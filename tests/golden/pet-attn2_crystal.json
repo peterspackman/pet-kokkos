@@ -1,0 +1,167 @@
+{
+  "model": "pet-attn2",
+  "variant": null,
+  "case": "crystal",
+  "description": "Golden reference for metatrain PET model 'pet-attn2', case 'crystal'. Energy in eV, positions in Angstrom, forces in eV/Angstrom. Total energy INCLUDES composition energies and the output scaler.",
+  "evaluation_path": "metatrain.utils.io.load_model(ckpt).export() -> metatomic AtomisticModel; MetatomicCalculator(model, variants={'energy': 'None'}).compute_energy(atoms, compute_forces_and_stresses=True, per_atom=True)",
+  "units": {
+    "energy": "eV",
+    "length": "Angstrom",
+    "forces": "eV/Angstrom"
+  },
+  "atomic_numbers": [
+    6,
+    6,
+    6,
+    6,
+    6,
+    6,
+    6,
+    6
+  ],
+  "positions": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      1.7835,
+      1.7835,
+      0.0
+    ],
+    [
+      1.7835,
+      0.0,
+      1.7835
+    ],
+    [
+      0.0,
+      1.7835,
+      1.7835
+    ],
+    [
+      0.89175,
+      0.89175,
+      0.89175
+    ],
+    [
+      2.67525,
+      2.67525,
+      0.89175
+    ],
+    [
+      2.67525,
+      0.89175,
+      2.67525
+    ],
+    [
+      0.89175,
+      2.67525,
+      2.67525
+    ]
+  ],
+  "cell": [
+    [
+      3.567,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      3.567,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      3.567
+    ]
+  ],
+  "pbc": [
+    true,
+    true,
+    true
+  ],
+  "periodic": true,
+  "n_atoms": 8,
+  "total_energy": -48.70741271972656,
+  "per_atom_energies": [
+    -6.066091537475586,
+    -6.066089630126953,
+    -6.066092014312744,
+    -6.066089630126953,
+    -6.110764026641846,
+    -6.1107611656188965,
+    -6.110762119293213,
+    -6.110762596130371
+  ],
+  "forces": [
+    [
+      -0.14340108633041382,
+      0.45857036113739014,
+      0.25102752447128296
+    ],
+    [
+      -0.1433941125869751,
+      0.4585854411125183,
+      0.2510231137275696
+    ],
+    [
+      -0.1433933973312378,
+      0.45856964588165283,
+      0.25103116035461426
+    ],
+    [
+      -0.14340081810951233,
+      0.45856860280036926,
+      0.251029372215271
+    ],
+    [
+      0.14340579509735107,
+      -0.45856547355651855,
+      -0.2510279715061188
+    ],
+    [
+      0.1433972865343094,
+      -0.4585803747177124,
+      -0.25102508068084717
+    ],
+    [
+      0.14339007437229156,
+      -0.4585722088813782,
+      -0.2510245442390442
+    ],
+    [
+      0.14339599013328552,
+      -0.4585760831832886,
+      -0.25103363394737244
+    ]
+  ],
+  "stress": [
+    [
+      -0.16655951814221048,
+      -0.046484207252951014,
+      -0.04232275111896291
+    ],
+    [
+      -0.05065427877046466,
+      -0.3076602207432378,
+      -0.028032443358208085
+    ],
+    [
+      -0.04253505203019312,
+      -0.024587227658943816,
+      -0.1666395781696063
+    ]
+  ],
+  "virial": null,
+  "volume": 45.38468526300001,
+  "result_keys": [
+    "energy",
+    "energies",
+    "forces",
+    "stress"
+  ],
+  "notes": "SYNTHETIC model: pet-mad-xs-v1.6.0 with num_attention_layers raised to 2 and block 0 duplicated into block 1 with a 5%% per-tensor perturbation, via tools/make_multilayer_checkpoint.py. It exists because every published upet model uses num_attention_layers=1, so the multi-block transformer stack has nothing real to validate against -- while metatrain defaults to 2, so a locally trained model can easily need it. The blocks are deliberately NOT identical, so an implementation reading block 0 weights for every block fails this. Reference produced by metatrain itself, as with every other golden."
+}

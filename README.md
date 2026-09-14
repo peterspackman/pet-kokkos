@@ -127,16 +127,23 @@ A directory only matches if it holds **both** halves of the pair.
 Two validated families, each covering the opposite branch of every config axis.
 The loader rejects any other mix rather than silently running the wrong path.
 
-| | **pet-mad-xs** | **pbe0-pet** | **pet-mad-xs v1.6** |
-|---|---|---|---|
-| featurizer | feedforward | residual | feedforward |
-| transformer | PreLN | PostLN | PreLN |
-| normalization | RMSNorm | LayerNorm | RMSNorm |
-| activation | SwiGLU | SiLU | SwiGLU |
-| central token | expanded (`d_node != d_pet`) | non-expanded | expanded |
-| cutoff | Bump, adaptive **grid** (8 nbrs) | Cosine, fixed | Bump, adaptive **solver** (16 nbrs) |
-| dims | `d_pet=128, d_node=512, 8 heads` | `d_pet=256, d_node=256, 8 heads` | `d_pet=128, d_node=512, 8 heads` |
-| attention layers | 1 | 2 | 1 |
+| | **pet-mad-xs** | **pbe0-pet** | **pet-mad-xs v1.6** | **pet-attn2**¹ |
+|---|---|---|---|---|
+| featurizer | feedforward | residual | feedforward | feedforward |
+| transformer | PreLN | PostLN | PreLN | PreLN |
+| normalization | RMSNorm | LayerNorm | RMSNorm | RMSNorm |
+| activation | SwiGLU | SiLU | SwiGLU | SwiGLU |
+| central token | expanded | non-expanded | expanded | expanded |
+| cutoff | Bump, adaptive **grid** | Cosine, fixed | Bump, adaptive **solver** | Bump, adaptive solver |
+| attention layers | 1 | 2 | 1 | **2** |
+
+¹ Synthetic. Every published upet model uses `num_attention_layers = 1` — the
+larger ones add GNN layers instead — while metatrain's *default* is 2, so a
+locally trained model can easily need it and there is nothing real to validate
+against. `tools/make_multilayer_checkpoint.py` builds a genuine two-block
+metatrain model from a one-block one (with the blocks deliberately made
+non-identical, so an implementation that read block 0's weights for every block
+would fail), and its goldens come from metatrain like all the others.
 
 Both adaptive-cutoff schemes are implemented — `"grid"` (the legacy
 probe-grid average) and `"solver"` (Newton–bisection root find, metatrain's
@@ -146,11 +153,9 @@ used; anything else is refused by name rather than defaulted, because the two
 schemes choose different per-atom cutoffs and picking the wrong one is silently
 wrong energies, not an error.
 
-Three limits are enforced at load time rather than assumed:
+Both featurizers handle any `num_attention_layers >= 1`. Two limits are enforced
+at load time rather than assumed:
 
-- the feedforward path supports `num_attention_layers == 1` only (the weights
-  load for more; the attention-stack loop is the missing piece). The residual
-  path handles any count `>= 1`;
 - the residual path has no adaptive-cutoff chain rule, so a residual model with
   `num_neighbors_adaptive > 0` is rejected — its forces would be silently
   inconsistent with its energy;

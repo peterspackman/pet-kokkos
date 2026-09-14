@@ -147,7 +147,10 @@ inline const std::vector<std::string>& golden_models() {
     //                 goldens are shipped; reproduce the model itself with
     //                 "uv run tools/convert_pet.py --model pet-mad-xs
     //                  --out models/pet-mad-xs-v1.6".
-    std::vector<std::string> v{"pet-mad-xs", "pbe0-pet", "pet-mad-xs-v1.6"};
+    // pet-attn2  -- synthetic, num_attention_layers = 2 (see its goldens' notes,
+    //               and tools/make_multilayer_checkpoint.py). No published upet
+    //               model uses A > 1, but metatrain defaults to it.
+    std::vector<std::string> v{"pet-mad-xs", "pbe0-pet", "pet-mad-xs-v1.6", "pet-attn2"};
     if (const char* e = std::getenv("PET_TEST_MODELS")) {
       const std::string s(e);
       for (std::size_t p = 0; p <= s.size();) {
