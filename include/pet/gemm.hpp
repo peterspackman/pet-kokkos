@@ -26,6 +26,30 @@
 
 namespace pet {
 
+// TF32 tensor-core GEMMs for the fp32 (Net=float) path: ~10-bit mantissa
+// truncation on the inputs, fp32 accumulate. The PET GEMMs are tall-skinny and
+// memory-bound, so the win is modest -- but it CHANGES THE ANSWER, and not
+// subtly: measured on the 8-atom pet-mad-xs crystal golden, enabling it moves
+// the total energy by 9.4 meV (1.2 meV/atom), which is ~2800x the fp32 noise
+// floor the same golden otherwise sits at. So it is off by default, and it must
+// stay off for anything compared against a reference or checked for
+// determinism.
+//
+// Process-global, not per-Calculator, because the cuBLAS handle below is a
+// process-wide singleton and its math mode is fixed when it is created. That
+// means this must be set BEFORE the first GEMM; pet::Calculator applies its
+// Options::allow_tf32 at construction, which is early enough.
+// PET_TF32=1 in the environment sets the initial value.
+inline bool& tf32_flag() {
+  static bool enabled = [] {
+    const char* e = std::getenv("PET_TF32");
+    return e && e[0] == '1';
+  }();
+  return enabled;
+}
+inline bool tf32_enabled() { return tf32_flag(); }
+inline void set_tf32(bool on) { tf32_flag() = on; }
+
 #if defined(KOKKOS_ENABLE_CUDA)
 inline cublasHandle_t blas_handle() {
   // Leaked-at-exit singleton bound to Kokkos's default stream, so every GEMM is
@@ -35,12 +59,9 @@ inline cublasHandle_t blas_handle() {
     cublasHandle_t hh;
     cublasCreate(&hh);
     cublasSetStream(hh, Kokkos::DefaultExecutionSpace().cuda_stream());
-    // Opt-in TF32 tensor-core path for the fp32 (Net=float) GEMMs: ~10-bit
-    // mantissa truncation on the inputs, fp32 accumulate. The PET GEMMs are
-    // tall-skinny and memory-bound, so the win is modest, but it costs nothing
-    // to try. KLASP_PET_TF32=1 enables it (off = strict IEEE fp32).
-    if (const char* e = std::getenv("KLASP_PET_TF32"); e && e[0] == '1')
-      cublasSetMathMode(hh, CUBLAS_TF32_TENSOR_OP_MATH);
+    // Read once, here: the math mode is a property of the handle, and the
+    // handle is created once. See tf32_flag() above.
+    if (tf32_enabled()) cublasSetMathMode(hh, CUBLAS_TF32_TENSOR_OP_MATH);
     return hh;
   }();
   return h;

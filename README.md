@@ -181,8 +181,14 @@ removing float atomics from every reduction the energy depends on:
 
 Integer counts are order-independent in value, so the count-plus-scan that
 recovers those ranges is itself safe. `tests/test_determinism.cpp` checks this
-against the model, needing no golden — and it must run with TF32 **off**, since
-a tensor-core GEMM is its own source of run-to-run variation.
+against the model, needing no golden.
+
+TF32 tensor-core GEMMs (`PET_TF32=1`, or `Options::allow_tf32`) are **off by
+default** and must stay off for anything compared against a reference. They are
+not a free speedup: on the 8-atom `pet-mad-xs` crystal golden, turning them on
+moves the total energy by 9.4 meV — 1.2 meV/atom, about 2800x the fp32 noise the
+same golden otherwise sits at. The setting is process-global, because cuBLAS
+fixes a handle's math mode when the handle is created.
 
 ## Virial convention
 

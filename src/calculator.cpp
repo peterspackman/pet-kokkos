@@ -3,6 +3,7 @@
 #include "pet/checkpoint.hpp"
 #include "pet/device_geometry.hpp"
 #include "pet/device_neighbors.hpp"
+#include "pet/gemm.hpp"
 #include "pet/model.hpp"
 #include "pet/neighbors.hpp"
 
@@ -183,6 +184,10 @@ struct Calculator::Impl {
       : ckpt(json_path, weights_path), model(ckpt), opts(o) {
     for (int z = 0; z < (int) ckpt.species_to_index.size(); ++z)
       if (ckpt.species_to_index[z] >= 0) atomic_types.push_back(z);
+    // Applied at construction because the cuBLAS handle's math mode is fixed
+    // when the handle is first created, which is at the first GEMM. Process-
+    // global, so the last Calculator constructed wins -- see gemm.hpp.
+    if (o.allow_tf32) set_tf32(true);
   }
 };
 

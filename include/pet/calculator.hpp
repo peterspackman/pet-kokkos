@@ -31,19 +31,32 @@ namespace pet {
 // the ANSWER is off by default and has to be asked for.
 struct Options {
   // Build the neighbour list on the device (the default, and the fast path) or
-  // on the host. The two are meant to agree to the bit; a difference between
-  // them is a bug, not a setting, which is why this exists at all.
+  // on the host. Both produce the same edge set in the same per-atom order; the
+  // arithmetic is issued differently, so results differ by a few fp32 ulps
+  // (measured ~3e-8 relative on the energy). Anything larger than that is a
+  // bug, not a setting -- which is why this switch exists at all, and what
+  // tests/test_device_vs_host.cpp holds it to.
   bool device_neighbors = true;
 
   // Reuse the Verlet topology cache across calls. Worth it only for a caller
   // stepping the same atoms (a relaxer, an MD driver); a one-shot evaluation
-  // pays the rebuild either way. Also meant to be bit-identical to the uncached
-  // path -- see NefCache in device_geometry.hpp.
+  // pays the rebuild either way. On the round that builds the cache the result
+  // matches the uncached path to double round-off; once reused after the
+  // geometry moves it matches to a few fp32 ulps, because the cache states
+  // periodic images in unwrapped coordinates and the uncached search in wrapped
+  // ones. See NefCache in device_geometry.hpp for why that trade is the right
+  // one.
   bool cache_neighbors = false;
 
   // Allow TF32 tensor-core GEMMs on NVIDIA. Faster, and it CHANGES THE ANSWER,
   // so it stays off unless asked for and must be off for anything compared
-  // against a reference.
+  // against a reference or checked for determinism.
+  //
+  // PROCESS-GLOBAL despite living here: cuBLAS fixes a handle's math mode when
+  // the handle is created, and there is one handle per process. A Calculator
+  // applies this at construction (early enough), but a second Calculator asking
+  // for something different will not change it. pet::set_tf32 in gemm.hpp is
+  // the direct control, and PET_TF32=1 sets the initial value.
   bool allow_tf32 = false;
 
   // Device memory a batch may occupy, in bytes. 0 queries the device.
@@ -98,14 +111,24 @@ class Calculator {
   Calculator(const Calculator&) = delete;
   Calculator& operator=(const Calculator&) = delete;
 
-  // Evaluate one structure. Takes the host neighbour-list path, which is what
-  // fills per_atom_energy.
+  // Evaluate one structure. Always takes the host neighbour-list path -- it is
+  // what the goldens validate, it returns the virial directly, and it is the
+  // only path that fills per_atom_energy.
   Results compute(const System& system, bool compute_forces = true) const;
 
   // Evaluate many (typically small) structures in ONE pass: each structure's
   // NEF is built and the lot concatenated, so B small cells use a GPU as well
-  // as one big cell does. PET's network is per-atom/per-edge, so the per-atom
-  // energies and forces equal evaluating each structure alone.
+  // as one big cell does. PET's network is per-atom/per-edge and edges never
+  // cross a structure boundary, so the per-atom energies and forces are
+  // identical to evaluating each structure alone -- bit-identical, in fact, on
+  // the host neighbour path (tests/test_determinism.cpp).
+  //
+  // A single-element vector delegates to the overload above, which means it
+  // takes the HOST neighbour path whatever Options::device_neighbors says, and
+  // fills per_atom_energy. That is deliberate -- one structure is not worth a
+  // device NEF build -- but it does mean the two entry points differ in the last
+  // bits for B == 1 (see the host/device comparison in
+  // tests/test_device_vs_host.cpp for the size of that: ~3e-8 relative).
   Results compute(const std::vector<System>& systems, bool compute_forces = true) const;
 
   // Fully device-resident evaluation: `geom` is already-populated staging (see

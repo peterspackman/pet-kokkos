@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "pet/calculator.hpp"
+#include "pet/gemm.hpp"
 #include "test_support.hpp"
 
 using namespace pet_test;
@@ -53,7 +54,10 @@ TEST_CASE("repeated evaluation is bit-identical", "[model][determinism]") {
       continue;
     }
     pet::Calculator calc(found->first, found->second);
-    REQUIRE_FALSE(calc.options().allow_tf32);  // see the header comment
+    // The GLOBAL, not the Options field: TF32 is a property of the process's
+    // cuBLAS handle, so checking the field would pass while a stray PET_TF32=1
+    // in the environment quietly made this test meaningless.
+    REQUIRE_FALSE(pet::tf32_enabled());
 
     for (const auto& path : golden_paths(model)) {
       const Golden g = load_golden(path);
