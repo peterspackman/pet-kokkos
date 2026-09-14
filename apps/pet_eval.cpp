@@ -36,6 +36,9 @@ void usage() {
       "  -f, --forces         compute forces (and, for periodic frames, the virial)\n"
       "  -b, --batch          evaluate all frames in one pass instead of one at a time\n"
       "  -o, --output FILE    write the frames back out as extxyz, with forces\n"
+      "      --json           emit results as JSON on stdout (for scripts)\n"
+      "      --charge N       total charge per frame (conditioned models only)\n"
+      "      --spin N         spin multiplicity 2S+1 per frame (conditioned models)\n"
       "      --per-atom       print per-atom energies\n"
       "      --host-neighbors build the neighbour list on the host\n"
       "      --repeat N       evaluate N times and report the best wall time\n"
@@ -68,8 +71,10 @@ double cell_volume(const pet::System& s) {
 struct Args {
   std::string model_spec, structure_path, output_path;
   bool want_forces = false, batch = false, per_atom = false;
-  bool host_neighbors = false, info_only = false;
+  bool host_neighbors = false, info_only = false, json = false;
   int repeat = 1;
+  int charge = 0;
+  int spin = 1;
 };
 
 // Parse argv. Returns false when the program should stop; `rc` is the exit code
@@ -104,9 +109,15 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.host_neighbors = true;
     } else if (s == "--info") {
       a.info_only = true;
+    } else if (s == "--json") {
+      a.json = true;
     } else if (s == "-o" || s == "--output") {
       a.output_path = next("--output");
       a.want_forces = true;
+    } else if (s == "--charge") {
+      a.charge = std::atoi(next("--charge").c_str());
+    } else if (s == "--spin") {
+      a.spin = std::atoi(next("--spin").c_str());
     } else if (s == "--repeat") {
       a.repeat = std::max(1, std::atoi(next("--repeat").c_str()));
     } else if (!s.empty() && s[0] == '-') {
@@ -158,6 +169,111 @@ void print_model_info(const Args& a, const pet::Calculator& calc) {
   std::puts(")");
 }
 
+// The model's architecture, as JSON. A sweep over many checkpoints wants to
+// report what each one IS alongside whether it worked, and parsing the human
+// table for that would be silly.
+void print_model_info_json(const Args& a, const pet::Calculator& calc) {
+  const pet::Hypers& h = calc.hypers();
+  std::printf("{\n");
+  std::printf("  \"model\": \"%s\",\n", a.model_spec.c_str());
+  std::printf("  \"featurizer\": \"%s\",\n",
+              h.featurizer_type == pet::FeaturizerType::Residual ? "residual" : "feedforward");
+  std::printf("  \"transformer\": \"%s\",\n",
+              h.transformer_type == pet::TransformerType::PreLN ? "PreLN" : "PostLN");
+  std::printf("  \"normalization\": \"%s\",\n",
+              h.normalization == pet::Normalization::RMSNorm ? "RMSNorm" : "LayerNorm");
+  std::printf("  \"activation\": \"%s\",\n",
+              h.activation == pet::Activation::SwiGLU ? "SwiGLU" : "SiLU");
+  std::printf("  \"cutoff_function\": \"%s\",\n",
+              h.cutoff_function == pet::CutoffFunction::Bump ? "Bump" : "Cosine");
+  std::printf("  \"cutoff\": %g,\n", h.cutoff);
+  std::printf("  \"cutoff_width\": %g,\n", h.cutoff_width);
+  std::printf("  \"cutoff_width_adaptive\": %g,\n", h.cutoff_width_adaptive);
+  std::printf("  \"num_neighbors_adaptive\": %g,\n", h.num_neighbors_adaptive);
+  std::printf("  \"adaptive_cutoff_method\": \"%s\",\n",
+              h.adaptive_cutoff_method == pet::AdaptiveCutoffMethod::Solver ? "solver" : "grid");
+  std::printf("  \"d_pet\": %d,\n  \"d_node\": %d,\n  \"d_head\": %d,\n", h.d_pet, h.d_node,
+              h.d_head);
+  std::printf("  \"d_feedforward\": %d,\n  \"num_heads\": %d,\n", h.d_feedforward, h.num_heads);
+  std::printf("  \"num_gnn_layers\": %d,\n  \"num_attention_layers\": %d,\n",
+              h.num_gnn_layers, h.num_attention_layers);
+  std::printf("  \"num_readout_layers\": %d,\n", h.num_readout_layers);
+  std::printf("  \"system_conditioning\": %s,\n", h.system_conditioning ? "true" : "false");
+  std::printf("  \"max_charge\": %d,\n  \"max_spin_multiplicity\": %d,\n", h.max_charge,
+              h.max_spin_multiplicity);
+  std::printf("  \"n_species\": %zu\n}\n", calc.atomic_types().size());
+}
+
+// Results as JSON, for a caller that has to compare numbers rather than read
+// them. Hand-rolled because the library does not otherwise need a JSON writer on
+// the output side, and the shape here is fixed and flat. Full precision: this
+// exists to be diffed against a reference, so a printf default of 6 significant
+// figures would throw away exactly what it is for.
+void print_json(const Args& a, const pet::Calculator& calc,
+                const std::vector<pet::System>& frames, const pet::Results& r,
+                double best_seconds) {
+  auto num = [](double v) {
+    char buf[40];
+    std::snprintf(buf, sizeof buf, "%.17g", v);
+    return std::string(buf);
+  };
+
+  std::printf("{\n  \"model\": \"%s\",\n", a.model_spec.c_str());
+  std::printf("  \"cutoff\": %s,\n", num(calc.cutoff()).c_str());
+  std::printf("  \"energy_unit\": \"%s\",\n", calc.energy_unit().c_str());
+  std::printf("  \"length_unit\": \"%s\",\n", calc.length_unit().c_str());
+  std::printf("  \"seconds\": %s,\n", num(best_seconds).c_str());
+  std::printf("  \"system_conditioning\": %s,\n",
+              calc.hypers().system_conditioning ? "true" : "false");
+  std::printf("  \"charge\": %d,\n  \"spin_multiplicity\": %d,\n", a.charge, a.spin);
+  std::printf("  \"frames\": [\n");
+
+  std::size_t foff = 0, eoff = 0;
+  for (std::size_t b = 0; b < frames.size(); ++b) {
+    const pet::System& s = frames[b];
+    std::printf("    {\n      \"n_atoms\": %d,\n", s.n_atoms);
+    std::printf("      \"energy\": %s", num(r.energy[b]).c_str());
+
+    if (a.per_atom && r.per_atom_energy.size() >= eoff + static_cast<std::size_t>(s.n_atoms)) {
+      std::printf(",\n      \"per_atom_energy\": [");
+      for (int i = 0; i < s.n_atoms; ++i)
+        std::printf("%s%s", i ? ", " : "", num(r.per_atom_energy[eoff + i]).c_str());
+      std::printf("]");
+    }
+    eoff += s.n_atoms;
+
+    if (a.want_forces && r.forces.size() >= foff + static_cast<std::size_t>(s.n_atoms) * 3) {
+      std::printf(",\n      \"forces\": [");
+      for (int i = 0; i < s.n_atoms; ++i) {
+        std::printf("%s[", i ? ", " : "");
+        for (int c = 0; c < 3; ++c)
+          std::printf("%s%s", c ? ", " : "", num(r.forces[foff + i * 3 + c]).c_str());
+        std::printf("]");
+      }
+      std::printf("]");
+      // Voigt [xx, yy, zz, xy, xz, yz], the symmetric virial W = V*sigma.
+      if ((s.pbc[0] || s.pbc[1] || s.pbc[2]) &&
+          r.virial.size() >= (b + 1) * 6) {
+        const double vol = cell_volume(s);
+        std::printf(",\n      \"volume\": %s", num(vol).c_str());
+        std::printf(",\n      \"virial\": [");
+        for (int v = 0; v < 6; ++v)
+          std::printf("%s%s", v ? ", " : "", num(r.virial[b * 6 + v]).c_str());
+        std::printf("]");
+        if (vol > 0.0) {
+          std::printf(",\n      \"stress\": [");
+          for (int v = 0; v < 6; ++v)
+            std::printf("%s%s", v ? ", " : "", num(r.virial[b * 6 + v] / vol).c_str());
+          std::printf("]");
+        }
+      }
+    }
+    foff += static_cast<std::size_t>(s.n_atoms) * 3;
+    std::printf("\n    }%s\n", b + 1 < frames.size() ? "," : "");
+  }
+  std::printf("  ]\n}\n");
+}
+
 // The whole program, in a scope of its own. Everything that owns a Kokkos::View
 // is destroyed when this returns -- which has to happen BEFORE
 // Kokkos::finalize(), and is the reason this is a function rather than the body
@@ -168,11 +284,27 @@ int run(const Args& a) {
   pet::Calculator calc(a.model_spec, opts);
 
   if (a.info_only) {
-    print_model_info(a, calc);
+    if (a.json)
+      print_model_info_json(a, calc);
+    else
+      print_model_info(a, calc);
     return 0;
   }
 
   std::vector<pet::System> frames = pet::read_extxyz(a.structure_path);
+  // Applied to every frame. A model without system_conditioning ignores them,
+  // so setting them on one is a no-op rather than an error -- but warn, because
+  // silently ignoring an electronic state the user asked for is worse.
+  if (a.charge != 0 || a.spin != 1) {
+    if (!calc.hypers().system_conditioning)
+      std::fprintf(stderr,
+                   "pet-eval: warning: --charge/--spin given, but this model was not "
+                   "trained with system_conditioning; they have no effect.\n");
+    for (auto& s : frames) {
+      s.charge = a.charge;
+      s.spin_multiplicity = a.spin;
+    }
+  }
   if (frames.empty()) {
     std::fputs("pet-eval: no frames in the structure file\n", stderr);
     return 2;
@@ -211,6 +343,11 @@ int run(const Args& a) {
     Kokkos::fence();
     const std::chrono::duration<double> dt = std::chrono::steady_clock::now() - t0;
     best_seconds = std::min(best_seconds, dt.count());
+  }
+
+  if (a.json) {
+    print_json(a, calc, frames, r, best_seconds);
+    return 0;
   }
 
   std::size_t foff = 0, eoff = 0;

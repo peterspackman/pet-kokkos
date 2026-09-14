@@ -886,6 +886,74 @@ void adaptive_backward(Workspace& ws, RView2D d_forces, RView2D dvir, RView1D ad
 
 }  // namespace
 
+// Charge / spin conditioning: per-system charge and spin multiplicity embedded,
+// projected, and broadcast to the atoms of that system. The result is ADDED to
+// the node features after every GNN layer (metatrain does this in both
+// featurizers, identically).
+//
+// Forward only. It is a per-system constant with no dependence on any position,
+// so no gradient flows into it and the geometry backward never sees it. That is
+// why there is no conditioning_bwd.
+//
+// Returns an empty View when the model is not conditioned, which the callers
+// test rather than branching on the hyper.
+View2D PetModel::conditioning(const DeviceEdgeData& dev, int N, int NS) {
+  if (!h_.system_conditioning) return View2D();
+  const int Dn = h_.d_node;
+  const int max_q = h_.max_charge;
+
+  // Defaults when the caller supplied no electronic state: neutral singlet,
+  // which is metatrain's own fallback for a system that carries none.
+  IView1D q = dev.charge, sm = dev.spin_multiplicity;
+  if ((int) q.extent(0) != NS || (int) sm.extent(0) != NS) {
+    q = ws_.i1("cond_q", NS);
+    sm = ws_.i1("cond_sm", NS);
+    Kokkos::deep_copy(ExecSpace(), q, 0);
+    Kokkos::deep_copy(ExecSpace(), sm, 1);
+  }
+
+  // [NS, 2*Dn] = [charge_embedding(q + max_charge) | spin_embedding(2S+1 - 1)]
+  View2D cat = ws_.n2("cond_cat", NS, 2 * Dn);
+  {
+    auto qe = mat("system_conditioning.charge_embedding.weight");
+    auto se = mat("system_conditioning.spin_multiplicity_embedding.weight");
+    const int nq = (int) qe.extent(0), ns = (int) se.extent(0);
+    Kokkos::parallel_for(
+        "cond_gather", RangePolicy(0, NS * Dn), KOKKOS_LAMBDA(int _i) {
+          const int b = _i / Dn, d = _i % Dn;
+          // Clamp rather than index out of the table. An out-of-range charge is
+          // a caller error, but reading past the embedding is undefined
+          // behaviour on the device, where it would surface as a wrong number
+          // somewhere else entirely.
+          int iq = q(b) + max_q;
+          iq = iq < 0 ? 0 : (iq >= nq ? nq - 1 : iq);
+          int is = sm(b) - 1;
+          is = is < 0 ? 0 : (is >= ns ? ns - 1 : is);
+          cat(b, d) = qe(iq, d);
+          cat(b, Dn + d) = se(is, d);
+        });
+  }
+  // project = Linear(2*Dn -> Dn) -> SiLU -> Linear(Dn -> Dn)
+  View2D h0 = ws_.n2("cond_h0", NS, Dn);
+  linear_silu(h0, View2D(), cat, mat("system_conditioning.project.0.weight"),
+              vec("system_conditioning.project.0.bias"), false);
+  View2D per_struct = ws_.n2("cond_ps", NS, Dn);
+  linear(per_struct, h0, mat("system_conditioning.project.2.weight"),
+         vec("system_conditioning.project.2.bias"));
+
+  // Broadcast to atoms. Done once here rather than indexing through struct_id at
+  // every use, because it is read num_gnn_layers times.
+  View2D out = ws_.n2("cond_atom", N, Dn);
+  IView1D sid = dev.struct_id;
+  const bool have_sid = ((int) sid.extent(0) == N);
+  Kokkos::parallel_for(
+      "cond_bcast", RangePolicy(0, N * Dn), KOKKOS_LAMBDA(int _i) {
+        const int n = _i / Dn, d = _i % Dn;
+        out(n, d) = per_struct(have_sid ? sid(n) : 0, d);
+      });
+  return out;
+}
+
 // --- architecture-varying components (see pet/model.hpp) ---------------------
 
 void PetModel::norm(View2D out, View2D in, const std::string& key) const {
@@ -1090,6 +1158,15 @@ void PetModel::load_all(const Checkpoint& ckpt) {
     }
   }
   load_mat("edge_embedder.weight");
+
+  // Charge / spin conditioning: two embedding tables plus a Linear-SiLU-Linear
+  // projection, all per system rather than per atom.
+  if (h_.system_conditioning) {
+    load_mat("system_conditioning.charge_embedding.weight");
+    load_mat("system_conditioning.spin_multiplicity_embedding.weight");
+    load_linear("system_conditioning.project.0");
+    load_linear("system_conditioning.project.2");
+  }
   // One node embedder + one node/edge readout head per readout layer (feedforward
   // reads out once from the final layer; residual reads out from every GNN layer).
   for (int i = 0; i < R; ++i) {
@@ -1162,6 +1239,21 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed) const {
   dev.pair_cutoff = RView1D("pcut", NM);
   dev.cutoff_factor = View1D("cutoff", NM);
   dev.cf_seq = View2D("cf_seq", N, S);
+
+  // Per-structure electronic state, for a conditioned model.
+  if (!ed.charge.empty()) {
+    const int B = (int) ed.charge.size();
+    dev.charge = IView1D("charge", B);
+    dev.spin_multiplicity = IView1D("spin", B);
+    auto h_q = Kokkos::create_mirror_view(dev.charge);
+    auto h_s = Kokkos::create_mirror_view(dev.spin_multiplicity);
+    for (int b = 0; b < B; ++b) {
+      h_q(b) = ed.charge[b];
+      h_s(b) = (b < (int) ed.spin_multiplicity.size()) ? ed.spin_multiplicity[b] : 1;
+    }
+    Kokkos::deep_copy(dev.charge, h_q);
+    Kokkos::deep_copy(dev.spin_multiplicity, h_s);
+  }
 
   // Solver adaptive cutoff: the forward's root and slope, uploaded alongside
   // everything else. Without these the backward has nothing to differentiate
@@ -1396,6 +1488,9 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
   const int G = h_.num_gnn_layers;
   const int A = h_.num_attention_layers;
   const int R = h_.num_readout_layers;  // == G for the residual featurizer
+  // Charge / spin conditioning, computed once and reused by every GNN layer.
+  // Empty (and free) for a model without it.
+  View2D cond = conditioning(dev, dev.n_atoms, dev.n_struct);
   const bool grad = (host_forces != nullptr || dev_forces != nullptr);
 
   // Forward activations are fully overwritten; skip per-reuse zeroing.
@@ -1533,6 +1628,17 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
           if (s == 0) onode(n, d) = tokens(row, d);
           else oedge(n * M + (s - 1), d) = tokens(row, d);
         });
+
+    // Charge / spin conditioning, added to this layer's node output before it is
+    // read out -- the same point metatrain adds it. The residual featurizer is
+    // non-expanded, so d_node == d_pet and the projection's width matches D.
+    if (cond.extent(0) == (std::size_t) N) {
+      Kokkos::parallel_for(
+          "re_cond_add", RangePolicy(0, N * D), KOKKOS_LAMBDA(int _i) {
+            const int n = _i / D, d = _i % D;
+            onode(n, d) += cond(n, d);
+          });
+    }
 
     // message passing: input_edge := 0.5*(input_edge + output_edge[reverse])
     if (L + 1 < G) {
@@ -1864,6 +1970,10 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
       sav_qkv(G, std::vector<View2D>(A)), sav_node_new(G, std::vector<View2D>(A)),
       sav_tmp_center(G, std::vector<View2D>(A)), sav_eps(G, std::vector<View2D>(A)),
       sav_tmp_edge(G, std::vector<View2D>(A));
+  // Charge / spin conditioning, computed once and reused by every GNN layer.
+  // Empty (and free) for a model without it.
+  View2D cond = conditioning(dev, N, dev.n_struct);
+
   // Readout saves. One set: this featurizer reads out once. Sized as vectors so
   // PetModel::readout is the same call for both featurizers.
   std::vector<View2D> sav_nh0(1), sav_nh1(1), sav_eh0(1), sav_eh1(1), sav_epred(1);
@@ -2014,6 +2124,12 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
     }
 
     // featurizer (feedforward) update
+    if (cond.extent(0) == (std::size_t) N) {
+      Kokkos::parallel_for(
+          "cond_add", RangePolicy(0, (N) * (Dn)),
+          KOKKOS_LAMBDA(int _i) { const int n = _i / (Dn), d = _i % (Dn);
+            node_cur(n, d) += cond(n, d); });
+    }
     node = node_cur;
     View2D rev_edge = ws_.n2("rev_edge", NM, D);
     // cat_rev writes concat fully; when grad it is the layernorm input the backward

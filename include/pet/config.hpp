@@ -62,6 +62,18 @@ struct Hypers {
 
   bool zbl = false;
   bool long_range_enabled = false;
+
+  // Charge / spin conditioning. When on, the per-system total charge and spin
+  // multiplicity are embedded and added to the node features after every GNN
+  // layer, so the same geometry can yield different predictions for different
+  // electronic states.
+  //
+  // It is a per-system CONSTANT -- it does not depend on any position -- so it
+  // affects the forward only: no gradient flows into it, and the geometry
+  // backward is untouched.
+  bool system_conditioning = false;
+  int max_charge = 10;             // table covers charges in [-max_charge, +max_charge]
+  int max_spin_multiplicity = 10;  // table covers 2S+1 in [1, max_spin_multiplicity]
 };
 
 }  // namespace pet

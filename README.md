@@ -153,8 +153,14 @@ used; anything else is refused by name rather than defaulted, because the two
 schemes choose different per-atom cutoffs and picking the wrong one is silently
 wrong energies, not an error.
 
-Both featurizers handle any `num_attention_layers >= 1`. Two limits are enforced
-at load time rather than assumed:
+Both featurizers handle any `num_attention_layers >= 1`, and both support
+**charge/spin conditioning** (`system_conditioning`): set `System::charge` and
+`System::spin_multiplicity`, or `pet-eval --charge N --spin N`. The defaults are
+metatrain's own — a neutral singlet — so a model trained with conditioning gives
+the same answer as upet does for a system that says nothing about its electronic
+state.
+
+Two limits are enforced at load time rather than assumed:
 
 - the residual path has no adaptive-cutoff chain rule, so a residual model with
   `num_neighbors_adaptive > 0` is rejected — its forces would be silently
@@ -212,6 +218,40 @@ doing it here would make the returned quantity something other than a stress.
 ```bash
 ctest --preset serial          # or openmp / cuda
 ```
+
+### Against upet itself
+
+The goldens cover a handful of architectures by hand. `tools/test_all_models.py`
+covers the **whole published catalogue**: for every checkpoint on
+`lab-cosmo/upet` it converts the model, evaluates the same structures with
+metatomic (the reference implementation, through PyTorch) and with pet-kokkos,
+and reports the deviation.
+
+```bash
+uv run tools/test_all_models.py                 # the small models (<= 150 MB)
+uv run tools/test_all_models.py --all           # everything, ~15 GB of downloads
+uv run tools/test_all_models.py --models pet-mad-s
+```
+
+```
+      model        architecture                            dE/E        dF   dStress
+-----------------------------------------------------------------------------------
+PASS  pet-mols-s   resi PostLN G2 A2 d256               1.1e-07   1.0e-05   5.6e-07
+PASS  pet-omad-xs  feed PreLN G2 A1 d128 grid           1.5e-07   1.0e-05   5.1e-07
+PASS  pet-omat-xs  feed PreLN G2 A1 d128 grid           3.2e-07   1.0e-05   6.4e-07
+PASS  pet-mad-xs   feed PreLN G2 A1 d128 solver         2.3e-07   8.8e-06   2.8e-07
+PASS  pet-spice-s  feed PreLN G3 A1 d192                5.2e-08   1.5e-05   4.1e-07
+PASS  pet-omad-s   feed PreLN G3 A1 d256 grid           1.1e-07   1.1e-05   5.7e-07
+PASS  pet-omat-s   feed PreLN G3 A1 d256 grid           3.3e-08   9.1e-06   5.8e-07
+PASS  pet-mad-s    feed PreLN G3 A1 d256 solver         1.5e-07   8.8e-06   2.8e-07
+PASS  pet-omol-s   feed PreLN G3 A1 d256 grid cond      1.3e-07   8.1e-06   4.8e-07
+```
+
+This is worth running against any new upet or metatrain release: a model that
+starts failing is usually an architecture axis that has moved, and the report
+says which. It is how `system_conditioning` was caught — `pet-omol-s` was
+converting happily and evaluating 0.25 eV/A off, because the converter did not
+know the axis existed.
 
 | suite | needs a model? | what it holds |
 |---|---|---|

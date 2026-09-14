@@ -28,6 +28,12 @@ struct System {
   std::vector<double> positions;       // [N*3] cartesian, Angstrom
   std::array<double, 9> cell{};        // row-major lattice vectors a,b,c (rows)
   std::array<bool, 3> pbc{false, false, false};
+
+  // Electronic state, for a model trained with system_conditioning. Ignored by
+  // every other model. The defaults are metatrain's own fallback for a system
+  // that carries no such information: neutral singlet.
+  int charge = 0;
+  int spin_multiplicity = 1;  // 2S+1, so 1 is a singlet
 };
 
 // Edges in neighbor-edge-format. Row-major NEF arrays are [N, M] (or [N, M, 3]).
@@ -43,6 +49,12 @@ struct EdgeData {
   std::vector<double> pair_cutoff;     // [N*M] per-edge cutoff radius (adaptive or fixed)
   std::vector<char> mask;              // [N*M] 1=real, 0=padding
   std::vector<int> reverse_index;      // [N*M] flat (j*M+slot) of reverse edge, -1 if none
+
+  // Per-STRUCTURE electronic state for a conditioned model, in the order the
+  // structures were concatenated (length 1 for a single system). Empty when the
+  // model is not conditioned.
+  std::vector<int> charge;
+  std::vector<int> spin_multiplicity;
 
   // SOLVER adaptive cutoff only: [N] the root of the smoothed neighbour count and
   // [N] dn/dr there, both computed by the forward and consumed by the backward's
@@ -114,6 +126,12 @@ inline EdgeData concat_edge_data(const std::vector<EdgeData>& parts, std::vector
   if (have_adapt) {
     out.adapt_r.assign(N, 0.0);
     out.adapt_dn.assign(N, 0.0);
+  }
+  // Per-structure, so concatenation appends rather than copies per atom.
+  for (const auto& p : parts) {
+    out.charge.insert(out.charge.end(), p.charge.begin(), p.charge.end());
+    out.spin_multiplicity.insert(out.spin_multiplicity.end(), p.spin_multiplicity.begin(),
+                                 p.spin_multiplicity.end());
   }
 
   int off_n = 0, off_e = 0;
@@ -543,7 +561,13 @@ inline EdgeData build_edge_data(const System& sys, const Hypers& h,
     edges[e].vz = raw[e].vz;
     edges[e].dist = raw[e].dist;
   }
-  return build_edge_data_from_raw(N, species, h, edges);
+  EdgeData ed = build_edge_data_from_raw(N, species, h, edges);
+  // One structure, so one entry. Only a conditioned model reads these; carrying
+  // them unconditionally keeps build_edge_data free of a model-shape branch, and
+  // two ints per structure is not worth a conditional.
+  ed.charge = {sys.charge};
+  ed.spin_multiplicity = {sys.spin_multiplicity};
+  return ed;
 }
 
 }  // namespace pet

@@ -59,6 +59,9 @@ class Checkpoint {
     hypers.cutoff_width_adaptive =
         h.value("cutoff_width_adaptive", hypers.cutoff_width);
     hypers.zbl = h.value("zbl", false);
+    hypers.system_conditioning = h.value("system_conditioning", false);
+    hypers.max_charge = h.value("max_charge", 10);
+    hypers.max_spin_multiplicity = h.value("max_spin_multiplicity", 10);
     hypers.long_range_enabled = h.value("long_range_enabled", false);
 
     hypers.normalization = parse_norm(h.at("normalization").get<std::string>());

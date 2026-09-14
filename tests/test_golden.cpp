@@ -204,3 +204,57 @@ TEST_CASE("adaptive_cutoff_method is read, defaulted and validated", "[model][go
   std::error_code ec;
   std::filesystem::remove_all(tmp, ec);
 }
+
+TEST_CASE("charge and spin change a conditioned model's answer", "[model][golden]") {
+  // A model trained with system_conditioning embeds the per-system charge and
+  // spin multiplicity into its node features, so the same geometry must give
+  // different energies for different electronic states. If it does not, the
+  // conditioning branch is loaded but not wired -- which is exactly the failure
+  // that went unnoticed until the whole-catalogue sweep found pet-omol-s
+  // disagreeing with upet by 0.25 eV/A.
+  //
+  // Runs only where such a model is installed; pet-omol-s is the published one.
+  const auto found = find_model("pet-omol-s");
+  if (!found) {
+    WARN("no conditioned model installed; skipping the charge/spin check");
+    return;
+  }
+  pet::Calculator calc(found->first, found->second);
+  if (!calc.hypers().system_conditioning) {
+    WARN("pet-omol-s resolved to a model without system_conditioning");
+    return;
+  }
+
+  pet::System water;
+  water.n_atoms = 3;
+  water.atomic_numbers = {8, 1, 1};
+  water.positions = {0.0, 0.0, 0.11926, 0.0, 0.76323, -0.47704, 0.0, -0.76323, -0.47704};
+
+  const double neutral = calc.compute(water, false).energy.at(0);
+
+  pet::System cation = water;
+  cation.charge = 1;
+  cation.spin_multiplicity = 2;
+  const double charged = calc.compute(cation, false).energy.at(0);
+
+  INFO("neutral singlet " << neutral << " eV, +1 doublet " << charged << " eV");
+  CHECK(neutral != charged);
+
+  // The defaults have to BE the neutral singlet, not merely resemble it: a
+  // System that says nothing about its electronic state must evaluate exactly as
+  // one that explicitly says charge 0, multiplicity 1. (metatrain's own fallback
+  // for a system carrying no such information.)
+  pet::System explicit_neutral = water;
+  explicit_neutral.charge = 0;
+  explicit_neutral.spin_multiplicity = 1;
+  CHECK(calc.compute(explicit_neutral, false).energy.at(0) == neutral);
+
+  // And a batch must carry each structure's own state rather than the first
+  // one's -- the embedding is per system, and a broadcast bug here would be
+  // invisible in every single-structure test.
+  const pet::Results batched = calc.compute(std::vector<pet::System>{water, cation}, true);
+  REQUIRE(batched.energy.size() == 2);
+  INFO("batched: " << batched.energy[0] << ", " << batched.energy[1]);
+  CHECK(std::fabs(batched.energy[0] - neutral) < 1e-4);
+  CHECK(std::fabs(batched.energy[1] - charged) < 1e-4);
+}

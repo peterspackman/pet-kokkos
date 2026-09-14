@@ -83,6 +83,12 @@ struct DeviceEdgeData {
   // (n_struct=1, empty struct_id) is a single structure.
   IView1D struct_id;
   int n_struct = 1;
+
+  // [n_struct] electronic state, for a model trained with system_conditioning.
+  // Empty for every other model. Per structure, not per atom -- the embedding is
+  // a system property broadcast to the atoms that belong to it.
+  IView1D charge;
+  IView1D spin_multiplicity;
 };
 
 class PetModel {
@@ -156,6 +162,16 @@ class PetModel {
   EnergyResult compute(const DeviceEdgeData& dev, std::vector<double>* host_forces,
                        RView2D* dev_forces, RView1D* dev_per_atom = nullptr,
                        RView2D* dev_virial = nullptr);
+
+  // Per-atom charge/spin conditioning features, or an empty View when the model
+  // is not conditioned. Computed once per evaluation and added to the node
+  // features after every GNN layer. Forward only -- it is a per-system constant
+  // with no dependence on any position, so nothing flows back into it.
+  //
+  // Public for the same reason compute() is: nvcc forbids extended
+  // __host__ __device__ lambdas (KOKKOS_LAMBDA) inside a private or protected
+  // member function. It is not part of the intended API.
+  View2D conditioning(const DeviceEdgeData& dev, int N, int n_struct);
 
   // Residual-featurizer forward/backward (PostLN, LayerNorm, SiLU, non-expanded
   // central token, num_attention_layers>=1). compute() dispatches here when

@@ -418,7 +418,25 @@ DeviceEdgeData build_device_batch(const std::vector<System>& systems, const Hype
   Kokkos::deep_copy(g.sper, h_sper);
   Kokkos::deep_copy(g.scell, h_scell);
 
-  return build_nef_device(g, h, probes, P, ws, edge_map, m_high, cache);
+  DeviceEdgeData dev = build_nef_device(g, h, probes, P, ws, edge_map, m_high, cache);
+
+  // Per-structure electronic state, for a conditioned model. Uploaded here
+  // rather than derived on the device: it comes from the caller's Systems and
+  // has nothing to do with geometry.
+  {
+    IView1D q("charge", B), sm("spin", B);
+    auto h_q = Kokkos::create_mirror_view(q);
+    auto h_s = Kokkos::create_mirror_view(sm);
+    for (int b = 0; b < B; ++b) {
+      h_q(b) = systems[b].charge;
+      h_s(b) = systems[b].spin_multiplicity;
+    }
+    Kokkos::deep_copy(q, h_q);
+    Kokkos::deep_copy(sm, h_s);
+    dev.charge = q;
+    dev.spin_multiplicity = sm;
+  }
+  return dev;
 }
 
 }  // namespace pet

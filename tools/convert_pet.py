@@ -54,6 +54,7 @@ KEEP_PREFIXES = (
     "combination_mlps.",
     "node_embedders.",
     "edge_embedder.",
+    "system_conditioning.",
 )
 # Head sub-trees: keep only the selected energy target.
 HEAD_ROOTS = ("node_heads", "edge_heads", "node_last_layers", "edge_last_layers")
@@ -283,6 +284,9 @@ def main():
             "cutoff_width_adaptive": float(
                 h.get("cutoff_width_adaptive", h["cutoff_width"])
             ),
+            "system_conditioning": bool(h.get("system_conditioning", False)),
+            "max_charge": int(h.get("max_charge", 10)),
+            "max_spin_multiplicity": int(h.get("max_spin_multiplicity", 10)),
             "zbl": bool(h.get("zbl", False)),
             "long_range_enabled": bool(h.get("long_range", {}).get("enable", False)),
         },
@@ -323,7 +327,8 @@ def main():
           f"gnn_layers={num_gnn} attn_layers={h['num_attention_layers']} "
           f"readout_layers={num_readout}")
     print(f"  featurizer={featurizer} norm={h['normalization']} "
-          f"act={h['activation']} type={h['transformer_type']}")
+          f"act={h['activation']} type={h['transformer_type']}"
+          + ("  system_conditioning=on" if h.get("system_conditioning") else ""))
     print(f"  cutoff={h['cutoff']} fn={h['cutoff_function']} width={h['cutoff_width']} "
           f"adaptive={nna} ({adaptive_method})  energy_scale={meta['energy_scale']:.6f}")
     print(f"  n_species={n_species}  dropped {len(dropped)} non-kept tensors")
