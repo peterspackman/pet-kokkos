@@ -45,12 +45,12 @@ constexpr double kStressTolerance = 1e-4;   // eV/Angstrom^3
 
 TEST_CASE("goldens reproduce the reference energy, forces and stress", "[model][golden]") {
   for (const auto& model : golden_models()) {
-    const auto found = find_model(model);
-    if (!found) {
+    pet::Calculator* calcp = shared_calculator(model);
+    if (!calcp) {
       WARN("model '" << model << "' is not installed; skipping its goldens");
       continue;
     }
-    pet::Calculator calc(found->first, found->second);
+    pet::Calculator& calc = *calcp;
 
     for (const auto& path : golden_paths(model)) {
       const Golden g = load_golden(path);
@@ -117,9 +117,9 @@ TEST_CASE("energy() and energy_forces() agree", "[model][golden]") {
   // forward buffer it was only supposed to read -- which the Workspace's
   // zeroing policy makes a live risk every time a buffer key is reused.
   for (const auto& model : golden_models()) {
-    const auto found = find_model(model);
-    if (!found) continue;
-    pet::Calculator calc(found->first, found->second);
+    pet::Calculator* calcp = shared_calculator(model);
+    if (!calcp) continue;
+    pet::Calculator& calc = *calcp;
     for (const auto& path : golden_paths(model)) {
       const Golden g = load_golden(path);
       DYNAMIC_SECTION(model << " / " << g.name) {

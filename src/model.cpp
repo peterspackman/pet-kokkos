@@ -1336,8 +1336,8 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse)
     const int B = (int) ed.charge.size();
     dev.charge = IView1D("charge", B);
     dev.spin_multiplicity = IView1D("spin", B);
-    auto h_q = Kokkos::create_mirror_view(dev.charge);
-    auto h_s = Kokkos::create_mirror_view(dev.spin_multiplicity);
+    auto h_q = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.charge);
+    auto h_s = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.spin_multiplicity);
     for (int b = 0; b < B; ++b) {
       h_q(b) = ed.charge[b];
       h_s(b) = (b < (int) ed.spin_multiplicity.size()) ? ed.spin_multiplicity[b] : 1;
@@ -1353,8 +1353,8 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse)
   if (!ed.adapt_r.empty() && (int) ed.adapt_r.size() == N) {
     dev.adapt_r = RView1D("adapt_r", N);
     dev.adapt_dn = RView1D("adapt_dn", N);
-    auto h_ar = Kokkos::create_mirror_view(dev.adapt_r);
-    auto h_adn = Kokkos::create_mirror_view(dev.adapt_dn);
+    auto h_ar = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.adapt_r);
+    auto h_adn = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.adapt_dn);
     for (int i = 0; i < N; ++i) {
       h_ar(i) = ed.adapt_r[i];
       h_adn(i) = ed.adapt_dn[i];
@@ -1363,17 +1363,17 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse)
     Kokkos::deep_copy(dev.adapt_dn, h_adn);
   }
 
-  auto h_species = Kokkos::create_mirror_view(dev.species);
+  auto h_species = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.species);
   for (int i = 0; i < N; ++i) h_species(i) = ed.species[i];
   Kokkos::deep_copy(dev.species, h_species);
 
-  auto h_ns = Kokkos::create_mirror_view(dev.neigh_species);
-  auto h_rev = Kokkos::create_mirror_view(dev.reverse_index);
-  auto h_ev = Kokkos::create_mirror_view(dev.edge_vec);
-  auto h_dist = Kokkos::create_mirror_view(dev.dist);
-  auto h_cut = Kokkos::create_mirror_view(dev.cutoff_factor);
-  auto h_mask = Kokkos::create_mirror_view(dev.mask);
-  auto h_pc = Kokkos::create_mirror_view(dev.pair_cutoff);
+  auto h_ns = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.neigh_species);
+  auto h_rev = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.reverse_index);
+  auto h_ev = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.edge_vec);
+  auto h_dist = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.dist);
+  auto h_cut = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.cutoff_factor);
+  auto h_mask = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.mask);
+  auto h_pc = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.pair_cutoff);
   for (int k = 0; k < NM; ++k) {
     h_ns(k) = ed.neigh_species[k];
     h_rev(k) = ed.reverse_index[k];
@@ -1393,7 +1393,7 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse)
   Kokkos::deep_copy(dev.mask, h_mask);
   Kokkos::deep_copy(dev.pair_cutoff, h_pc);
 
-  auto h_cf = Kokkos::create_mirror_view(dev.cf_seq);
+  auto h_cf = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.cf_seq);
   for (int n = 0; n < N; ++n) {
     h_cf(n, 0) = 1.0;
     for (int m = 0; m < M; ++m) h_cf(n, 1 + m) = ed.cutoff_factor[n * M + m];
@@ -1406,10 +1406,10 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse)
   dev.raw_dist = RView1D("raw_dist", E);
   dev.raw_vec = RView2D("raw_vec", E, 3);
   if (E > 0) {
-    auto h_rc = Kokkos::create_mirror_view(dev.raw_center);
-    auto h_rj = Kokkos::create_mirror_view(dev.raw_neigh);
-    auto h_rd = Kokkos::create_mirror_view(dev.raw_dist);
-    auto h_rv = Kokkos::create_mirror_view(dev.raw_vec);
+    auto h_rc = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_center);
+    auto h_rj = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_neigh);
+    auto h_rd = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_dist);
+    auto h_rv = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_vec);
     for (int e = 0; e < E; ++e) {
       h_rc(e) = ed.raw_center[e];
       h_rj(e) = ed.raw_neigh[e];
@@ -1490,8 +1490,8 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse)
       if (grouped) {
         dev.raw_off = IView1D("raw_off", N + 1);
         dev.raw_reverse = IView1D("raw_reverse", E);
-        auto h_off = Kokkos::create_mirror_view(dev.raw_off);
-        auto h_rev2 = Kokkos::create_mirror_view(dev.raw_reverse);
+        auto h_off = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_off);
+        auto h_rev2 = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_reverse);
         for (int a = 0; a <= N; ++a) h_off(a) = off[a];
         for (int e = 0; e < E; ++e) h_rev2(e) = rev[e];
         Kokkos::deep_copy(dev.raw_off, h_off);
@@ -1520,7 +1520,7 @@ BatchResult PetModel::energy_forces_batch(const std::vector<System>& systems, bo
   // to the device-resident core
   DeviceEdgeData dev = upload_edge_data(combined);
   IView1D struct_id("struct_id", N);
-  auto h_sid = Kokkos::create_mirror_view(struct_id);
+  auto h_sid = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, struct_id);
   for (int a = 0; a < N; ++a) h_sid(a) = struct_id_h[a];
   Kokkos::deep_copy(struct_id, h_sid);
   dev.struct_id = struct_id;
@@ -1542,6 +1542,7 @@ BatchResult PetModel::energy_forces_batch(const DeviceEdgeData& dev, bool comput
   RView1D per_atom;
   compute(dev, nullptr, compute_forces ? &forces : nullptr, &per_atom,
           compute_forces ? &virial : nullptr);
+  out.per_atom = per_atom;
 
   // per-structure energy: on-device segmented sum of the per-atom energy.
   // Pooled rather than freshly allocated: this ran once per optimizer round, and a
@@ -1807,7 +1808,7 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
   EnergyResult res;
   if (!dev_per_atom) {
     res.per_atom.resize(N);
-    auto h_pa = Kokkos::create_mirror_view(per_atom);
+    auto h_pa = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, per_atom);
     Kokkos::deep_copy(h_pa, per_atom);
     double total = 0.0;
     for (int i = 0; i < N; ++i) {
@@ -2016,7 +2017,7 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
         });
     *dev_virial = bvir;
   } else {
-    auto h_vir = Kokkos::create_mirror_view(dvir);
+    auto h_vir = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dvir);
     Kokkos::deep_copy(h_vir, dvir);
     res.virial[0] = h_vir(0, 0);
     res.virial[1] = h_vir(0, 4);
@@ -2028,7 +2029,7 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
   if (dev_forces) *dev_forces = d_forces;
   if (host_forces) {
     host_forces->resize(static_cast<std::size_t>(N) * 3);
-    auto h_f = Kokkos::create_mirror_view(d_forces);
+    auto h_f = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, d_forces);
     Kokkos::deep_copy(h_f, d_forces);
     for (int i = 0; i < N; ++i)
       for (int c = 0; c < 3; ++c) (*host_forces)[3 * i + c] = h_f(i, c);
@@ -2329,7 +2330,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   // host reduction there, which otherwise forces a device sync on every step.
   if (!dev_per_atom) {
     res.per_atom.resize(N);
-    auto h_pa = Kokkos::create_mirror_view(per_atom);
+    auto h_pa = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, per_atom);
     Kokkos::deep_copy(h_pa, per_atom);
     double total = 0.0;
     for (int i = 0; i < N; ++i) {
@@ -2663,7 +2664,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
         });
     *dev_virial = bvir;
   } else {
-    auto h_vir = Kokkos::create_mirror_view(dvir);
+    auto h_vir = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dvir);
     Kokkos::deep_copy(h_vir, dvir);
     res.virial[0] = h_vir(0, 0);                        // xx
     res.virial[1] = h_vir(0, 4);                        // yy
@@ -2677,7 +2678,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   // host force output (single-structure callers): one N*3 copy to host
   if (host_forces) {
     host_forces->resize(static_cast<std::size_t>(N) * 3);
-    auto h_f = Kokkos::create_mirror_view(d_forces);
+    auto h_f = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, d_forces);
     Kokkos::deep_copy(h_f, d_forces);
     for (int i = 0; i < N; ++i)
       for (int c = 0; c < 3; ++c) (*host_forces)[3 * i + c] = h_f(i, c);

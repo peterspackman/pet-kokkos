@@ -30,6 +30,7 @@ struct BatchResult {
   RView2D forces;      // [N_total,3] per-atom forces (eV/A), device; empty if not requested
   RView2D virial;      // [B,6] per-structure virial (Voigt, eV), device; empty if no forces
   IView1D struct_id;   // [N_total] owning structure per atom, device
+  RView1D per_atom;    // [N_total] per-atom energy (eV), device
   int n_struct = 0;
   int n_atoms = 0;
 };

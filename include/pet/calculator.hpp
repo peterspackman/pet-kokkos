@@ -118,6 +118,15 @@ void resolve_model(const std::string& spec, std::string& json_out, std::string& 
 // expensive part) and evaluates structures against it. Reuse one Calculator
 // across many calls: it carries the persistent scratch pools that make a
 // stepping loop free of per-round device allocation.
+// Atom count above which a single structure is evaluated on the device path
+// rather than the host one. Below it the device NEF build's fixed cost dominates
+// and the host path wins; above it the host path's O(N^2) search (vesin absent)
+// and its per-call host->device staging dominate instead. Measured crossover is
+// well under this on a 4080 SUPER; the value is set where the device path is
+// clearly ahead rather than at the break-even point, so that small cases keep
+// the path the goldens pin.
+constexpr int kDeviceSingleMinAtoms = 256;
+
 class Calculator {
  public:
   // Resolve `spec` through the search path above; empty = the default model.
@@ -196,6 +205,10 @@ class Calculator {
   const Options& options() const;
 
  private:
+  // The device batch evaluation, shared by the multi-structure overload and by
+  // the single-structure one when the structure is large enough to prefer it.
+  Results compute_batch(const std::vector<System>& systems, bool compute_forces) const;
+
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

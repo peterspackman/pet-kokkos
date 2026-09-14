@@ -235,9 +235,27 @@ DeviceGeom Calculator::stage(int n_atoms_total, int n_struct) const {
 }
 
 Results Calculator::compute(const System& system, bool compute_forces) const {
-  // Single-structure path: the host neighbour-list path. It is what the goldens
-  // validate, it returns the virial in the host EnergyResult directly, and it
-  // is the only path that fills per_atom_energy.
+  // A single structure used to take the host neighbour path unconditionally, on
+  // the grounds that one structure is not worth a device NEF build. That holds
+  // for the eight-atom cells a CSP batch is made of and fails badly for anything
+  // large: without vesin the host search is O(N^2), and the path stages ~20
+  // host->device copies per call. Measured at 1728 atoms with forces on
+  // pet-mad-s: host 0.1369 ms/atom against 0.0597 ms/atom on the device path,
+  // which did two structures in less wall time than the host path took for one.
+  //
+  // A single structure is the COMMON case -- an MD step, an ASE calculator, a
+  // relaxation step all ask for exactly one -- so the default was the slowest
+  // path for the thing callers do most. The decision belongs here rather than in
+  // the vector overload because this is the entry point they call.
+  //
+  // Small structures stay on the host path deliberately: below the threshold the
+  // device build's fixed cost dominates, and this is the path the goldens pin to
+  // 1e-9 (the two differ by ~3e-8 relative, tests/test_device_vs_host.cpp).
+  if (impl_->opts.device_neighbors && system.n_atoms >= kDeviceSingleMinAtoms)
+    return compute_batch(std::vector<System>{system}, compute_forces);
+
+  // Host neighbour-list path: what the goldens validate, it returns the virial
+  // in the host EnergyResult directly, and it fills per_atom_energy.
   Results out;
   const int N = system.n_atoms;
   out.energy.resize(1);
@@ -264,8 +282,14 @@ Results Calculator::compute(const System& system, bool compute_forces) const {
 Results Calculator::compute(const std::vector<System>& systems, bool compute_forces) const {
   const int B = static_cast<int>(systems.size());
   if (B == 0) return {};
+  // One structure routes through the single-structure overload, which decides
+  // between the host and device paths on size (see there).
   if (B == 1) return compute(systems[0], compute_forces);
+  return compute_batch(systems, compute_forces);
+}
 
+Results Calculator::compute_batch(const std::vector<System>& systems, bool compute_forces) const {
+  const int B = static_cast<int>(systems.size());
   BatchResult br;
   if (impl_->opts.device_neighbors) {
     DeviceEdgeData dev = build_device_batch(
@@ -283,27 +307,37 @@ Results Calculator::compute(const std::vector<System>& systems, bool compute_for
   for (int b = 0; b < B; ++b) out.n_atoms[b] = systems[b].n_atoms;
 
   {
-    auto h_e = Kokkos::create_mirror_view(br.energy);
+    auto h_e = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, br.energy);
     Kokkos::deep_copy(h_e, br.energy);
     for (int b = 0; b < B; ++b) out.energy[b] = h_e(b);
+  }
+
+  // The host single-structure path fills per_atom_energy, so the device route
+  // has to as well or rerouting would silently drop it.
+  if (br.per_atom.extent(0) > 0) {
+    const int Ntot = static_cast<int>(br.per_atom.extent(0));
+    auto h_pa = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, br.per_atom);
+    Kokkos::deep_copy(h_pa, br.per_atom);
+    out.per_atom_energy.resize(Ntot);
+    for (int i = 0; i < Ntot; ++i) out.per_atom_energy[i] = h_pa(i);
   }
 
   if (compute_forces && br.forces.extent(0) > 0) {
     const int Ntot = static_cast<int>(br.forces.extent(0));
     out.forces.resize(static_cast<std::size_t>(Ntot) * 3);
-    auto h_f = Kokkos::create_mirror_view(br.forces);
+    auto h_f = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, br.forces);
     Kokkos::deep_copy(h_f, br.forces);
     for (int i = 0; i < Ntot; ++i)
       for (int c = 0; c < 3; ++c) out.forces[i * 3 + c] = h_f(i, c);
 
-    auto h_id = Kokkos::create_mirror_view(br.struct_id);
+    auto h_id = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, br.struct_id);
     Kokkos::deep_copy(h_id, br.struct_id);
     out.struct_id.resize(Ntot);
     for (int i = 0; i < Ntot; ++i) out.struct_id[i] = h_id(i);
 
     if (br.virial.extent(0) > 0) {
       out.virial.resize(static_cast<std::size_t>(B) * 6);
-      auto h_w = Kokkos::create_mirror_view(br.virial);
+      auto h_w = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, br.virial);
       Kokkos::deep_copy(h_w, br.virial);
       for (int b = 0; b < B; ++b)
         for (int v = 0; v < 6; ++v) out.virial[b * 6 + v] = h_w(b, v);

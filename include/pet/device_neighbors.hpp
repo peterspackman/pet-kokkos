@@ -540,7 +540,7 @@ inline DeviceEdgeData build_device_edge_data(const System& sys, const Hypers& h,
     throw std::runtime_error("build_device_edge_data: atom count exceeds packed-key range");
 
   IView1D species("species", N);
-  auto h_sp = Kokkos::create_mirror_view(species);
+  auto h_sp = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, species);
   for (int i = 0; i < N; ++i) {
     const int Z = sys.atomic_numbers[i];
     const int s = (Z >= 0 && Z < (int) species_to_index.size()) ? species_to_index[Z] : -1;
@@ -555,11 +555,11 @@ inline DeviceEdgeData build_device_edge_data(const System& sys, const Hypers& h,
   IView2D re_shift("re_shift", E, 3);
   RView2D re_vec("re_vec", E, 3);
   RView1D re_dist("re_dist", E);
-  auto h_i = Kokkos::create_mirror_view(re_i);
-  auto h_j = Kokkos::create_mirror_view(re_j);
-  auto h_sh = Kokkos::create_mirror_view(re_shift);
-  auto h_v = Kokkos::create_mirror_view(re_vec);
-  auto h_d = Kokkos::create_mirror_view(re_dist);
+  auto h_i = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, re_i);
+  auto h_j = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, re_j);
+  auto h_sh = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, re_shift);
+  auto h_v = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, re_vec);
+  auto h_d = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, re_dist);
   const int sbias = detail::PET_KEY_SHIFT_BIAS;
   for (int e = 0; e < E; ++e) {
     const auto& r = raw[e];

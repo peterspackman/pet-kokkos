@@ -74,12 +74,12 @@ constexpr double kVirialAbsTol = 3e-2;  // eV
 
 TEST_CASE("analytic forces match -dE/dx by finite difference", "[model][fd]") {
   for (const auto& model : golden_models()) {
-    const auto found = find_model(model);
-    if (!found) {
+    pet::Calculator* calcp = shared_calculator(model);
+    if (!calcp) {
       WARN("model '" << model << "' is not installed; skipping its FD check");
       continue;
     }
-    pet::Calculator calc(found->first, found->second);
+    pet::Calculator& calc = *calcp;
 
     for (const auto& path : golden_paths(model)) {
       const Golden g = load_golden(path);
@@ -109,6 +109,13 @@ TEST_CASE("analytic forces match -dE/dx by finite difference", "[model][fd]") {
             best = worst;
             best_h = h;
           }
+          // The sweep exists to find the step where truncation and round-off
+          // balance, which is only worth searching for when the check has not
+          // already passed. Stopping at the first step that agrees keeps the
+          // failure diagnostic (a genuine mismatch still tries every step and
+          // reports the best one) and makes the passing case -- every run where
+          // nothing is broken -- up to six times cheaper.
+          if (best / std::max(max_f, 1e-30) < kRelTol || best < kForceAbsTol) break;
         }
         const double rel = best / std::max(max_f, 1e-30);
         INFO("best max|dF| = " << best << " eV/A at h = " << best_h << " (relative " << rel
@@ -121,9 +128,9 @@ TEST_CASE("analytic forces match -dE/dx by finite difference", "[model][fd]") {
 
 TEST_CASE("analytic virial matches dE/dstrain by finite difference", "[model][fd]") {
   for (const auto& model : golden_models()) {
-    const auto found = find_model(model);
-    if (!found) continue;
-    pet::Calculator calc(found->first, found->second);
+    pet::Calculator* calcp = shared_calculator(model);
+    if (!calcp) continue;
+    pet::Calculator& calc = *calcp;
 
     for (const auto& path : golden_paths(model)) {
       const Golden g = load_golden(path);
@@ -157,6 +164,7 @@ TEST_CASE("analytic virial matches dE/dstrain by finite difference", "[model][fd
             best_h = h;
             worst_v = wv;
           }
+          if (best / std::max(max_w, 1e-30) < kRelTol || best < kVirialAbsTol) break;
         }
         const double rel = best / std::max(max_w, 1e-30);
         INFO("best max|dW| = " << best << " eV at h = " << best_h << " (relative " << rel

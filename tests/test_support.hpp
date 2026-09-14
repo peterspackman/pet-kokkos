@@ -17,6 +17,7 @@
 #include <cmath>
 #include <optional>
 #include <stdexcept>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -195,6 +196,36 @@ inline const std::vector<std::string>& golden_models() {
     return v;
   }();
   return m;
+}
+
+// One Calculator per model, shared by every test case that wants default
+// options.
+//
+// Building a Calculator reads and parses a safetensors file and uploads every
+// weight to the device. Four test cases loop over the golden models, so each
+// model was being built about five times per run for no benefit: a Calculator is
+// immutable once constructed, and these cases only ever read from it.
+//
+// Only DEFAULT options are shared. A test that needs its own Options -- the
+// host/device comparisons, the cached-neighbour and TF32 cases -- must keep
+// constructing its own, or one test's settings would silently become another's.
+//
+// The cache is leaked deliberately. Calculators hold Kokkos Views, and a
+// function-local static is destroyed during static destruction, which runs after
+// Kokkos::finalize(); Kokkos rejects a View freed at that point. The process is
+// ending anyway.
+inline pet::Calculator* shared_calculator(const std::string& model) {
+  static auto* cache = new std::map<std::string, pet::Calculator*>();
+  const auto it = cache->find(model);
+  if (it != cache->end()) return it->second;
+  const auto found = find_model(model);
+  if (!found) {
+    cache->emplace(model, nullptr);
+    return nullptr;
+  }
+  auto* calc = new pet::Calculator(found->first, found->second);
+  cache->emplace(model, calc);
+  return calc;
 }
 
 }  // namespace pet_test

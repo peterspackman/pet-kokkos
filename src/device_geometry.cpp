@@ -399,14 +399,14 @@ DeviceEdgeData build_device_batch(const std::vector<System>& systems, const Hype
   }
 
   DeviceGeom g = stage_geometry_views(ws, Ntot, B);
-  auto h_pos = Kokkos::create_mirror_view(g.pos);
-  auto h_sid = Kokkos::create_mirror_view(g.sid);
-  auto h_spec = Kokkos::create_mirror_view(g.spec);
-  auto h_soff = Kokkos::create_mirror_view(g.soff);
-  auto h_scnt = Kokkos::create_mirror_view(g.scnt);
-  auto h_srng = Kokkos::create_mirror_view(g.srng);
-  auto h_sper = Kokkos::create_mirror_view(g.sper);
-  auto h_scell = Kokkos::create_mirror_view(g.scell);
+  auto h_pos = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, g.pos);
+  auto h_sid = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, g.sid);
+  auto h_spec = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, g.spec);
+  auto h_soff = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, g.soff);
+  auto h_scnt = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, g.scnt);
+  auto h_srng = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, g.srng);
+  auto h_sper = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, g.sper);
+  auto h_scell = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, g.scell);
   for (int b = 0; b < B; ++b) {
     const System& s = systems[b];
     h_soff(b) = off[b];
@@ -444,8 +444,8 @@ DeviceEdgeData build_device_batch(const std::vector<System>& systems, const Hype
   // has nothing to do with geometry.
   {
     IView1D q("charge", B), sm("spin", B);
-    auto h_q = Kokkos::create_mirror_view(q);
-    auto h_s = Kokkos::create_mirror_view(sm);
+    auto h_q = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, q);
+    auto h_s = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, sm);
     for (int b = 0; b < B; ++b) {
       h_q(b) = systems[b].charge;
       h_s(b) = systems[b].spin_multiplicity;
