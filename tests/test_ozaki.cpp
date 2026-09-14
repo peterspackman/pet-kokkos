@@ -92,7 +92,6 @@ TEST_CASE("the Ozaki GEMM reproduces DGEMM as slices increase", "[ozaki]") {
   };
 
   ConfigGuard guard;
-  pet::Workspace ws;
   for (const Case& c : cases) {
     DYNAMIC_SECTION("m=" << c.m << " k=" << c.k << " n=" << c.n << " " << c.ta << c.tb) {
       const bool ta = (c.ta == 'T'), tb = (c.tb == 'T');
@@ -112,7 +111,7 @@ TEST_CASE("the Ozaki GEMM reproduces DGEMM as slices increase", "[ozaki]") {
       for (int s : {2, 4, 6, 8}) {
         guard.use(s);
         Kokkos::deep_copy(C, (pet::Net) 0.0);
-        pet::gemm_ozaki(ws, "t", c.ta, c.tb, (pet::Net) 1.0, A, B, (pet::Net) 0.0, C, nullptr);
+        pet::gemm_ozaki(c.ta, c.tb, (pet::Net) 1.0, A, B, (pet::Net) 0.0, C, nullptr);
         const double err = max_rel_diff(C, Cref);
         std::printf("    slices=%d  max relative error = %.3e\n", s, err);
         INFO("slices = " << s << ", error " << err << ", previous " << prev);
@@ -144,17 +143,16 @@ TEST_CASE("a pre-split weight gives the same answer as splitting in place", "[oz
   fill_random(W, 22, 1.0);
 
   ConfigGuard guard;
-  pet::Workspace ws;
   guard.use(pet::kOzakiMaxSlices);
 
   // Split in place.
-  pet::gemm_ozaki(ws, "inplace", 'N', 'T', (pet::Net) 1.0, A, W, (pet::Net) 0.0, C1, nullptr);
+  pet::gemm_ozaki('N', 'T', (pet::Net) 1.0, A, W, (pet::Net) 0.0, C1, nullptr);
 
   // Split once, as a load-time weight would be, then reuse.
   pet::OzakiSplit wsplit = pet::ozaki_split_weight(W, pet::kOzakiMaxSlices);
   REQUIRE(wsplit.valid());
   REQUIRE(wsplit.uniform);
-  pet::gemm_ozaki(ws, "presplit", 'N', 'T', (pet::Net) 1.0, A, W, (pet::Net) 0.0, C2, &wsplit);
+  pet::gemm_ozaki('N', 'T', (pet::Net) 1.0, A, W, (pet::Net) 0.0, C2, &wsplit);
 
   const double d = max_rel_diff(C2, C1);
   INFO("pre-split vs in-place: max relative difference " << d);
@@ -188,9 +186,8 @@ TEST_CASE("beta accumulates rather than overwriting", "[ozaki]") {
   Kokkos::deep_copy(Cref, C);
 
   ConfigGuard guard;
-  pet::Workspace ws;
   guard.use(pet::kOzakiMaxSlices);
-  pet::gemm_ozaki(ws, "acc", 'N', 'N', (pet::Net) 1.0, A, B, (pet::Net) 1.0, C, nullptr);
+  pet::gemm_ozaki('N', 'N', (pet::Net) 1.0, A, B, (pet::Net) 1.0, C, nullptr);
   guard.native();
   pet::gemm('N', 'N', (pet::Net) 1.0, A, B, (pet::Net) 1.0, Cref);
 
@@ -212,7 +209,6 @@ TEST_CASE("Ozaki against DGEMM: throughput", "[ozaki][!benchmark]") {
   fill_random(A, 3, 1.0);
   fill_random(B, 4, 1.0);
   ConfigGuard guard;
-  pet::Workspace ws;
 
   auto time_it = [&](auto&& f) {
     f();  // warm
@@ -232,7 +228,7 @@ TEST_CASE("Ozaki against DGEMM: throughput", "[ozaki][!benchmark]") {
     guard.use(s);
     pet::OzakiSplit ws_s = pet::ozaki_split_weight(B, s);
     const double t = time_it([&] {
-      pet::gemm_ozaki(ws, "bench", 'N', 'T', (pet::Net) 1.0, A, B, (pet::Net) 0.0, C, &ws_s);
+      pet::gemm_ozaki('N', 'T', (pet::Net) 1.0, A, B, (pet::Net) 0.0, C, &ws_s);
     });
     std::printf("    Ozaki slices=%d         %8.3f ms   (%.2fx vs DGEMM)\n", s, t * 1e3,
                 t_native / t);

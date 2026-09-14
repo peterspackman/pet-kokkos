@@ -1,4 +1,5 @@
 #include "pet/model.hpp"
+#include "pet/ozaki.hpp"
 
 #include "pet/gemm.hpp"
 
@@ -27,8 +28,11 @@ constexpr int VBINS = 256;  // virial-accumulator bins (cut atomic contention)
 // ----------------------------------------------------------------------------
 
 // out(R,Dout) = in(R,Din) @ W(Dout,Din)^T + b(Dout)
-void linear(View2D out, View2D in, View2D W, View1D b) {
-  gemm('N', 'T', (Net)1.0, in, W, (Net)0.0, out);  // out = in @ W^T
+void linear(View2D out, View2D in, WeightRef W, View1D b) {
+  // gemm_ozaki falls through to the vendor GEMM unless the Ozaki path is both
+  // asked for and available, so every call site gets it for free and none of
+  // them has to know.
+  gemm_ozaki('N', 'T', (Net)1.0, in, W.v, (Net)0.0, out, W.for_orientation(true));
   const int R = out.extent(0), Dout = out.extent(1);
   Kokkos::parallel_for(
       "bias", RangePolicy(0, (R) * (Dout)),
@@ -39,8 +43,8 @@ void linear(View2D out, View2D in, View2D W, View1D b) {
 // linear / copy_into / silu_inplace triple (3 elementwise passes) with the gemm
 // plus a single fused epilogue kernel. `sav` (when save) receives the pre-SiLU
 // value the analytic backward needs; pass an empty View when !save.
-void linear_silu(View2D out, View2D sav, View2D in, View2D W, View1D b, bool save) {
-  gemm('N', 'T', (Net)1.0, in, W, (Net)0.0, out);  // out = in @ W^T
+void linear_silu(View2D out, View2D sav, View2D in, WeightRef W, View1D b, bool save) {
+  gemm_ozaki('N', 'T', (Net)1.0, in, W.v, (Net)0.0, out, W.for_orientation(true));
   const int R = out.extent(0), Dout = out.extent(1);
   Kokkos::parallel_for(
       "linear_silu", RangePolicy(0, (R) * (Dout)),
@@ -206,7 +210,7 @@ constexpr int kMaxHeadDim = 128;
 
 template <int HD>
 void attention_impl(Workspace& ws, const std::string& key, View2D attn_out, View2D qkv,
-                    View2D cf_seq, View2D w_out, View1D b_out, int N, int S, int num_heads,
+                    View2D cf_seq, WeightRef w_out, View1D b_out, int N, int S, int num_heads,
                     int head_dim, double temperature, bool save) {
   const int D = num_heads * head_dim, H = num_heads;
   View2D merged = ws.n2(key + ":merged", N * S, D);
@@ -285,7 +289,7 @@ void attention_impl(Workspace& ws, const std::string& key, View2D attn_out, View
     default: FN<0>(__VA_ARGS__); break;                             \
   }
 void attention(Workspace& ws, const std::string& key, View2D attn_out, View2D qkv, View2D cf_seq,
-               View2D w_out, View1D b_out, int N, int S, int num_heads, int head_dim,
+               WeightRef w_out, View1D b_out, int N, int S, int num_heads, int head_dim,
                double temperature, bool save) {
   PET_ATTN_DISPATCH(attention_impl, ws, key, attn_out, qkv, cf_seq, w_out, b_out, N, S, num_heads,
                     head_dim, temperature, save);
@@ -296,8 +300,12 @@ void attention(Workspace& ws, const std::string& key, View2D attn_out, View2D qk
 // ----------------------------------------------------------------------------
 
 // in_adj(R,Din) += out_adj(R,Dout) @ W(Dout,Din)
-void linear_bwd(View2D in_adj, View2D out_adj, View2D W) {
-  gemm('N', 'N', (Net)1.0, out_adj, W, (Net)1.0, in_adj);  // accumulate
+void linear_bwd(View2D in_adj, View2D out_adj, WeightRef W) {
+  // The BACKWARD goes through the same path as the forward, which is the point
+  // for anything that differentiates the forces again -- a Hessian, a phonon
+  // calculation, a nested finite difference. An accurate forward with an fp32
+  // backward would leave the second derivative limited by the backward.
+  gemm_ozaki('N', 'N', (Net)1.0, out_adj, W.v, (Net)1.0, in_adj, W.for_orientation(false));
 }
 
 // grad *= dsilu(pre)  (in place)
@@ -971,8 +979,11 @@ View2D PetModel::conditioning(const DeviceEdgeData& dev, int N, int NS) {
   // [NS, 2*Dn] = [charge_embedding(q + max_charge) | spin_embedding(2S+1 - 1)]
   View2D cat = ws_.n2("cond_cat", NS, 2 * Dn);
   {
-    auto qe = mat("system_conditioning.charge_embedding.weight");
-    auto se = mat("system_conditioning.spin_multiplicity_embedding.weight");
+    // The Views themselves: these are gathered from element-wise in a kernel,
+    // not multiplied, so the Ozaki decomposition mat() also carries is of no use
+    // here and a WeightRef is not indexable.
+    const View2D qe = mat("system_conditioning.charge_embedding.weight");
+    const View2D se = mat("system_conditioning.spin_multiplicity_embedding.weight");
     const int nq = (int) qe.extent(0), ns = (int) se.extent(0);
     Kokkos::parallel_for(
         "cond_gather", RangePolicy(0, NS * Dn), KOKKOS_LAMBDA(int _i) {
@@ -1112,10 +1123,13 @@ void PetModel::readout(const std::vector<View2D>& node_feat, const std::vector<V
   }
 }
 
-const View2D& PetModel::mat(const std::string& name) const {
+WeightRef PetModel::mat(const std::string& name) const {
   auto it = mat_.find(name);
   if (it == mat_.end()) throw std::runtime_error("PetModel: missing matrix '" + name + "'");
-  return it->second;
+  const auto sit = wsplit_.find(name);
+  const auto tit = wsplit_t_.find(name);
+  return WeightRef{it->second, sit == wsplit_.end() ? nullptr : &sit->second,
+                   tit == wsplit_t_.end() ? nullptr : &tit->second};
 }
 const View1D& PetModel::vec(const std::string& name) const {
   auto it = vec_.find(name);
@@ -1263,6 +1277,24 @@ void PetModel::load_all(const Checkpoint& ckpt) {
   }
   if (h_.num_attention_layers < 1)
     throw std::runtime_error("PetModel: num_attention_layers must be >= 1");
+  // Ozaki: decompose every weight once, here, and never again. This is what
+  // makes the scheme affordable for this network -- each GEMM is
+  // `activation x weight`, and a decomposition depends only on its own operand,
+  // so half of every product's splitting work is done before the first
+  // evaluation runs.
+  //
+  // Weights use a matrix-wide scale (ozaki_split_weight), not per-row: a weight
+  // is used transposed by linear() and untransposed by linear_bwd(), and those
+  // want normalisation along opposite axes. A scalar is constant along both, so
+  // one decomposition serves both directions instead of two.
+  if (ozaki_active()) {
+    const int slices = ozaki_config().slices;
+    for (const auto& kv : mat_) {
+      wsplit_.emplace(kv.first, ozaki_split_weight(kv.second, slices, false));
+      wsplit_t_.emplace(kv.first, ozaki_split_weight(kv.second, slices, true));
+    }
+  }
+
   if (h_.head_dim > kMaxHeadDim)
     throw std::runtime_error("PetModel: head_dim " + std::to_string(h_.head_dim) +
                              " exceeds the attention kernels' ceiling of " +
@@ -1278,7 +1310,7 @@ void PetModel::load_all(const Checkpoint& ckpt) {
 // Marshal a host EdgeData into device Views. This is the single host->device
 // boundary for the host-neighbor-list path; compute() itself is device-native
 // and never touches the host EdgeData.
-DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed) const {
+DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse) const {
   const int N = ed.n_atoms;
   const int M = ed.max_neighbors;
   const int S = M + 1;
@@ -1401,20 +1433,51 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed) const {
       if (e > 0 && ed.raw_center[e] < ed.raw_center[e - 1]) { grouped = false; break; }
       ++off[ed.raw_center[e] + 1];
     }
-    if (grouped) {
+    // Only the adaptive-cutoff backward consumes these, so a fixed-cutoff model
+    // never needs them either.
+    if (grouped && need_reverse && h_.adaptive()) {
       for (int a = 0; a < N; ++a) off[a + 1] += off[a];
       // Partner of (i, j, v) is (j, i, -v). Matched on the neighbour index and the
       // closest opposing vector, which distinguishes periodic images of the same
       // pair; an exact float compare would be at the mercy of how each vector was
       // rounded.
+      // Is raw_neigh non-decreasing within each centre's run? Both host searches
+      // emit the list sorted by (i, j, shift) -- the vesin wrapper sorts
+      // explicitly, the built-in search's nested loops produce it naturally --
+      // but neither is contractually required to, and a caller supplying its own
+      // edge list certainly is not. Checked in one pass rather than assumed.
+      bool sorted_runs = true;
+      for (int a = 0; a < N && sorted_runs; ++a)
+        for (int f = off[a] + 1; f < off[a + 1]; ++f)
+          if (ed.raw_neigh[f] < ed.raw_neigh[f - 1]) { sorted_runs = false; break; }
+
       std::vector<int> rev(E, -1);
       for (int e = 0; e < E && grouped; ++e) {
         const int i = ed.raw_center[e], j = ed.raw_neigh[e];
         const double vx = -ed.raw_vec[3 * e + 0], vy = -ed.raw_vec[3 * e + 1],
                      vz = -ed.raw_vec[3 * e + 2];
+        // Narrow the scan to the block of j's edges that point back at i.
+        //
+        // Without this the loop walks all of atom j's neighbours for every edge:
+        // O(E x neighbours), 147 million iterations on a 1728-atom supercell and
+        // ~72 ms -- more than the adaptive-cutoff solver and the whole NEF packer
+        // combined, and the single largest cost on the host path. When the run is
+        // sorted, the edges with raw_neigh == i are contiguous (one to three
+        // periodic images of the same pair), so a pair of binary searches finds
+        // them directly.
+        //
+        // The candidate set and the closest-vector choice below are unchanged, so
+        // the output is byte-identical; this only skips entries the scan would
+        // have rejected on the `raw_neigh != i` test anyway.
+        int lo = off[j], hi = off[j + 1];
+        if (sorted_runs) {
+          const auto begin = ed.raw_neigh.begin();
+          lo = (int) (std::lower_bound(begin + off[j], begin + off[j + 1], i) - begin);
+          hi = (int) (std::upper_bound(begin + lo, begin + off[j + 1], i) - begin);
+        }
         double best = 1e300;
         int found = -1;
-        for (int f = off[j]; f < off[j + 1]; ++f) {
+        for (int f = lo; f < hi; ++f) {
           if (ed.raw_neigh[f] != i) continue;
           const double dx = ed.raw_vec[3 * f + 0] - vx, dy = ed.raw_vec[3 * f + 1] - vy,
                        dz = ed.raw_vec[3 * f + 2] - vz;

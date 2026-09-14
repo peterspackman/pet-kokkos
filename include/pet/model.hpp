@@ -9,6 +9,7 @@
 #include "pet/config.hpp"
 #include "pet/kokkos.hpp"
 #include "pet/neighbors.hpp"
+#include "pet/ozaki.hpp"
 
 namespace pet {
 
@@ -91,13 +92,44 @@ struct DeviceEdgeData {
   IView1D spin_multiplicity;
 };
 
+// A weight matrix, together with its Ozaki decomposition when there is one.
+//
+// Carried as a pair rather than threading the split through linear() /
+// linear_silu() / linear_bwd() separately, because those have some eighty call
+// sites, all spelled `linear(out, in, mat("..."), vec("..."))`. The implicit
+// conversion both ways means every other use of mat() -- the embedding gathers,
+// a plain View2D held in a local -- keeps working unchanged, just without the
+// pre-split (the GEMM then splits that operand in place).
+//
+// `v` is held by value: a Kokkos::View is a reference-counted handle, so copying
+// it is cheap, and a reference member would dangle the moment one of these was
+// built from a temporary.
+struct WeightRef {
+  View2D v;
+  // Two decompositions, because int8 tensor-core GEMM needs the contraction
+  // index contiguous and a weight is contracted along opposite axes by
+  // linear() (transposed) and linear_bwd() (not). `split` is the natural
+  // layout, `split_t` the transposed one; both are null unless the Ozaki path
+  // is on.
+  const OzakiSplit* split = nullptr;
+  const OzakiSplit* split_t = nullptr;
+  WeightRef() = default;
+  WeightRef(const View2D& m, const OzakiSplit* s = nullptr, const OzakiSplit* st = nullptr)
+      : v(m), split(s), split_t(st) {}
+  // The decomposition to use when the GEMM wants B transposed (`tb`) or not.
+  const OzakiSplit* for_orientation(bool tb) const { return tb ? split : split_t; }
+  operator const View2D&() const { return v; }
+  std::size_t extent(int d) const { return v.extent(d); }
+};
+
 class PetModel {
  public:
   explicit PetModel(const Checkpoint& ckpt);
 
   // Evaluate total + per-atom energy for one preprocessed system.
   EnergyResult energy(const EdgeData& ed) {
-    return compute(upload_edge_data(ed), nullptr, nullptr);
+    // No forces, so no backward, so nothing will read the reverse map.
+    return compute(upload_edge_data(ed, /*need_reverse=*/false), nullptr, nullptr);
   }
 
   // Evaluate energy and conservative forces (F[i] = -dE/dx_i, eV/Angstrom).
@@ -137,7 +169,16 @@ class PetModel {
   }
 
   // Marshal a host EdgeData into device Views (one host->device copy per array).
-  DeviceEdgeData upload_edge_data(const EdgeData& ed) const;
+  // `need_reverse` builds raw_off / raw_reverse, the per-atom segmentation and
+  // partner map the adaptive-cutoff BACKWARD needs in order to gather rather
+  // than scatter. They cost real time to construct -- on a 1728-atom supercell
+  // the reverse map was the single largest item on the host path -- and nothing
+  // else reads them, so an energy-only evaluation should not pay for them.
+  //
+  // Be careful turning it off: without them adaptive_backward falls back to an
+  // atomic scatter, which is correct but NOT reproducible run to run. Pass false
+  // only where no backward will run at all.
+  DeviceEdgeData upload_edge_data(const EdgeData& ed, bool need_reverse = true) const;
 
   const Hypers& hypers() const { return h_; }
 
@@ -192,6 +233,16 @@ class PetModel {
 
   std::unordered_map<std::string, View2D> mat_;  // matrices / embedding tables
   std::unordered_map<std::string, View1D> vec_;  // biases / norm weights
+  // Ozaki slice decompositions of the weight matrices, when that path is in
+  // use. Empty otherwise.
+  //
+  // Computed once here, at load, and reused by every evaluation for the life of
+  // the model. That is the whole reason the Ozaki scheme is affordable for this
+  // network: every GEMM in PET is `activation x weight`, and a slice
+  // decomposition depends only on its own operand, so half of each product's
+  // splitting work is done before the first evaluation runs.
+  std::unordered_map<std::string, OzakiSplit> wsplit_;
+  std::unordered_map<std::string, OzakiSplit> wsplit_t_;  // transposed layout
 
   // What the last evaluation actually cost: pool bytes and the atom count they
   // were for. A caller sizing a batch divides the two -- see
@@ -220,7 +271,14 @@ class PetModel {
   long peak_edge_slots_ = 0;
   int peak_max_neighbors_ = 0;
 
-  const View2D& mat(const std::string& name) const;
+  // A weight matrix, together with its Ozaki decomposition when there is one.
+  //
+  // Returned as a pair rather than threaded through linear()/linear_silu()/
+  // linear_bwd() separately because those have some eighty call sites, all
+  // spelled `linear(out, in, mat("..."), vec("..."))`. The implicit conversion
+  // means every other use of mat() -- attention's projections, the embedding
+  // gathers -- keeps compiling unchanged.
+  WeightRef mat(const std::string& name) const;
   const View1D& vec(const std::string& name) const;
 
   // --- architecture-varying components, resolved from the loaded hypers -------

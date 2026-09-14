@@ -44,6 +44,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -146,13 +147,35 @@ OzakiSplit ozaki_split(Workspace& ws, const std::string& key, const View2D& src,
 // As above but owning its buffers and using a single matrix-wide scale, for a
 // weight that is split once at load and then used in either direction. See
 // OzakiSplit::uniform.
-OzakiSplit ozaki_split_weight(const View2D& src, int n_slices);
+//
+// `transposed` decomposes src^T instead. Both layouts are needed because int8
+// tensor-core GEMM only accepts operands with the contraction index contiguous
+// -- cuBLAS's "TN" case -- and a weight is contracted along opposite axes by
+// linear() (transposed) and linear_bwd() (not). Feeding it the other layout
+// returns CUBLAS_STATUS_NOT_SUPPORTED rather than running slowly.
+//
+// The two share a scale, so the transposed slices are a permutation of the same
+// digits: no accuracy is lost, only memory. That memory is not trivial -- eight
+// int8 slices in two layouts is 16 bytes per weight element against 8 for the
+// fp64 weight itself -- so this is done only when the Ozaki path is actually on.
+OzakiSplit ozaki_split_weight(const View2D& src, int n_slices, bool transposed = false);
 
 // C = alpha * op(A) * op(B) + beta * C, computed through the slice grid.
-// `bsplit` is B's precomputed decomposition; pass an invalid one to split it
-// here. Falls back to the native GEMM when the Ozaki path is unavailable.
-void gemm_ozaki(Workspace& ws, const std::string& key, char transA, char transB, Net alpha,
-                const View2D& A, const View2D& B, Net beta, const View2D& C,
-                const OzakiSplit* bsplit);
+// `bsplit` is B's precomputed decomposition (null to split it here). Falls back
+// to the native GEMM when the Ozaki path is unavailable, so it is safe to call
+// unconditionally.
+//
+// The scratch it needs -- the activation's slices and the int32 accumulator --
+// comes from a pool private to this translation unit, under fixed keys. That is
+// sound because no two of these calls are ever live at once: each completes
+// before the next begins. It also keeps the signature small enough to drop into
+// linear()/linear_bwd() without threading a Workspace through the ~80 call sites
+// that use them.
+void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View2D& B, Net beta,
+                const View2D& C, const OzakiSplit* bsplit);
+
+// Bytes the Ozaki scratch pool is currently holding. A caller sizing a batch has
+// to count this alongside the model's own workspace.
+std::size_t ozaki_workspace_bytes();
 
 }  // namespace pet

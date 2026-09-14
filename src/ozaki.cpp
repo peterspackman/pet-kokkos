@@ -160,10 +160,23 @@ OzakiSplit ozaki_split(Workspace& ws, const std::string& key, const View2D& src,
   return out;
 }
 
-OzakiSplit ozaki_split_weight(const View2D& src, int n_slices) {
+OzakiSplit ozaki_split_weight(const View2D& src, int n_slices, bool transposed) {
   OzakiSplit out;
-  // by_column is irrelevant under a uniform scale; pass false for definiteness.
-  split_into(nullptr, "w", src, n_slices, /*by_column=*/false, /*uniform=*/true, out);
+  if (!transposed) {
+    // by_column is irrelevant under a uniform scale; pass false for definiteness.
+    split_into(nullptr, "w", src, n_slices, /*by_column=*/false, /*uniform=*/true, out);
+    return out;
+  }
+  // Materialise src^T and split that. Transposing the fp64 weight and splitting
+  // is equivalent to transposing the slices -- the scale is matrix-wide, so the
+  // digits do not depend on position -- and it is far less code than a
+  // slice-wise transpose. The temporary lives only for this call, at load.
+  const int R = (int) src.extent(0), C = (int) src.extent(1);
+  View2D srcT("wT", C, R);
+  Kokkos::parallel_for(
+      "oz_wT", Kokkos::RangePolicy<ExecSpace>(0, R * C),
+      KOKKOS_LAMBDA(int idx) { srcT(idx % C, idx / C) = src(idx / C, idx % C); });
+  split_into(nullptr, "wT", srcT, n_slices, /*by_column=*/false, /*uniform=*/true, out);
   return out;
 }
 
@@ -176,27 +189,57 @@ namespace {
 // int8 x int8 -> int32, on tensor cores. beta = 1 accumulates, and because the
 // accumulator is integer that accumulation is exact -- no ordering concern, and
 // no reason to keep separate buffers per slice pair.
+//
+// Returns the status rather than throwing, because CUBLAS_STATUS_NOT_SUPPORTED
+// is an expected answer for some shapes and the caller falls back rather than
+// failing. See gemm_ozaki.
+cublasStatus_t igemm_try(cublasOperation_t oa, cublasOperation_t ob, int m, int n, int k,
+                         const int8_t* A, int lda, const int8_t* B, int ldb, int32_t beta,
+                         int32_t* C, int ldc) {
+  const int32_t alpha = 1;
+  return cublasGemmEx(blas_handle(), oa, ob, m, n, k, &alpha, A, CUDA_R_8I, lda, B, CUDA_R_8I,
+                      ldb, &beta, C, CUDA_R_32I, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
+}
+
 void igemm(cublasOperation_t oa, cublasOperation_t ob, int m, int n, int k, const int8_t* A,
            int lda, const int8_t* B, int ldb, int32_t beta, int32_t* C, int ldc) {
-  const int32_t alpha = 1;
-  const cublasStatus_t st = cublasGemmEx(
-      blas_handle(), oa, ob, m, n, k, &alpha, A, CUDA_R_8I, lda, B, CUDA_R_8I, ldb, &beta, C,
-      CUDA_R_32I, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
+  const cublasStatus_t st = igemm_try(oa, ob, m, n, k, A, lda, B, ldb, beta, C, ldc);
+  // The shape was probed before the loop, so an unsupported one has already
+  // fallen back; anything failing here is a genuine error.
   if (st != CUBLAS_STATUS_SUCCESS)
     throw std::runtime_error("pet: cublasGemmEx (int8) failed with status " +
-                             std::to_string((int) st));
+                             std::to_string((int) st) + " (m=" + std::to_string(m) +
+                             " n=" + std::to_string(n) + " k=" + std::to_string(k) + ")");
 }
 }  // namespace
 #endif
 
-void gemm_ozaki(Workspace& ws, const std::string& key, char transA, char transB, Net alpha,
-                const View2D& A, const View2D& B, Net beta, const View2D& C,
-                const OzakiSplit* bsplit) {
+namespace {
+// Scratch for the slice grid. Private and keyed fixed, because only one
+// gemm_ozaki is ever in flight -- see the header. Pooled rather than allocated
+// per call for the usual reason: a cudaMalloc/cudaFree pair per GEMM would
+// synchronise the device on every layer of every evaluation.
+Workspace& ozaki_ws() {
+  // Leaked at exit, deliberately, exactly as blas_handle() is: a function-local
+  // static is destroyed during static destruction, which runs AFTER
+  // Kokkos::finalize(), and Kokkos rejects a View freed at that point. Leaking
+  // it is the standard way out and costs nothing -- the process is ending.
+  static Workspace* ws = new Workspace();
+  return *ws;
+}
+}  // namespace
+
+std::size_t ozaki_workspace_bytes() { return ozaki_ws().capacity_bytes(); }
+
+void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View2D& B, Net beta,
+                const View2D& C, const OzakiSplit* bsplit) {
   const OzakiConfig& cfg = ozaki_config();
   if (!ozaki_active()) {
     gemm(transA, transB, alpha, A, B, beta, C);
     return;
   }
+  Workspace& ws = ozaki_ws();
+  const std::string key = "oz";
 
 #if defined(KOKKOS_ENABLE_CUDA)
   const bool ta = (transA == 'T' || transA == 't');
@@ -211,12 +254,20 @@ void gemm_ozaki(Workspace& ws, const std::string& key, char transA, char transB,
   // one, because the digits of the two operands would be scaled inconsistently
   // across the summation index.
   OzakiSplit asp = ozaki_split(ws, key + ":a", A, S, /*by_column=*/ta);
+  // B is handed to cuBLAS as the FIRST operand (it computes C^T = B^T A^T for our
+  // row-major data), and int8 tensor cores need that operand transposed -- the
+  // contraction index has to be contiguous. When the caller already wants B
+  // transposed the stored layout is right; when it does not, the transposed
+  // decomposition is the one to use, and the GEMM is issued as OP_T either way.
   OzakiSplit bown;
   const OzakiSplit* bs = bsplit;
   if (!bs || !bs->valid() || bs->n_slices != S) {
-    bown = ozaki_split(ws, key + ":b", B, S, /*by_column=*/!tb);
+    // No pre-split supplied: decompose here, in whichever layout the int8 GEMM
+    // can take. This is the fallback; a model's weights arrive pre-split.
+    bown = ozaki_split_weight(B, S, /*transposed=*/!tb);
     bs = &bown;
   }
+  const int ldb_eff = tb ? (int) B.extent(1) : (int) B.extent(0);
 
   // Pooled: this is [m, n] int32, which at the widths the heavy models use is
   // hundreds of megabytes. Allocating it per GEMM would reintroduce exactly the
@@ -226,6 +277,31 @@ void gemm_ozaki(Workspace& ws, const std::string& key, char transA, char transB,
   static_assert(sizeof(int) == 4, "the Ozaki accumulator assumes 32-bit int");
 
   const int lda = (int) A.extent(1), ldb = (int) B.extent(1), ldc = n;
+
+  // Not every shape can go through int8 tensor cores. The exact rule is a
+  // function of the cuBLAS version and the architecture's IMMA fragment size, so
+  // rather than encode one, ask: try the shape, and on NOT_SUPPORTED use the
+  // vendor fp64 GEMM for this call instead.
+  //
+  // That fallback is always safe -- DGEMM is exact, so falling back can only
+  // improve accuracy -- and it is the right answer anyway for the shapes that
+  // fail. In this network they are PET's geometry embedder, the Linear(4 ->
+  // d_pet) on [edge_vector, distance] that gives the architecture its name: at
+  // k = 4 there is nothing for a slice decomposition to win, and a 45-GEMM grid
+  // over a k = 4 contraction would be pure overhead.
+  {
+    const cublasStatus_t probe =
+        igemm_try(CUBLAS_OP_T, ta ? CUBLAS_OP_T : CUBLAS_OP_N, n, m, k, bs->slices[0].data(),
+                  ldb_eff, asp.slices[0].data(), lda, 0, reinterpret_cast<int32_t*>(G.data()), ldc);
+    if (probe == CUBLAS_STATUS_NOT_SUPPORTED) {
+      gemm(transA, transB, alpha, A, B, beta, C);
+      return;
+    }
+    if (probe != CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("pet: cublasGemmEx (int8) probe failed with status " +
+                               std::to_string((int) probe));
+  }
+
   auto scaleA = asp.scale;
   auto scaleB = bs->scale;
   const bool uniA = asp.uniform, uniB = bs->uniform;
@@ -243,9 +319,10 @@ void gemm_ozaki(Workspace& ws, const std::string& key, char transA, char transB,
       if (t >= S || v >= S) continue;
       // cuBLAS is column-major and these Views are row-major, so the operands
       // swap and the transposes follow -- the same inversion gemm() does.
-      igemm(tb ? CUBLAS_OP_T : CUBLAS_OP_N, ta ? CUBLAS_OP_T : CUBLAS_OP_N, n, m, k,
-            bs->slices[v].data(), ldb, asp.slices[t].data(), lda, used ? 1 : 0,
-            reinterpret_cast<int32_t*>(G.data()), ldc);
+      // Always OP_T on B: its slices are stored with the contraction index
+      // contiguous, whichever layout that took.
+      igemm(CUBLAS_OP_T, ta ? CUBLAS_OP_T : CUBLAS_OP_N, n, m, k, bs->slices[v].data(), ldb_eff,
+            asp.slices[t].data(), lda, used ? 1 : 0, reinterpret_cast<int32_t*>(G.data()), ldc);
       ++used;
     }
     if (!used) continue;

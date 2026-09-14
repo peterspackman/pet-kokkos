@@ -126,6 +126,11 @@ checked; `pet-eval --json` reports which is in use.
 This covers the **host** path. The device-resident path has its own cell list,
 below.
 
+Cumulatively, a 1728-atom evaluation with forces went from ~0.44 s to ~0.165 s
+(2.7x): the vesin cell list replacing the brute-force search, then bounding the
+reverse-edge map's scan, which was quadratic by accident and was the largest
+single host cost once the search stopped being.
+
 ### Device neighbour search
 
 `build_nef_device` — the path a relaxer or MD driver uses, where geometry never
