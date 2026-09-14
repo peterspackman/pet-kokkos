@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <cmath>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -48,6 +49,9 @@ struct Golden {
   bool periodic = false;
   double total_energy = 0.0;
   double volume = 0.0;
+  // The energy scale of the model this golden was generated from, when it
+  // recorded one. Used to refuse a mismatched model -- see require_matching_model.
+  std::optional<double> model_energy_scale;
   std::vector<double> per_atom_energies;   // [N]
   std::vector<double> forces;              // [N*3]
   std::optional<std::array<double, 9>> stress;  // row-major 3x3, if periodic
@@ -65,6 +69,8 @@ inline Golden load_golden(const std::string& path) {
   out.periodic = g.value("periodic", false);
   out.total_energy = g.at("total_energy").get<double>();
   out.volume = g.value("volume", 0.0);
+  if (g.contains("model_metadata") && g.at("model_metadata").contains("energy_scale"))
+    out.model_energy_scale = g.at("model_metadata").at("energy_scale").get<double>();
 
   const int N = g.at("n_atoms").get<int>();
   out.system.n_atoms = N;
@@ -117,6 +123,27 @@ inline std::vector<std::string> golden_dirs() {
     }
   }
   return dirs;
+}
+
+// Refuse to compare a golden against a model it was not generated from.
+//
+// Model NAMES are not unique across time: `pet-mad-xs` means one checkpoint to
+// the goldens shipped here and a different one on HuggingFace today (different
+// weights, different cutoff width, grid vs solver). Both legitimately answer to
+// that name, so whichever directory comes first on the search path wins -- and
+// the symptom is a golden failing by 0.14 eV with no hint that it is comparing
+// two different models.
+//
+// energy_scale is the fingerprint: a per-model fitted constant, recorded in the
+// golden's model_metadata, and different for any two distinct checkpoints.
+inline void require_matching_model(const Golden& g, const pet::Calculator& calc) {
+  if (!g.model_energy_scale) return;  // an older golden with no fingerprint
+  const double want = *g.model_energy_scale, got = calc.energy_scale();
+  INFO("golden '" << g.model << "/" << g.name << "' was generated from a model with "
+                  << "energy_scale " << want << ", but the model resolved for it has " << got
+                  << ". A different checkpoint is answering to the same name -- check "
+                     "PET_MODEL_DIR ordering.");
+  REQUIRE(std::fabs(want - got) <= 1e-9 * std::max(1.0, std::fabs(want)));
 }
 
 // Every golden available for a given model.

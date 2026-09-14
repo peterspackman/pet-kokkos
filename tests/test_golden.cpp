@@ -55,6 +55,7 @@ TEST_CASE("goldens reproduce the reference energy, forces and stress", "[model][
     for (const auto& path : golden_paths(model)) {
       const Golden g = load_golden(path);
       DYNAMIC_SECTION(model << " / " << g.name) {
+        require_matching_model(g, calc);
         const pet::Results r = calc.compute(g.system, /*compute_forces=*/true);
 
         REQUIRE(r.energy.size() == 1);

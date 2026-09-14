@@ -149,6 +149,11 @@ class Calculator {
   bool supports(int atomic_number) const;
   const std::string& length_unit() const;
   const std::string& energy_unit() const;
+  // The output scaler fitted with this model. Not needed to evaluate anything --
+  // it is applied internally -- but it is the sharpest single fingerprint of
+  // WHICH checkpoint is loaded, which a golden uses to refuse a model it was not
+  // generated from.
+  double energy_scale() const;
 
   // Atoms per batch this model can afford right now. Two ceilings bind and the
   // smaller wins: device MEMORY (the backward's saved activations are linear in

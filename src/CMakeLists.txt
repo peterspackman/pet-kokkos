@@ -8,6 +8,7 @@ add_library(pet_kokkos STATIC
     device_geometry.cpp
     calculator.cpp
     io/extxyz.cpp
+    ozaki.cpp
 )
 add_library(pet::kokkos ALIAS pet_kokkos)
 

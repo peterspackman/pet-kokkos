@@ -45,6 +45,11 @@ using RView2D = Kokkos::View<Real**, LR, MemSpace>;
 using IView1D = Kokkos::View<int*, LR, MemSpace>;
 using IView2D = Kokkos::View<int**, LR, MemSpace>;
 
+// Narrow integer views, for the Ozaki slice decomposition (ozaki.hpp). int8 is
+// the widest type whose pairwise products accumulate exactly in int32 over the
+// inner dimensions this network uses.
+using I8View2D = Kokkos::View<int8_t**, LR, MemSpace>;
+
 // Persistent scratch-buffer pool reused across compute() calls. Each compute()
 // otherwise allocates ~70 Kokkos Views (cudaMalloc/cudaFree, which synchronize
 // the device) -- the dominant per-step cost on GPU for small/medium systems.
@@ -79,6 +84,7 @@ class Workspace {
   RView2D r2(const std::string& k, int r, int c) { return get2<RView2D, double>(r2_, k, r, c); }
   RView1D r1(const std::string& k, int n) { return get1<RView1D, double>(r1_, k, n); }
   IView2D i2(const std::string& k, int r, int c) { return get2<IView2D, int>(i2_, k, r, c); }
+  I8View2D i8(const std::string& k, int r, int c) { return get2<I8View2D, int8_t>(i8_, k, r, c); }
   IView1D i1(const std::string& k, int n) { return get1<IView1D, int>(i1_, k, n); }
   // Return an existing buffer without zeroing it (for reading data written by an
   // earlier kernel this step, e.g. saved forward activations). Returns the same
@@ -109,6 +115,7 @@ class Workspace {
     for (const auto& kv : r1_) b += kv.second.span() * sizeof(double);
     for (const auto& kv : i2_) b += kv.second.span() * sizeof(int);
     for (const auto& kv : i1_) b += kv.second.span() * sizeof(int);
+    for (const auto& kv : i8_) b += kv.second.span() * sizeof(int8_t);
     return b;
   }
 
@@ -156,6 +163,7 @@ class Workspace {
   std::unordered_map<std::string, RView1D> r1_;
   std::unordered_map<std::string, IView2D> i2_;
   std::unordered_map<std::string, IView1D> i1_;
+  std::unordered_map<std::string, I8View2D> i8_;
   std::unordered_map<std::string, View2D> cur2_;  // current logical n2 view per key (for peek2)
 };
 

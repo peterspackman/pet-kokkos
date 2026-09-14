@@ -217,6 +217,7 @@ double Calculator::cutoff() const { return impl_->ckpt.hypers.cutoff; }
 const std::vector<int>& Calculator::atomic_types() const { return impl_->atomic_types; }
 const std::string& Calculator::length_unit() const { return impl_->ckpt.length_unit; }
 const std::string& Calculator::energy_unit() const { return impl_->ckpt.energy_unit; }
+double Calculator::energy_scale() const { return impl_->ckpt.energy_scale; }
 Options& Calculator::options() { return impl_->opts; }
 const Options& Calculator::options() const { return impl_->opts; }
 
