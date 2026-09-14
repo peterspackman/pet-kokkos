@@ -59,6 +59,21 @@ struct Options {
   // the direct control, and PET_TF32=1 sets the initial value.
   bool allow_tf32 = false;
 
+  // Which host neighbour search to use. The built-in one is an O(N^2 x images)
+  // brute force; vesin's is an O(N) cell list, and on a 1728-atom supercell the
+  // difference is ~450 ms against ~14 ms -- 95% of that evaluation's runtime.
+  //
+  // Only meaningful when the library was built with vesin (PET_WITH_VESIN);
+  // without it this falls back to the built-in search rather than failing, and
+  // `vesin_available()` says which you will get.
+  //
+  // The two do NOT produce the same edge ORDER -- the built-in search walks
+  // images in a fixed nested loop, vesin's list is sorted canonically by
+  // (i, j, shift) -- so results differ in the last bits, the same way the host
+  // and device builders already do. Both are individually reproducible.
+  enum class Neighbors { Builtin, Vesin };
+  Neighbors neighbors = Neighbors::Vesin;
+
   // Device memory a batch may occupy, in bytes. 0 queries the device.
   std::size_t memory_budget_bytes = 0;
 
@@ -79,6 +94,10 @@ struct Results {
   std::vector<int> struct_id;  // [Ntot] owning structure per atom
   std::vector<int> n_atoms;    // [B] atom count per structure (force-array offsets)
 };
+
+// True when this build can use vesin for the host neighbour search. When false,
+// Options::neighbors is ignored and the built-in search is always used.
+bool vesin_available();
 
 // Directories searched for a NAMED model, highest priority first:
 //   1. $PET_MODEL_DIR (':'-separated) -- the knob for batch jobs

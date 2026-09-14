@@ -9,6 +9,7 @@ add_library(pet_kokkos STATIC
     calculator.cpp
     io/extxyz.cpp
     ozaki.cpp
+    vesin_neighbors.cpp
 )
 add_library(pet::kokkos ALIAS pet_kokkos)
 
@@ -36,6 +37,14 @@ elseif(PET_PRECISION STREQUAL "fp64")
     target_compile_definitions(pet_kokkos PUBLIC PET_KOKKOS_FP64)
 elseif(NOT PET_PRECISION STREQUAL "mixed")
     message(FATAL_ERROR "PET_PRECISION must be one of: mixed, fp32, fp64")
+endif()
+
+# --- vesin (optional) --------------------------------------------------------
+# PUBLIC: the switch appears in a public header's preprocessor conditionals, so a
+# consumer compiling against these headers has to see the same definition.
+if(PET_HAVE_VESIN)
+    target_link_libraries(pet_kokkos PUBLIC vesin::vesin)
+    target_compile_definitions(pet_kokkos PUBLIC PET_HAVE_VESIN)
 endif()
 
 # --- dense GEMM --------------------------------------------------------------

@@ -12,6 +12,7 @@
 #include <set>
 #include <tuple>
 
+#include "pet/calculator.hpp"
 #include "pet/neighbors.hpp"
 
 using Catch::Matchers::WithinAbs;
@@ -322,5 +323,68 @@ TEST_CASE("the solver's derivative matches its own cutoff function", "[neighbors
     const double ana = pet::detail::bump_dcutoff_dr(d, rc, w);
     INFO("d = " << d << ": analytic " << ana << ", numeric " << num);
     CHECK_THAT(ana, WithinAbs(num, 1e-4));
+  }
+}
+
+TEST_CASE("the vesin and built-in neighbour searches find the same edges", "[neighbors]") {
+  // Not a tolerance comparison: these are integer pair lists, and they must
+  // contain exactly the same set of (i, j, shift) triples. Either search finding
+  // an edge the other misses is a bug in one of them, and the shipped goldens
+  // would only show it as a slightly wrong energy.
+  //
+  // The ORDER legitimately differs -- the built-in search walks images in a
+  // fixed nested loop, the vesin wrapper sorts canonically -- so the sets are
+  // compared, not the sequences.
+  if (!pet::vesin_available()) {
+    WARN("built without vesin; skipping the neighbour-backend comparison");
+    return;
+  }
+
+  struct Setup {
+    const char* name;
+    pet::System sys;
+    double cutoff;
+  };
+  std::vector<Setup> setups;
+  setups.push_back({"cubic 4x4x4, rc 5.0", simple_cubic(4, 2.3), 5.0});
+  // A cutoff larger than the box, so the search must reach several images out --
+  // the case a cell list gets wrong if its grid or its shift bookkeeping is off.
+  setups.push_back({"cubic 2x2x2, rc 7.5 (many images)", simple_cubic(2, 2.3), 7.5});
+  {
+    pet::System mol;
+    mol.n_atoms = 3;
+    mol.pbc = {false, false, false};
+    mol.cell = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    mol.atomic_numbers = {8, 1, 1};
+    mol.positions = {0.0, 0.0, 0.11926, 0.0, 0.76323, -0.47704, 0.0, -0.76323, -0.47704};
+    setups.push_back({"isolated molecule", mol, 5.0});
+  }
+
+  using Key = std::tuple<int, int, int, int, int>;
+  for (const auto& s : setups) {
+    DYNAMIC_SECTION(s.name) {
+      auto collect = [&](pet::NeighborBackend b) {
+        pet::neighbor_backend() = b;
+        const auto raw = pet::detail::build_raw_edges_dispatch(s.sys, s.cutoff);
+        std::map<Key, double> m;
+        for (const auto& e : raw) m[{e.i, e.j, e.sa, e.sb, e.sc}] = e.dist;
+        return m;
+      };
+      const auto builtin = collect(pet::NeighborBackend::Builtin);
+      const auto vesin = collect(pet::NeighborBackend::Vesin);
+      pet::neighbor_backend() = pet::NeighborBackend::Builtin;
+
+      INFO("built-in found " << builtin.size() << " edges, vesin " << vesin.size());
+      REQUIRE(builtin.size() == vesin.size());
+      REQUIRE_FALSE(builtin.empty());
+      for (const auto& [k, d] : builtin) {
+        const auto it = vesin.find(k);
+        INFO("edge (" << std::get<0>(k) << "," << std::get<1>(k) << ") shift "
+                      << std::get<2>(k) << "," << std::get<3>(k) << "," << std::get<4>(k));
+        REQUIRE(it != vesin.end());
+        // The same geometry computed two ways: equal to round-off, not to the bit.
+        CHECK_THAT(it->second, WithinRel(d, 1e-12));
+      }
+    }
   }
 }

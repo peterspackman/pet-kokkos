@@ -188,6 +188,10 @@ struct Calculator::Impl {
     // when the handle is first created, which is at the first GEMM. Process-
     // global, so the last Calculator constructed wins -- see gemm.hpp.
     if (o.allow_tf32) set_tf32(true);
+    // Likewise process-global: build_edge_data has too many call sites to thread
+    // a per-Calculator choice through, and the two searches are meant to agree.
+    neighbor_backend() = (o.neighbors == Options::Neighbors::Vesin) ? NeighborBackend::Vesin
+                                                                    : NeighborBackend::Builtin;
   }
 };
 

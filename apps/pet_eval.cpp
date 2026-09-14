@@ -41,6 +41,7 @@ void usage() {
       "      --spin N         spin multiplicity 2S+1 per frame (conditioned models)\n"
       "      --per-atom       print per-atom energies\n"
       "      --host-neighbors build the neighbour list on the host\n"
+      "      --builtin-neighbors  use the built-in O(N^2) search, not vesin\n"
       "      --repeat N       evaluate N times and report the best wall time\n"
       "      --info           print the model's properties and exit\n"
       "      --models         list the model search path and exit\n"
@@ -71,7 +72,7 @@ double cell_volume(const pet::System& s) {
 struct Args {
   std::string model_spec, structure_path, output_path;
   bool want_forces = false, batch = false, per_atom = false;
-  bool host_neighbors = false, info_only = false, json = false;
+  bool host_neighbors = false, builtin_neighbors = false, info_only = false, json = false;
   int repeat = 1;
   int charge = 0;
   int spin = 1;
@@ -107,6 +108,8 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.per_atom = true;
     } else if (s == "--host-neighbors") {
       a.host_neighbors = true;
+    } else if (s == "--builtin-neighbors") {
+      a.builtin_neighbors = true;
     } else if (s == "--info") {
       a.info_only = true;
     } else if (s == "--json") {
@@ -198,6 +201,7 @@ void print_model_info_json(const Args& a, const pet::Calculator& calc) {
   std::printf("  \"num_gnn_layers\": %d,\n  \"num_attention_layers\": %d,\n",
               h.num_gnn_layers, h.num_attention_layers);
   std::printf("  \"num_readout_layers\": %d,\n", h.num_readout_layers);
+  std::printf("  \"vesin\": %s,\n", pet::vesin_available() ? "true" : "false");
   std::printf("  \"system_conditioning\": %s,\n", h.system_conditioning ? "true" : "false");
   std::printf("  \"max_charge\": %d,\n  \"max_spin_multiplicity\": %d,\n", h.max_charge,
               h.max_spin_multiplicity);
@@ -223,6 +227,7 @@ void print_json(const Args& a, const pet::Calculator& calc,
   std::printf("  \"energy_unit\": \"%s\",\n", calc.energy_unit().c_str());
   std::printf("  \"length_unit\": \"%s\",\n", calc.length_unit().c_str());
   std::printf("  \"seconds\": %s,\n", num(best_seconds).c_str());
+  std::printf("  \"vesin\": %s,\n", pet::vesin_available() ? "true" : "false");
   std::printf("  \"system_conditioning\": %s,\n",
               calc.hypers().system_conditioning ? "true" : "false");
   std::printf("  \"charge\": %d,\n  \"spin_multiplicity\": %d,\n", a.charge, a.spin);
@@ -281,6 +286,8 @@ void print_json(const Args& a, const pet::Calculator& calc,
 int run(const Args& a) {
   pet::Options opts;
   opts.device_neighbors = !a.host_neighbors;
+  opts.neighbors = a.builtin_neighbors ? pet::Options::Neighbors::Builtin
+                                       : pet::Options::Neighbors::Vesin;
   pet::Calculator calc(a.model_spec, opts);
 
   if (a.info_only) {

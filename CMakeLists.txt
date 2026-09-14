@@ -40,6 +40,17 @@ option(PET_INSTALL       "Generate install/export targets" ${PET_IS_TOP_LEVEL})
 option(PET_BUILD_METATOMIC_PLUGIN
        "Build the metatomic backend plugin (prototype; needs metatensor + metatomic)" OFF)
 
+# Optional vesin backend for the host neighbour search. The built-in search is an
+# O(N^2 x images) brute force, which is fine for small cells and dominates
+# everything else for large ones -- 95% of the runtime on a 1728-atom supercell.
+# vesin's cell list does the same work in O(N).
+#
+# AUTO uses it when it can be found (the `vesin` Python wheel ships the header
+# and the library, so a venv counts) and silently does without otherwise; ON
+# fails the configure if it is missing; OFF never looks.
+set(PET_WITH_VESIN "AUTO" CACHE STRING "Use vesin for neighbour lists: AUTO | ON | OFF")
+set_property(CACHE PET_WITH_VESIN PROPERTY STRINGS AUTO ON OFF)
+
 # Tune for the building machine's CPU. A real win on the host kernels, but it
 # bakes THIS machine's instruction set into the objects: turn it off when the
 # build host and the run host may differ, or when objects are cached and reused
@@ -129,6 +140,24 @@ if(NOT TARGET nlohmann_json::nlohmann_json)
     )
 endif()
 
+# --- vesin (optional) --------------------------------------------------------
+
+set(PET_HAVE_VESIN OFF)
+if(NOT PET_WITH_VESIN STREQUAL "OFF")
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+    if(PET_WITH_VESIN STREQUAL "ON")
+        find_package(Vesin REQUIRED)
+    else()
+        find_package(Vesin QUIET)
+    endif()
+    if(Vesin_FOUND)
+        set(PET_HAVE_VESIN ON)
+        message(STATUS "pet-kokkos: vesin neighbour lists from ${Vesin_LIBRARY}")
+    elseif(PET_WITH_VESIN STREQUAL "AUTO")
+        message(STATUS "pet-kokkos: vesin not found; using the built-in neighbour search")
+    endif()
+endif()
+
 # --- warnings ----------------------------------------------------------------
 #
 # Applied to our own targets only, never to Kokkos. Nothing here is an error:
@@ -169,3 +198,4 @@ message(STATUS "  backend    : ${PET_BACKEND}")
 message(STATUS "  precision  : ${PET_PRECISION}")
 message(STATUS "  build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  tests      : ${PET_BUILD_TESTS}   apps: ${PET_BUILD_APPS}")
+message(STATUS "  vesin      : ${PET_HAVE_VESIN}")

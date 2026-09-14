@@ -276,6 +276,11 @@ inline std::vector<RawEdge> build_raw_edges(const System& sys, double cutoff) {
   return edges;
 }
 
+// Pick a backend. Out of line (src/vesin_neighbors.cpp) so this header does not
+// have to include vesin.h, which would drag the dependency onto every consumer
+// of pet/neighbors.hpp whether they build with it or not.
+std::vector<RawEdge> build_raw_edges_dispatch(const System& sys, double cutoff);
+
 }  // namespace detail
 
 // A raw directed edge supplied to build_edge_data_from_raw. `center` and
@@ -534,6 +539,13 @@ inline EdgeData build_edge_data_from_raw(int N, const std::vector<int>& species,
 
 // Build NEF edge data from a System (standalone path: builds its own full
 // periodic neighbor list).
+// Which neighbour search build_edge_data should use. Declared here rather than
+// taken as a parameter because build_edge_data has ~40 call sites and the choice
+// is a property of the run, not of any one call. pet::Calculator sets it from
+// its Options; PET_NEIGHBORS=builtin|vesin sets the process default.
+enum class NeighborBackend { Builtin, Vesin };
+NeighborBackend& neighbor_backend();
+
 inline EdgeData build_edge_data(const System& sys, const Hypers& h,
                                 const std::vector<int>& species_to_index) {
   using namespace detail;
@@ -546,7 +558,7 @@ inline EdgeData build_edge_data(const System& sys, const Hypers& h,
     species[i] = s;
   }
 
-  auto raw = build_raw_edges(sys, h.cutoff);
+  auto raw = build_raw_edges_dispatch(sys, h.cutoff);
   std::vector<RawEdgeIn> edges(raw.size());
   for (std::size_t e = 0; e < raw.size(); ++e) {
     edges[e].center = raw[e].i;

@@ -94,6 +94,37 @@ once with the `serial` preset (which fetches Kokkos) or pass an explicit path.
 | `PET_BUILD_TESTS` | on if top-level | |
 | `PET_BUILD_APPS` | on if top-level | the `pet-eval` CLI |
 | `PET_ARCH_NATIVE` | `ON` | `-march=native`; turn off if build and run hosts differ |
+| `PET_WITH_VESIN` | `AUTO` | use [vesin](https://github.com/Luthaf/vesin) for the host neighbour list — see below |
+
+### Neighbour lists
+
+The built-in periodic search is O(N² × images) brute force: fine for small
+cells, and about half the runtime of a 1728-atom supercell evaluation. Building
+with [vesin](https://github.com/Luthaf/vesin) — the neighbour-list library from
+the same ecosystem as metatrain and metatomic — replaces it with an O(N) cell
+list:
+
+| 1728-atom diamond, 7.5 Å cutoff, CUDA | built-in | vesin |
+|---|---|---|
+| pet-mad-xs | 0.441 s | **0.232 s** |
+| pet-mad-s | 0.548 s | **0.341 s** |
+
+`AUTO` uses it when it can be found and does without otherwise. The `vesin`
+Python wheel ships the header and the library, so a venv counts:
+
+```bash
+uv pip install vesin
+cmake --preset serial      # finds it automatically
+```
+
+The two searches find **exactly the same set of edges** — that's a test, not an
+assumption — but in a different order, so results differ in the last bits, the
+same way the host and device builders already do. `PET_NEIGHBORS=builtin` (or
+`Options::neighbors`) forces the built-in one, which is how that agreement gets
+checked; `pet-eval --json` reports which is in use.
+
+This covers the **host** path only. The device-resident path
+(`build_nef_device`) still does its own O(N²) search.
 
 As a dependency (`add_subdirectory`, CPM, FetchContent) tests and apps default
 off, and an existing `Kokkos::kokkos` target is reused rather than a second
