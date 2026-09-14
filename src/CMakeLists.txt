@@ -6,6 +6,7 @@
 add_library(pet_kokkos STATIC
     model.cpp
     device_geometry.cpp
+    device_cell_list.cpp
     calculator.cpp
     io/extxyz.cpp
     ozaki.cpp

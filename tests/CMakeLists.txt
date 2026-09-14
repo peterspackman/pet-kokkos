@@ -21,6 +21,7 @@ add_executable(pet_tests
     test_determinism.cpp
     test_device_vs_host.cpp
     test_ozaki.cpp
+    test_cell_list.cpp
 )
 
 target_link_libraries(pet_tests PRIVATE
@@ -44,6 +45,7 @@ add_test(NAME determinism  COMMAND pet_tests "[determinism]")
 add_test(NAME paths_agree  COMMAND pet_tests "[paths]")
 # Needs a CUDA fp64 build to do anything; skips with a warning elsewhere.
 add_test(NAME ozaki        COMMAND pet_tests "[ozaki]")
+add_test(NAME cell_list    COMMAND pet_tests "[cells]")
 
 # The finite-difference test evaluates the model a few hundred times.
 set_tests_properties(finite_diff PROPERTIES TIMEOUT 900)

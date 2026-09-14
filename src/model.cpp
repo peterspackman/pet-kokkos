@@ -636,7 +636,11 @@ void fold_edge_gradients(Workspace& ws, const std::string& key, RView2D edge_gra
   // Atoms of a structure are contiguous in the batch, so a count plus a prefix sum
   // gives each structure its range and the sum runs in atom-index order. Integer
   // counts are order-independent in value, so the count itself is safe.
-  IView1D scnt = ws.i1(key + ":vir_scnt", NS);  // zeroed on reuse
+  // Explicitly zeroed rather than trusting the pool's policy -- see the note in
+  // energy_forces_batch. This one is only reached from the backward, where the
+  // policy is on, but that is a property of the caller and not of this code.
+  IView1D scnt = ws.i1(key + ":vir_scnt", NS);
+  Kokkos::deep_copy(ExecSpace(), scnt, 0);
   IView1D soff = ws.i1(key + ":vir_soff", NS + 1);
   if (NS > 1) {
     Kokkos::parallel_for(
@@ -910,6 +914,7 @@ void adaptive_backward(Workspace& ws, RView2D d_forces, RView2D dvir, RView1D ad
   // Per-structure virial, summed over each structure's contiguous atom range.
   {
     IView1D scnt = ws.i1("ad:vscnt", n_struct);
+    Kokkos::deep_copy(ExecSpace(), scnt, 0);  // atomic accumulator; see above
     IView1D soff = ws.i1("ad:vsoff", n_struct + 1);
     if (n_struct > 1) {
       Kokkos::parallel_for(
@@ -1490,7 +1495,17 @@ BatchResult PetModel::energy_forces_batch(const DeviceEdgeData& dev, bool comput
   // atomic_add here made the reported ENERGY itself depend on thread arrival
   // order, which is the quantity the whole re-ranking stage is built on.
   {
-    IView1D ecnt = ws_.i1("batch_energy_cnt", B);  // zeroed on reuse
+    // Zeroed EXPLICITLY, for the same reason `energy` above is: this is an
+    // atomic accumulator, and the pool only zeroes on reuse when its zeroing
+    // policy happens to be on. compute() turns that policy off for the forward
+    // and back on for the backward -- so on an energy-only evaluation, which
+    // never runs a backward, it is left off and this counter accumulated across
+    // calls. The symptom was a second batched energy-only evaluation putting
+    // every atom in structure 0: correct on the first call, silently wrong on
+    // the second. Relying on a policy set by a different function is not
+    // something to repeat.
+    IView1D ecnt = ws_.i1("batch_energy_cnt", B);
+    Kokkos::deep_copy(ExecSpace(), ecnt, 0);
     IView1D eoff = ws_.i1("batch_energy_off", B + 1);
     Kokkos::parallel_for(
         "batch_energy_count", Kokkos::RangePolicy<ExecSpace>(0, N),

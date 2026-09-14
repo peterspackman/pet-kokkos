@@ -5,6 +5,7 @@
 // large, because every consumer would otherwise recompile them (and under nvcc
 // that is minutes, not seconds), and because an unused inline KOKKOS_LAMBDA is
 // not reliably instantiated for the device.
+#include "pet/device_cell_list.hpp"
 #include "pet/device_geometry.hpp"
 
 #include <Kokkos_Core.hpp>
@@ -97,8 +98,26 @@ DeviceEdgeData build_nef_device(const DeviceGeom& g, const Hypers& h,
   RView1D re_dist;
   int E = 0;
 
-  if (!cache) {
-    // ---------- uncached path ----------
+  // The cell list replaces the brute-force search when it is worth its setup
+  // cost. Below a few hundred atoms it is not: building and sorting a grid is
+  // several kernel launches, and a CSP batch of eight-atom cells finds its
+  // neighbours faster by just looking at all of them. Auto picks per call from
+  // the atom count; PET_DEVICE_SEARCH forces either, which is how the two get
+  // checked against each other.
+  const bool use_cells =
+      !cache && (device_search() == DeviceSearch::CellList ||
+                 (device_search() == DeviceSearch::Auto && Ntot >= kCellListMinAtoms));
+
+  if (use_cells) {
+    RawEdges re = build_raw_edges_cells(ws, g, posw, cinv, cutoff);
+    re_i = re.i;
+    re_j = re.j;
+    re_shift = re.shift;
+    re_vec = re.vec;
+    re_dist = re.dist;
+    E = re.count;
+  } else if (!cache) {
+    // ---------- uncached brute-force path ----------
     IView1D ecnt = ws.i1("pet_ecnt", Ntot);
     Kokkos::parallel_for(
         "pet_neigh_count", RangePolicy(0, Ntot), KOKKOS_LAMBDA(int gi) {

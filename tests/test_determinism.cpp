@@ -129,3 +129,59 @@ TEST_CASE("a batch gives each structure the same answer as evaluating it alone",
     }
   }
 }
+
+TEST_CASE("a reused Calculator gives the same batched answer every time",
+          "[model][determinism]") {
+  // The batched path keeps per-structure counters in the pooled workspace, and
+  // those are atomic accumulators: if one is not zeroed between calls it carries
+  // the previous call's count. That is not hypothetical -- energy_forces_batch's
+  // segmentation counter relied on the pool's zeroing policy, which compute()
+  // turns OFF for the forward and only back on for the backward. An energy-only
+  // batch never runs a backward, so the policy stayed off and the second call
+  // put every atom in structure 0: the first structure got the whole batch's
+  // energy and the rest got nothing.
+  //
+  // Correct on the first call and silently wrong on the second is exactly the
+  // shape no single-shot test can see, so this one evaluates repeatedly, with
+  // and without forces, and demands the answer not move.
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    pet::Calculator calc(found->first, found->second);
+
+    std::vector<pet::System> systems;
+    for (const auto& path : golden_paths(model)) {
+      Golden g = load_golden(path);
+      if (g.periodic) systems.push_back(g.system);
+    }
+    if (systems.size() < 2) continue;
+
+    DYNAMIC_SECTION(model) {
+      for (bool forces : {false, true}) {
+        const char* what = forces ? "with forces" : "energy only";
+        INFO(what);
+        const pet::Results first = calc.compute(systems, forces);
+        REQUIRE(first.energy.size() == systems.size());
+        // Every structure must have a sane per-atom energy. The failure this
+        // guards against gave structure 0 the sum of the whole batch and the
+        // others zero, which a same-vs-same comparison alone would miss if the
+        // very first call were already wrong.
+        for (std::size_t b = 0; b < systems.size(); ++b) {
+          const double per_atom = first.energy[b] / std::max(1, systems[b].n_atoms);
+          INFO("structure " << b << ": " << per_atom << " eV/atom");
+          CHECK(std::abs(per_atom) > 1e-6);
+        }
+        for (int k = 0; k < 3; ++k) {
+          const pet::Results again = calc.compute(systems, forces);
+          for (std::size_t i = 0; i < first.energy.size(); ++i) {
+            INFO("repeat " << k << ", structure " << i);
+            CHECK(first.energy[i] == again.energy[i]);
+          }
+          REQUIRE(first.forces.size() == again.forces.size());
+          for (std::size_t i = 0; i < first.forces.size(); ++i)
+            CHECK(first.forces[i] == again.forces[i]);
+        }
+      }
+    }
+  }
+}

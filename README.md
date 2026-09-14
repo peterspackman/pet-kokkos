@@ -123,8 +123,30 @@ same way the host and device builders already do. `PET_NEIGHBORS=builtin` (or
 `Options::neighbors`) forces the built-in one, which is how that agreement gets
 checked; `pet-eval --json` reports which is in use.
 
-This covers the **host** path only. The device-resident path
-(`build_nef_device`) still does its own O(N²) search.
+This covers the **host** path. The device-resident path has its own cell list,
+below.
+
+### Device neighbour search
+
+`build_nef_device` — the path a relaxer or MD driver uses, where geometry never
+leaves the GPU — has its own O(N) cell list, with no external dependency.
+`PET_DEVICE_SEARCH=auto|cells|brute`; `auto` uses it above 256 atoms, below
+which building a grid costs more than the search it replaces.
+
+| atoms (device batch, energy only) | brute | cells | |
+|---|---|---|---|
+| 3 456 | 0.039 s | 0.022 s | 1.8× |
+| 8 192 | 0.091 s | 0.042 s | 2.2× |
+| 16 000 | 0.261 s | 0.078 s | 3.4× |
+| 27 648 | 0.598 s | 0.130 s | **4.6×** |
+
+With forces it is a flatter ~1.45×, because the backward then dominates rather
+than the search. The growing ratio is the O(N²)→O(N) crossover.
+
+Bins are sorted by atom index after binning, so the neighbour order — and hence
+the energy's last bits — is reproducible; an atomic fill alone would make it
+thread-arrival order. `PET_DEVICE_SEARCH=brute` is how the two are checked
+against each other.
 
 As a dependency (`add_subdirectory`, CPM, FetchContent) tests and apps default
 off, and an existing `Kokkos::kokkos` target is reused rather than a second

@@ -170,7 +170,8 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
   // the count/scan below is itself safe.
   IView1D roff = ws.i1("nef:roff", N + 1);
   {
-    IView1D rcnt = ws.i1("nef:rcnt", N);  // zeroed on reuse
+    IView1D rcnt = ws.i1("nef:rcnt", N);
+    Kokkos::deep_copy(ExecSpace(), rcnt, 0);  // atomic accumulator, zeroed explicitly
     Kokkos::parallel_for(
         "pet_raw_count", RangePolicy(0, E),
         KOKKOS_LAMBDA(int e) { Kokkos::atomic_inc(&rcnt(re_i(e))); });
@@ -397,7 +398,8 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
   // ---- per-edge pair cutoff, keep flag, smooth factor ----
   RView1D rcv = ws.r1("nef:rcv", E), factorv = ws.r1("nef:factorv", E);
   IView1D keepv = ws.i1("nef:keepv", E);
-  IView1D count = ws.i1("nef:count", N);  // zeroed on reuse
+  IView1D count = ws.i1("nef:count", N);
+  Kokkos::deep_copy(ExecSpace(), count, 0);  // atomic accumulator, zeroed explicitly
   Kokkos::parallel_for(
       "pet_keep", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
         double rc;
@@ -451,7 +453,8 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
   Kokkos::deep_copy(ExecSpace(), dev.reverse_index, -1);  // padding + unmatched edges stay -1
 
   // ---- scatter kept edges into NEF slots (atomic per-atom slot counter) ----
-  IView1D slot = ws.i1("nef:slot", N);            // running slot counter (zeroed on reuse)
+  IView1D slot = ws.i1("nef:slot", N);  // running slot counter
+  Kokkos::deep_copy(ExecSpace(), slot, 0);  // accumulator, zeroed explicitly
   IView1D flat_of_edge = ws.i1("nef:flat_edge", E);  // flat NEF index per kept edge (-1 if dropped)
   Kokkos::deep_copy(ExecSpace(), flat_of_edge, -1);
   // reuse the persistent reverse-matching map: grow capacity if needed, then clear
