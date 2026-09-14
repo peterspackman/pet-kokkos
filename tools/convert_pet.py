@@ -61,7 +61,7 @@ HEAD_ROOTS = ("node_heads", "edge_heads", "node_last_layers", "edge_last_layers"
 # Adaptive-cutoff schemes the C++ evaluator implements. Keep in step with
 # parse_acm() in include/pet/checkpoint.hpp -- this is the Python half of the
 # same gate, and it is the half that gives an actionable message.
-SUPPORTED_ADAPTIVE_METHODS = {"grid"}
+SUPPORTED_ADAPTIVE_METHODS = {"grid", "solver"}
 
 
 def keep_weight(name: str, target: str) -> bool:

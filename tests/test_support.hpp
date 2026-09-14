@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cstdlib>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -99,22 +100,66 @@ inline Golden load_golden(const std::string& path) {
   return out;
 }
 
-// Every golden shipped for a given model.
+// Directories scanned for goldens: the shipped ones, plus anything in
+// $PET_TEST_GOLDEN_EXTRA (':'-separated). The extra path exists because a model
+// whose weights cannot be redistributed still needs its goldens run somewhere --
+// generate them next to the weights and point this at the directory.
+inline std::vector<std::string> golden_dirs() {
+  std::vector<std::string> dirs{golden_dir()};
+  if (const char* e = std::getenv("PET_TEST_GOLDEN_EXTRA")) {
+    const std::string s(e);
+    for (std::size_t p = 0; p <= s.size();) {
+      const std::size_t q = s.find(':', p);
+      std::string d = s.substr(p, (q == std::string::npos ? s.size() : q) - p);
+      if (!d.empty()) dirs.push_back(std::move(d));
+      if (q == std::string::npos) break;
+      p = q + 1;
+    }
+  }
+  return dirs;
+}
+
+// Every golden available for a given model.
 inline std::vector<std::string> golden_paths(const std::string& model) {
   std::vector<std::string> out;
-  for (const auto& e : std::filesystem::directory_iterator(golden_dir())) {
-    const std::string fn = e.path().filename().string();
-    if (fn.rfind(model + "_", 0) == 0 && e.path().extension() == ".json")
-      out.push_back(e.path().string());
+  std::error_code ec;
+  for (const auto& dir : golden_dirs()) {
+    if (!std::filesystem::is_directory(dir, ec)) continue;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+      const std::string fn = e.path().filename().string();
+      if (fn.rfind(model + "_", 0) == 0 && e.path().extension() == ".json")
+        out.push_back(e.path().string());
+    }
   }
   std::sort(out.begin(), out.end());
   return out;
 }
 
-// The models the shipped goldens cover. Kept here so a new architecture lands
-// as one entry plus its goldens, not as an edit to every test.
+// The models the goldens cover. Kept here so a new architecture lands as one
+// entry plus its goldens, not as an edit to every test. Extra names can be added
+// at run time through $PET_TEST_MODELS (':'-separated), which is how a model
+// that cannot be committed still gets exercised -- see golden_dirs().
 inline const std::vector<std::string>& golden_models() {
-  static const std::vector<std::string> m{"pet-mad-xs", "pbe0-pet"};
+  static const std::vector<std::string> m = [] {
+    // pet-mad-xs   -- 2026.1-era checkpoint, adaptive_cutoff_method = grid
+    // pbe0-pet     -- residual featurizer, PostLN, LayerNorm, SiLU, fixed cosine cutoff
+    // pet-mad-xs-v1.6 -- current release, adaptive_cutoff_method = solver. Its
+    //                 goldens are shipped; reproduce the model itself with
+    //                 "uv run tools/convert_pet.py --model pet-mad-xs
+    //                  --out models/pet-mad-xs-v1.6".
+    std::vector<std::string> v{"pet-mad-xs", "pbe0-pet", "pet-mad-xs-v1.6"};
+    if (const char* e = std::getenv("PET_TEST_MODELS")) {
+      const std::string s(e);
+      for (std::size_t p = 0; p <= s.size();) {
+        const std::size_t q = s.find(':', p);
+        std::string n = s.substr(p, (q == std::string::npos ? s.size() : q) - p);
+        if (!n.empty()) v.push_back(std::move(n));
+        if (q == std::string::npos) break;
+        p = q + 1;
+      }
+    }
+    return v;
+  }();
   return m;
 }
 

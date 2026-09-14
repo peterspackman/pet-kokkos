@@ -239,3 +239,88 @@ TEST_CASE("concatenating edge data preserves every structure's edges", "[neighbo
       CHECK(c.reverse_index[c.reverse_index[k]] == static_cast<int>(k));
     }
 }
+
+TEST_CASE("the solver's root actually solves its own equation", "[neighbors]") {
+  // A self-consistency check that needs no reference implementation and no
+  // model: at the root the solver reports, the smoothed neighbour count
+  //     n_total(r) = sum_j bump(d_j, r, w) + target * (r / r_max)^3
+  // must equal `target`. If the Newton-bisection loop has not converged, or the
+  // bracket is wrong, or the derivative disagrees with the function it is
+  // supposed to differentiate, this fails -- and it localises the failure to the
+  // solver rather than to an energy several thousand FLOPs later.
+  //
+  // Driven through build_edge_data rather than the internals, so it also checks
+  // that the root reaches EdgeData at all: the backward reads it from there, and
+  // a path that drops it has no gradient.
+  const pet::System s = simple_cubic(4, 2.3);
+  pet::Hypers h = fixed_cutoff_hypers(7.5);
+  h.cutoff_width_adaptive = 1.0;
+  h.num_neighbors_adaptive = 16.0;
+  h.adaptive_cutoff_method = pet::AdaptiveCutoffMethod::Solver;
+
+  const pet::EdgeData ed = pet::build_edge_data(s, h, identity_species());
+  REQUIRE(static_cast<int>(ed.adapt_r.size()) == s.n_atoms);
+  REQUIRE(static_cast<int>(ed.adapt_dn.size()) == s.n_atoms);
+
+  // The raw list is the full set within the search cutoff -- what the solver
+  // sums over, including edges the adaptive mask later drops.
+  std::vector<std::vector<double>> dist_of(s.n_atoms);
+  for (int e = 0; e < ed.n_raw; ++e) dist_of[ed.raw_center[e]].push_back(ed.raw_dist[e]);
+
+  const double rmax = h.cutoff;
+  for (int i = 0; i < s.n_atoms; ++i) {
+    const double r = ed.adapt_r[i];
+    REQUIRE(r > 0.0);
+    REQUIRE(r <= rmax);
+    double n = 0.0;
+    for (double d : dist_of[i]) n += pet::detail::bump_cutoff(d, r, h.cutoff_width_adaptive);
+    const double x = r / rmax;
+    n += h.num_neighbors_adaptive * x * x * x;
+    INFO("atom " << i << ": r = " << r << ", n_total(r) = " << n << ", target = "
+                 << h.num_neighbors_adaptive);
+    CHECK_THAT(n, WithinAbs(h.num_neighbors_adaptive, 1e-6));
+    // A converged root is interior, so its slope is live rather than zeroed by
+    // the clamp -- an all-clamped result would pass the line above vacuously.
+    CHECK(ed.adapt_dn[i] > 0.0);
+  }
+}
+
+TEST_CASE("grid and solver choose different cutoffs", "[neighbors]") {
+  // They are two different schemes, not two spellings of one. If this ever
+  // passes trivially, the method switch has stopped switching anything -- which
+  // is the failure mode that silently returns the wrong model's energies.
+  const pet::System s = simple_cubic(4, 2.3);
+  pet::Hypers grid = fixed_cutoff_hypers(7.5);
+  grid.cutoff_width_adaptive = 1.0;
+  grid.num_neighbors_adaptive = 16.0;
+  pet::Hypers solver = grid;
+  solver.adaptive_cutoff_method = pet::AdaptiveCutoffMethod::Solver;
+
+  const auto species = identity_species();
+  const pet::EdgeData a = pet::build_edge_data(s, grid, species);
+  const pet::EdgeData b = pet::build_edge_data(s, solver, species);
+
+  bool any_different = false;
+  for (std::size_t k = 0; k < a.pair_cutoff.size() && k < b.pair_cutoff.size(); ++k)
+    if (std::fabs(a.pair_cutoff[k] - b.pair_cutoff[k]) > 1e-9) any_different = true;
+  CHECK(any_different);
+  // Only the grid method builds a probe grid; only the solver carries a root.
+  CHECK(a.adapt_r.empty());
+  CHECK_FALSE(b.adapt_r.empty());
+}
+
+TEST_CASE("the solver's derivative matches its own cutoff function", "[neighbors]") {
+  // bump_dcutoff_dr must be the derivative of bump_cutoff, not of the exact
+  // mathematical bump -- the solver root-finds on the former, so a mismatch
+  // makes Newton converge to the wrong place (or not at all). Central
+  // differences in r at a spread of distances across the taper.
+  const double rc = 5.0, w = 1.0, hstep = 1e-6;
+  for (double d = rc - w - 0.2; d <= rc + 0.2; d += 0.05) {
+    const double num = (pet::detail::bump_cutoff(d, rc + hstep, w) -
+                        pet::detail::bump_cutoff(d, rc - hstep, w)) /
+                       (2 * hstep);
+    const double ana = pet::detail::bump_dcutoff_dr(d, rc, w);
+    INFO("d = " << d << ": analytic " << ana << ", numeric " << num);
+    CHECK_THAT(ana, WithinAbs(num, 1e-4));
+  }
+}

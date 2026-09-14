@@ -85,14 +85,6 @@ class Checkpoint {
     if (hypers.long_range_enabled)
       throw std::runtime_error("checkpoint: long-range models not yet supported");
     if (hypers.zbl) throw std::runtime_error("checkpoint: ZBL term not yet supported");
-    if (hypers.adaptive() &&
-        hypers.adaptive_cutoff_method != AdaptiveCutoffMethod::Grid)
-      throw std::runtime_error(
-          "checkpoint: adaptive_cutoff_method 'solver' is not implemented; this build "
-          "provides 'grid' only. The two choose different per-atom cutoffs, so loading "
-          "this model would give silently wrong energies and forces. (metatrain's "
-          "default changed from grid to solver; a checkpoint converted from an older "
-          "metatrain carries no adaptive_cutoff_method field and is read as grid.)");
   }
 
  private:

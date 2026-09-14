@@ -630,95 +630,160 @@ void readout_accumulate(View1D per_atom_net, View2D node_pred, View2D edge_pred,
       });
 }
 
+// Backward of the adaptive cutoff. Both schemes reduce to ONE per-edge scalar --
+// d(adapted_cutoff[centre]) / d(dist_e), times the incoming adjoint -- after
+// which the gather into forces and the per-structure virial are identical. So
+// the methods differ only in how `gmag` is filled, and everything below that is
+// written once. (Having two copies of the gather is how one of them ends up
+// being the non-deterministic one.)
+//
+// `solver_r` / `solver_dn` are the saved root and slope from the solver forward;
+// they are empty for the grid method. A zero in solver_dn marks an atom whose
+// cutoff hit a clamp bound, and therefore has no gradient.
 void adaptive_backward(Workspace& ws, RView2D d_forces, RView2D dvir, RView1D adapted_adj,
                        IView1D raw_center, IView1D raw_neigh, RView1D raw_dist, RView2D raw_vec,
                        int E, RView1D probes, int P, double width, double target, double scale,
                        int N, bool bump, IView1D struct_id, int n_struct,
                        IView1D raw_off, IView1D raw_reverse,
+                       bool solver, RView1D solver_r, RView1D solver_dn,
                        RView2D eff_saved = RView2D()) {
-  if (P < 2 || E == 0) return;
-  // Reuse the effective-neighbor-count grid from the on-device forward build when
-  // it was provided (the same quantity the backward would recompute in K1).
-  const bool have_eff = (eff_saved.extent(0) == (size_t) N && eff_saved.extent(1) == (size_t) P);
-  RView2D eff = have_eff ? eff_saved : ws.r2("ad:eff", N, P);
-  RView2D diff = ws.r2("ad:diff", N, P), grad = ws.r2("ad:grad", N, P),
-          gsign = ws.r2("ad:gsign", N, P), w = ws.r2("ad:w", N, P), Cq = ws.r2("ad:Cq", N, P),
-          diffadj = ws.r2("ad:diffadj", N, P);
-  RView1D adapted = ws.r1("ad:adapted", N);
+  if (E == 0) return;
+  if (!solver && P < 2) return;
+  if (solver && ((int) solver_r.extent(0) != N || (int) solver_dn.extent(0) != N))
+    throw std::runtime_error(
+        "pet: the solver adaptive backward needs the forward's saved root and slope "
+        "(DeviceEdgeData::adapt_r / adapt_dn). A caller supplying its own edge data "
+        "must fill them -- they cannot be recovered here, because this path has no "
+        "per-atom segmentation of the raw edge list to recompute them with.");
+  // The adaptive scheme always tapers with the BUMP function, whatever the
+  // model's own cutoff_function is -- metatrain's adaptive_cutoff.py imports
+  // cutoff_func_bump unconditionally. The forwards (host and device) hardcode
+  // bump accordingly; passing the model's flag down here instead would
+  // differentiate a cosine while the forward summed bumps, for any Cosine model
+  // that also uses an adaptive cutoff.
+  (void) bump;
+  constexpr bool kAdaptiveIsBump = true;
+  // --- per-edge d(adapted_cutoff[centre]) / d(dist), by method -----------------
+  RView1D gmag = ws.r1("ad:gmag", E);
 
-  // K1: effective neighbor counts eff[center,p] = sum_edges bump(dist, probes[p], width).
-  // Skipped when reusing the forward build's eff -- an O(E*P) transcendental+atomic pass.
-  if (!have_eff)
+  if (solver) {
+    // Implicit-function theorem. The forward's last act was
+    //     adapted = r - (n_total(r) - target) / dn_root,
+    // with r and dn_root constants, so only the residual carries a dependence on
+    // the distances:
+    //     d(adapted)/d(d_j) = -(1/dn_root) * d(n_total)/d(d_j)
+    //                       = -(1/dn_root) * df/dd_j
+    //                       = +(1/dn_root) * df/dr_j        (since f depends on d - r)
+    // and df/dr is exactly -bump_ddist, which is why no new derivative is needed
+    // here. dn_root arrives zeroed for any atom whose cutoff was clamped, which
+    // makes that atom's gradient vanish without a second branch.
+    //
+    // This is the whole reason the solver forward takes a trailing IFT step it
+    // does not numerically need: it puts a differentiable expression at the root
+    // so the backward never has to unroll ten Newton iterations.
     Kokkos::parallel_for(
-        "ad_eff", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
+        "ad_gmag_solver", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
           const int c = raw_center(e);
           const double d = raw_dist(e);
-          for (int p = 0; p < P; ++p)
-            Kokkos::atomic_add(&eff(c, p), cutoff_val(d, probes(p), width, bump));
+          const double dn = solver_dn(c);
+          if (d <= 0.0 || dn <= 0.0) { gmag(e) = 0.0; return; }
+          const double df_dr = -bump_ddist(d, solver_r(c), width);
+          gmag(e) = scale * adapted_adj(c) * (df_dr / dn) / d;
         });
-  // K2: diff = eff - target + target*x^3
-  Kokkos::parallel_for(
-      "ad_diff", RangePolicy(0, (N) * (P)),
-      KOKKOS_LAMBDA(int _i) { const int a = _i / (P), p = _i % (P);
-        const double x = (double)p / (P - 1);
-        diff(a, p) = eff(a, p) - target + target * x * x * x;
-      });
-  // K3: grad = |torch.gradient(diff)| clamped ; gsign = d|.|/dG (0 if clamped)
-  Kokkos::parallel_for(
-      "ad_grad", RangePolicy(0, (N) * (P)),
-      KOKKOS_LAMBDA(int _i) { const int a = _i / (P), p = _i % (P);
-        double g;
-        if (p == 0) g = diff(a, 1) - diff(a, 0);
-        else if (p == P - 1) g = diff(a, P - 1) - diff(a, P - 2);
-        else g = 0.5 * (diff(a, p + 1) - diff(a, p - 1));
-        const double ag = Kokkos::fabs(g);
-        grad(a, p) = (ag > 1e-12) ? ag : 1e-12;
-        gsign(a, p) = (ag >= 1e-12) ? ((g > 0.0) ? 1.0 : (g < 0.0 ? -1.0 : 0.0)) : 0.0;
-      });
-  // K4: w = softmax_p(logw), logw=-0.5*(diff/grad)^2 ; adapted = sum probes*w
-  Kokkos::parallel_for(
-      "ad_w", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
-        double mx = -1e300;
-        for (int p = 0; p < P; ++p) {
-          const double lw = -0.5 * (diff(a, p) / grad(a, p)) * (diff(a, p) / grad(a, p));
-          w(a, p) = lw;
-          if (lw > mx) mx = lw;
-        }
-        double s = 0.0;
-        for (int p = 0; p < P; ++p) {
-          const double e = Kokkos::exp(w(a, p) - mx);
-          w(a, p) = e;
-          s += e;
-        }
-        double ad = 0.0;
-        for (int p = 0; p < P; ++p) {
-          w(a, p) /= s;
-          ad += probes(p) * w(a, p);
-        }
-        adapted(a) = ad;
-      });
-  // K5: logw adjoint -> direct diff term + Cq (for the grad-stencil chain)
-  Kokkos::parallel_for(
-      "ad_C", RangePolicy(0, (N) * (P)),
-      KOKKOS_LAMBDA(int _i) { const int a = _i / (P), p = _i % (P);
-        const double A = adapted_adj(a) * w(a, p) * (probes(p) - adapted(a));
-        const double gd = grad(a, p);
-        diffadj(a, p) = A * (-(diff(a, p) / (gd * gd)));      // direct d logw/d diff
-        Cq(a, p) = A * (diff(a, p) * diff(a, p) / (gd * gd * gd)) * gsign(a, p);
-      });
-  // K6: add adjoint of torch.gradient operator (B_r = sum_q C_q dG_q/ddiff_r)
-  Kokkos::parallel_for(
-      "ad_B", RangePolicy(0, (N) * (P)),
-      KOKKOS_LAMBDA(int _i) { const int a = _i / (P), r = _i % (P);
-        double B = 0.0;
-        if (r - 1 >= 1 && r - 1 <= P - 2) B += 0.5 * Cq(a, r - 1);
-        if (r + 1 >= 1 && r + 1 <= P - 2) B += -0.5 * Cq(a, r + 1);
-        if (r == 1) B += Cq(a, 0);
-        if (r == 0) B += -Cq(a, 0);
-        if (r == P - 1) B += Cq(a, P - 1);
-        if (r == P - 2) B += -Cq(a, P - 1);
-        diffadj(a, r) += B;
-      });
+  } else {
+    // Reuse the effective-neighbor-count grid from the on-device forward build when
+    // it was provided (the same quantity the backward would recompute in K1).
+    const bool have_eff = (eff_saved.extent(0) == (size_t) N && eff_saved.extent(1) == (size_t) P);
+    RView2D eff = have_eff ? eff_saved : ws.r2("ad:eff", N, P);
+    RView2D diff = ws.r2("ad:diff", N, P), grad = ws.r2("ad:grad", N, P),
+            gsign = ws.r2("ad:gsign", N, P), w = ws.r2("ad:w", N, P), Cq = ws.r2("ad:Cq", N, P),
+            diffadj = ws.r2("ad:diffadj", N, P);
+    RView1D adapted = ws.r1("ad:adapted", N);
+
+    // K1: effective neighbor counts eff[center,p] = sum_edges bump(dist, probes[p], width).
+    // Skipped when reusing the forward build's eff -- an O(E*P) transcendental+atomic pass.
+    if (!have_eff)
+      Kokkos::parallel_for(
+          "ad_eff", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
+            const int c = raw_center(e);
+            const double d = raw_dist(e);
+            for (int p = 0; p < P; ++p)
+              Kokkos::atomic_add(&eff(c, p), cutoff_val(d, probes(p), width, bump));
+          });
+    // K2: diff = eff - target + target*x^3
+    Kokkos::parallel_for(
+        "ad_diff", RangePolicy(0, (N) * (P)),
+        KOKKOS_LAMBDA(int _i) { const int a = _i / (P), p = _i % (P);
+          const double x = (double)p / (P - 1);
+          diff(a, p) = eff(a, p) - target + target * x * x * x;
+        });
+    // K3: grad = |torch.gradient(diff)| clamped ; gsign = d|.|/dG (0 if clamped)
+    Kokkos::parallel_for(
+        "ad_grad", RangePolicy(0, (N) * (P)),
+        KOKKOS_LAMBDA(int _i) { const int a = _i / (P), p = _i % (P);
+          double g;
+          if (p == 0) g = diff(a, 1) - diff(a, 0);
+          else if (p == P - 1) g = diff(a, P - 1) - diff(a, P - 2);
+          else g = 0.5 * (diff(a, p + 1) - diff(a, p - 1));
+          const double ag = Kokkos::fabs(g);
+          grad(a, p) = (ag > 1e-12) ? ag : 1e-12;
+          gsign(a, p) = (ag >= 1e-12) ? ((g > 0.0) ? 1.0 : (g < 0.0 ? -1.0 : 0.0)) : 0.0;
+        });
+    // K4: w = softmax_p(logw), logw=-0.5*(diff/grad)^2 ; adapted = sum probes*w
+    Kokkos::parallel_for(
+        "ad_w", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
+          double mx = -1e300;
+          for (int p = 0; p < P; ++p) {
+            const double lw = -0.5 * (diff(a, p) / grad(a, p)) * (diff(a, p) / grad(a, p));
+            w(a, p) = lw;
+            if (lw > mx) mx = lw;
+          }
+          double s = 0.0;
+          for (int p = 0; p < P; ++p) {
+            const double e = Kokkos::exp(w(a, p) - mx);
+            w(a, p) = e;
+            s += e;
+          }
+          double ad = 0.0;
+          for (int p = 0; p < P; ++p) {
+            w(a, p) /= s;
+            ad += probes(p) * w(a, p);
+          }
+          adapted(a) = ad;
+        });
+    // K5: logw adjoint -> direct diff term + Cq (for the grad-stencil chain)
+    Kokkos::parallel_for(
+        "ad_C", RangePolicy(0, (N) * (P)),
+        KOKKOS_LAMBDA(int _i) { const int a = _i / (P), p = _i % (P);
+          const double A = adapted_adj(a) * w(a, p) * (probes(p) - adapted(a));
+          const double gd = grad(a, p);
+          diffadj(a, p) = A * (-(diff(a, p) / (gd * gd)));      // direct d logw/d diff
+          Cq(a, p) = A * (diff(a, p) * diff(a, p) / (gd * gd * gd)) * gsign(a, p);
+        });
+    // K6: add adjoint of torch.gradient operator (B_r = sum_q C_q dG_q/ddiff_r)
+    Kokkos::parallel_for(
+        "ad_B", RangePolicy(0, (N) * (P)),
+        KOKKOS_LAMBDA(int _i) { const int a = _i / (P), r = _i % (P);
+          double B = 0.0;
+          if (r - 1 >= 1 && r - 1 <= P - 2) B += 0.5 * Cq(a, r - 1);
+          if (r + 1 >= 1 && r + 1 <= P - 2) B += -0.5 * Cq(a, r + 1);
+          if (r == 1) B += Cq(a, 0);
+          if (r == 0) B += -Cq(a, 0);
+          if (r == P - 1) B += Cq(a, P - 1);
+          if (r == P - 2) B += -Cq(a, P - 1);
+          diffadj(a, r) += B;
+        });
+    // Grid: the adjoint of the probe-weighted average, accumulated over probes.
+    Kokkos::parallel_for(
+        "ad_gmag_grid", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
+          const double d = raw_dist(e);
+          if (d <= 0.0) { gmag(e) = 0.0; return; }
+          double da = 0.0;
+          for (int p = 0; p < P; ++p)
+            da += diffadj(raw_center(e), p) * cutoff_ddist(d, probes(p), width, kAdaptiveIsBump);
+          gmag(e) = scale * da / d;
+        });
+  }
   // K7: scatter per-raw-edge distance gradient to atoms. Virial goes to one of
   // VBINS bins (~VBINS-fold less contention than every edge hitting 9 globals,
   // which is E-way contended here), reduced below.
@@ -734,15 +799,10 @@ void adaptive_backward(Workspace& ws, RView2D d_forces, RView2D dvir, RView1D ad
     Kokkos::parallel_for(
         "ad_scatter", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
           const int c = raw_center(e), j = raw_neigh(e);
-          const double d = raw_dist(e);
-          if (d <= 0.0) return;
-          double da = 0.0;
-          for (int p = 0; p < P; ++p)
-            da += diffadj(c, p) * cutoff_ddist(d, probes(p), width, bump);
-          const double invd = 1.0 / d;
+          const double ge = gmag(e);
           double gg[3];
           for (int cc = 0; cc < 3; ++cc) {
-            gg[cc] = scale * da * raw_vec(e, cc) * invd;
+            gg[cc] = ge * raw_vec(e, cc);
             Kokkos::atomic_add(&d_forces(c, cc), gg[cc]);
             Kokkos::atomic_add(&d_forces(j, cc), -gg[cc]);
           }
@@ -768,18 +828,9 @@ void adaptive_backward(Workspace& ws, RView2D d_forces, RView2D dvir, RView1D ad
     return;
   }
 
-  // Per-edge gradient magnitude first, so the per-atom gather below can read any
-  // edge's contribution -- including its partner's -- without recomputing it.
-  RView1D gmag = ws.r1("ad:gmag", E);
-  Kokkos::parallel_for(
-      "ad_gmag", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
-        const double d = raw_dist(e);
-        if (d <= 0.0) { gmag(e) = 0.0; return; }
-        double da = 0.0;
-        for (int p = 0; p < P; ++p)
-          da += diffadj(raw_center(e), p) * cutoff_ddist(d, probes(p), width, bump);
-        gmag(e) = scale * da / d;
-      });
+  // gmag was computed above, once, for whichever method is in play -- the gather
+  // needs to read any edge's contribution including its partner's, so it has to
+  // exist per edge rather than be recomputed inside the loop.
   // Force gather, one thread per atom: atom a takes +g from each of its own edges
   // and -g from each edge pointing at it, and those are exactly the partners of its
   // own edges (the list is full directed). Was two float atomic_adds per edge.
@@ -1111,6 +1162,23 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed) const {
   dev.pair_cutoff = RView1D("pcut", NM);
   dev.cutoff_factor = View1D("cutoff", NM);
   dev.cf_seq = View2D("cf_seq", N, S);
+
+  // Solver adaptive cutoff: the forward's root and slope, uploaded alongside
+  // everything else. Without these the backward has nothing to differentiate
+  // through -- it cannot recompute them, because it has no per-atom segmentation
+  // of the raw edge list on this path.
+  if (!ed.adapt_r.empty() && (int) ed.adapt_r.size() == N) {
+    dev.adapt_r = RView1D("adapt_r", N);
+    dev.adapt_dn = RView1D("adapt_dn", N);
+    auto h_ar = Kokkos::create_mirror_view(dev.adapt_r);
+    auto h_adn = Kokkos::create_mirror_view(dev.adapt_dn);
+    for (int i = 0; i < N; ++i) {
+      h_ar(i) = ed.adapt_r[i];
+      h_adn(i) = ed.adapt_dn[i];
+    }
+    Kokkos::deep_copy(dev.adapt_r, h_ar);
+    Kokkos::deep_copy(dev.adapt_dn, h_adn);
+  }
 
   auto h_species = Kokkos::create_mirror_view(dev.species);
   for (int i = 0; i < N; ++i) h_species(i) = ed.species[i];
@@ -2259,10 +2327,12 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
     // cutoff_width_adaptive, not cutoff_width: this differentiates the SMOOTHED
     // NEIGHBOUR COUNT, whose taper is the adaptive one. (The edge cutoff
     // factor's own width is used in geom_bwd above, and stays cutoff_width.)
+    const bool solver = (h_.adaptive_cutoff_method == AdaptiveCutoffMethod::Solver);
     adaptive_backward(ws_, d_forces, dvir, adapted_adj, d_rc, d_rj, d_rd, d_rv, E, probes_, n_probes_,
                       h_.cutoff_width_adaptive, h_.num_neighbors_adaptive, energy_scale_, N,
                       h_.cutoff_function == CutoffFunction::Bump, sid, NS,
-                      dev.raw_off, dev.raw_reverse, dev.adapt_eff);
+                      dev.raw_off, dev.raw_reverse, solver, dev.adapt_r, dev.adapt_dn,
+                      dev.adapt_eff);
   }
 
   // symmetrize the virial into Voigt order [xx,yy,zz,xy,xz,yz]. When the caller

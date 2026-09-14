@@ -130,14 +130,16 @@ TEST_CASE("energy() and energy_forces() agree", "[model][golden]") {
   }
 }
 
-TEST_CASE("the loader refuses an architecture it does not implement", "[model][golden]") {
-  // A model whose hypers name a scheme this build does not have must be
-  // REFUSED, not evaluated on the nearest thing available. The specific trap:
+TEST_CASE("adaptive_cutoff_method is read, defaulted and validated", "[model][golden]") {
   // metatrain's adaptive_cutoff_method default changed from "grid" to "solver",
-  // the two choose different per-atom cutoffs, and a checkpoint from before the
-  // change carries no such field at all. So "field absent" has to mean "grid"
-  // while "field says solver" has to be an error -- and the difference between
-  // those two behaviours is silently wrong energies.
+  // and the two choose different per-atom cutoffs -- so this field decides which
+  // energy a model returns, and getting its DEFAULT wrong is silently wrong
+  // results rather than a crash.
+  //
+  // A checkpoint converted before the field existed carries no such key, and
+  // must be read as "grid", because that is the scheme the metatrain that
+  // produced it used. Both named schemes are implemented now; anything else has
+  // to be an error rather than a fallback.
   const auto found = find_model("pet-mad-xs");
   if (!found) {
     WARN("no adaptive model installed; skipping the capability-gate check");
@@ -157,21 +159,46 @@ TEST_CASE("the loader refuses an architecture it does not implement", "[model][g
   std::filesystem::create_directories(tmp);
   const std::string json_path = (tmp / "gated.json").string();
 
-  SECTION("an unimplemented method is refused by name") {
-    meta["hypers"]["adaptive_cutoff_method"] = "solver";
-    std::ofstream(json_path) << meta.dump(2);
-    REQUIRE_THROWS_WITH(pet::Calculator(json_path, found->second),
-                        Catch::Matchers::ContainsSubstring("solver"));
+  SECTION("both named schemes load") {
+    for (const char* method : {"grid", "solver"}) {
+      meta["hypers"]["adaptive_cutoff_method"] = method;
+      std::ofstream(json_path) << meta.dump(2);
+      INFO(method);
+      REQUIRE_NOTHROW(pet::Calculator(json_path, found->second));
+    }
   }
-  SECTION("an unrecognized method is refused too, rather than defaulted") {
+  SECTION("an unrecognized method is refused, rather than defaulted") {
     meta["hypers"]["adaptive_cutoff_method"] = "something-new";
     std::ofstream(json_path) << meta.dump(2);
-    REQUIRE_THROWS(pet::Calculator(json_path, found->second));
+    REQUIRE_THROWS_WITH(pet::Calculator(json_path, found->second),
+                        Catch::Matchers::ContainsSubstring("something-new"));
   }
-  SECTION("an absent method means grid, and still loads") {
+  SECTION("an absent method means grid, and gives grid's answer") {
+    // Not just "loads": the whole point is WHICH scheme it silently picks. This
+    // model's shipped metadata has no adaptive_cutoff_method, so the default has
+    // to reproduce the golden -- and an explicit "solver" has to differ from it,
+    // or the two schemes are not actually distinct in this build.
     meta["hypers"].erase("adaptive_cutoff_method");
     std::ofstream(json_path) << meta.dump(2);
-    REQUIRE_NOTHROW(pet::Calculator(json_path, found->second));
+    pet::Calculator defaulted(json_path, found->second);
+
+    meta["hypers"]["adaptive_cutoff_method"] = "grid";
+    std::ofstream(json_path) << meta.dump(2);
+    pet::Calculator grid(json_path, found->second);
+
+    meta["hypers"]["adaptive_cutoff_method"] = "solver";
+    std::ofstream(json_path) << meta.dump(2);
+    pet::Calculator solver(json_path, found->second);
+
+    const auto goldens = golden_paths("pet-mad-xs");
+    REQUIRE_FALSE(goldens.empty());
+    const Golden g = load_golden(goldens.front());
+    const double e_def = defaulted.compute(g.system, false).energy.at(0);
+    const double e_grid = grid.compute(g.system, false).energy.at(0);
+    const double e_solver = solver.compute(g.system, false).energy.at(0);
+    INFO("default " << e_def << ", grid " << e_grid << ", solver " << e_solver);
+    CHECK(e_def == e_grid);
+    CHECK(e_def != e_solver);
   }
 
   std::error_code ec;

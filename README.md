@@ -127,16 +127,24 @@ A directory only matches if it holds **both** halves of the pair.
 Two validated families, each covering the opposite branch of every config axis.
 The loader rejects any other mix rather than silently running the wrong path.
 
-| | **pet-mad-xs** | **pbe0-pet** |
-|---|---|---|
-| featurizer | feedforward | residual |
-| transformer | PreLN | PostLN |
-| normalization | RMSNorm | LayerNorm |
-| activation | SwiGLU | SiLU |
-| central token | expanded (`d_node != d_pet`) | non-expanded |
-| cutoff | Bump, adaptive (8 neighbours) | Cosine, fixed |
-| dims | `d_pet=128, d_node=512, 8 heads` | `d_pet=256, d_node=256, 8 heads` |
-| attention layers | 1 | 2 |
+| | **pet-mad-xs** | **pbe0-pet** | **pet-mad-xs v1.6** |
+|---|---|---|---|
+| featurizer | feedforward | residual | feedforward |
+| transformer | PreLN | PostLN | PreLN |
+| normalization | RMSNorm | LayerNorm | RMSNorm |
+| activation | SwiGLU | SiLU | SwiGLU |
+| central token | expanded (`d_node != d_pet`) | non-expanded | expanded |
+| cutoff | Bump, adaptive **grid** (8 nbrs) | Cosine, fixed | Bump, adaptive **solver** (16 nbrs) |
+| dims | `d_pet=128, d_node=512, 8 heads` | `d_pet=256, d_node=256, 8 heads` | `d_pet=128, d_node=512, 8 heads` |
+| attention layers | 1 | 2 | 1 |
+
+Both adaptive-cutoff schemes are implemented — `"grid"` (the legacy
+probe-grid average) and `"solver"` (Newton–bisection root find, metatrain's
+current default). A checkpoint carrying no `adaptive_cutoff_method` predates the
+choice and is read as `"grid"`, which is what the metatrain that produced it
+used; anything else is refused by name rather than defaulted, because the two
+schemes choose different per-atom cutoffs and picking the wrong one is silently
+wrong energies, not an error.
 
 Three limits are enforced at load time rather than assumed:
 
@@ -147,10 +155,6 @@ Three limits are enforced at load time rather than assumed:
   `num_neighbors_adaptive > 0` is rejected — its forces would be silently
   inconsistent with its energy;
 - `zbl` and long-range models are rejected.
-
-`adaptive_cutoff_method: "solver"` — metatrain's current **default** — is not
-yet implemented; only the legacy `"grid"` method is. That is the largest gap,
-and it is the next thing on the list. See [PLAN.md](PLAN.md) §5.
 
 ## Precision
 
@@ -214,7 +218,16 @@ ctest --preset serial          # or openmp / cuda
 | `paths_agree` | yes | host vs device neighbour builds; fresh and reused Verlet cache |
 
 Model-dependent suites **skip** when no model is installed, so a fresh clone is
-green. Put a model on the search path and they start running.
+green. Put a model on the search path and they start running. Goldens for all
+three architectures above are shipped; reproduce the models with
+
+```bash
+uv run tools/convert_pet.py --model pet-mad-xs --out models/pet-mad-xs-v1.6
+```
+
+`$PET_TEST_MODELS` and `$PET_TEST_GOLDEN_EXTRA` (both `:`-separated) add model
+names and golden directories at run time, for a model whose weights cannot live
+in this tree.
 
 ## Provenance and licence
 

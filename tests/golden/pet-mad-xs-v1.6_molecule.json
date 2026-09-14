@@ -1,0 +1,90 @@
+{
+  "model": "pet-mad-xs-v1.6",
+  "variant": null,
+  "case": "molecule",
+  "description": "Golden reference for metatrain PET model 'pet-mad-s-solver', case 'molecule'. Energy in eV, positions in Angstrom, forces in eV/Angstrom. Total energy INCLUDES composition energies and the output scaler.",
+  "evaluation_path": "metatrain.utils.io.load_model(ckpt).export() -> metatomic AtomisticModel; MetatomicCalculator(model, variants={'energy': 'None'}).compute_energy(atoms, compute_forces_and_stresses=True, per_atom=True)",
+  "units": {
+    "energy": "eV",
+    "length": "Angstrom",
+    "forces": "eV/Angstrom"
+  },
+  "atomic_numbers": [
+    8,
+    1,
+    1
+  ],
+  "positions": [
+    [
+      0.0,
+      0.0,
+      0.11926
+    ],
+    [
+      0.0,
+      0.76323,
+      -0.47704
+    ],
+    [
+      0.0,
+      -0.76323,
+      -0.47704
+    ]
+  ],
+  "cell": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0
+    ]
+  ],
+  "pbc": [
+    false,
+    false,
+    false
+  ],
+  "periodic": false,
+  "n_atoms": 3,
+  "total_energy": -15.29156494140625,
+  "per_atom_energies": [
+    -7.63355827331543,
+    -3.8215079307556152,
+    -3.8364977836608887
+  ],
+  "forces": [
+    [
+      -0.02011912129819393,
+      0.0028202980756759644,
+      -0.5559736490249634
+    ],
+    [
+      0.009617652744054794,
+      -0.32828330993652344,
+      0.27270424365997314
+    ],
+    [
+      0.010501468554139137,
+      0.3254629969596863,
+      0.28326940536499023
+    ]
+  ],
+  "stress": null,
+  "virial": null,
+  "volume": 0.0,
+  "result_keys": [
+    "energy",
+    "energies",
+    "forces"
+  ],
+  "notes": "Generated from pet-mad-xs-v1.6.0 (lab-cosmo/upet), which uses adaptive_cutoff_method=solver -- unlike the pet-mad-xs goldens alongside it, which come from a 2026.1-era checkpoint using the legacy grid method. The two schemes choose different per-atom cutoffs, so these are a genuinely different reference, not a regenerated one."
+}

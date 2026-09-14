@@ -44,6 +44,18 @@ struct EdgeData {
   std::vector<char> mask;              // [N*M] 1=real, 0=padding
   std::vector<int> reverse_index;      // [N*M] flat (j*M+slot) of reverse edge, -1 if none
 
+  // SOLVER adaptive cutoff only: [N] the root of the smoothed neighbour count and
+  // [N] dn/dr there, both computed by the forward and consumed by the backward's
+  // implicit-function step. Empty for the grid method and for a fixed cutoff. A
+  // zero in adapt_dn marks an atom whose cutoff hit a clamp bound (no gradient).
+  //
+  // They are carried rather than recomputed for the same reason the device build
+  // keeps them: the backward would otherwise redo the entire Newton solve, and it
+  // would have to do it with atomics (it has no per-atom edge segmentation of its
+  // own), which would put run-to-run noise into a quantity the forces depend on.
+  std::vector<double> adapt_r;
+  std::vector<double> adapt_dn;
+
   // Full raw edge list within cutoff (BEFORE adaptive masking). Needed for the
   // adaptive-cutoff chain rule in the backward pass, since the per-atom adaptive
   // cutoff depends on every neighbor within the search radius, including edges
@@ -93,6 +105,17 @@ inline EdgeData concat_edge_data(const std::vector<EdgeData>& parts, std::vector
   out.raw_vec.resize((std::size_t) E * 3);
   struct_id.assign(N, 0);
 
+  // Solver adaptive state, when the parts carry it. Per-atom and independent of
+  // any other structure, so concatenation is a straight copy into the global atom
+  // index space -- but it does have to happen: the backward cannot rebuild it,
+  // and dropping it here is how a batched solver evaluation ends up with no
+  // gradient path at all.
+  const bool have_adapt = !parts.empty() && !parts.front().adapt_r.empty();
+  if (have_adapt) {
+    out.adapt_r.assign(N, 0.0);
+    out.adapt_dn.assign(N, 0.0);
+  }
+
   int off_n = 0, off_e = 0;
   for (std::size_t b = 0; b < parts.size(); ++b) {
     const EdgeData& p = parts[b];
@@ -102,6 +125,10 @@ inline EdgeData concat_edge_data(const std::vector<EdgeData>& parts, std::vector
       out.species[gi] = p.species[i];
       out.num_neigh[gi] = p.num_neigh[i];
       struct_id[gi] = (int) b;
+      if (have_adapt && i < (int) p.adapt_r.size()) {
+        out.adapt_r[gi] = p.adapt_r[i];
+        out.adapt_dn[gi] = p.adapt_dn[i];
+      }
       for (int m = 0; m < Mb; ++m) {
         const std::size_t src = (std::size_t) i * Mb + m;
         const std::size_t dst = (std::size_t) gi * M + m;
@@ -250,7 +277,83 @@ struct RawEdgeIn {
 
 namespace detail {
 
-// Adaptive per-atom cutoff (adaptive_cutoff.py). Returns atomic_cutoffs[N].
+// d/d(rc) of bump_cutoff at fixed distance -- the host twin of
+// detail::dev_bump_dcutoff_dr (device_neighbors.hpp), which carries the
+// derivation and the reason for the clamp.
+inline double bump_dcutoff_dr(double d, double rc, double width) {
+  const double scaled = (d - (rc - width)) / width;
+  if (scaled <= 0.0 || scaled >= 1.0) return 0.0;
+  const double safe = std::min(std::max(scaled, 1e-6), 1.0 - 1e-6);
+  const double ps = M_PI * safe;
+  const double si = std::sin(ps);
+  const double tt = std::tanh(std::cos(ps) / si);
+  return 0.5 * (1.0 - tt * tt) * (M_PI / (si * si)) / width;
+}
+
+// Solver adaptive cutoff: Newton-bisection on n_total(r) = target, plus one
+// implicit-function step. The host twin of the pet_adapt_solver kernel in
+// device_neighbors.hpp, which carries the full commentary; the two must agree,
+// and tests/test_device_vs_host.cpp is what holds them to it.
+inline std::vector<double> adaptive_cutoffs_solver(int N, const Hypers& h,
+                                                   const std::vector<RawEdgeIn>& edges,
+                                                   std::vector<double>* out_r = nullptr,
+                                                   std::vector<double>* out_dn = nullptr) {
+  const double rmax = h.cutoff;
+  const double inv_rmax = 1.0 / rmax;
+  const double width = h.cutoff_width_adaptive;
+  const double target = h.num_neighbors_adaptive;
+  const double lo_bound = rmax * (1.0 / 16.0);
+  constexpr int kIters = 10;
+  constexpr double kDnFloor = 1e-6;
+
+  // Group edges by centre so each atom's sums accumulate in a fixed order.
+  std::vector<std::vector<double>> dist_of(N);
+  for (const auto& e : edges) dist_of[e.center].push_back(e.dist);
+
+  std::vector<double> out(N, rmax);
+  if (out_r) out_r->assign(N, rmax);
+  if (out_dn) out_dn->assign(N, 0.0);
+  for (int a = 0; a < N; ++a) {
+    const auto& ds = dist_of[a];
+    double r_lo = 0.0, r_hi = rmax, r = 0.5 * rmax;
+    for (int it = 0; it < kIters; ++it) {
+      double n = 0.0, dn = 0.0;
+      for (double d : ds) {
+        n += bump_cutoff(d, r, width);
+        dn += bump_dcutoff_dr(d, r, width);
+      }
+      const double x = r * inv_rmax;
+      n += target * x * x * x;
+      dn += 3.0 * target * x * x * inv_rmax;
+
+      const double f = n - target;
+      if (f <= 0.0) r_lo = r; else r_hi = r;
+      const double r_newton = r - f / std::max(dn, kDnFloor);
+      r = (r_newton >= r_lo && r_newton <= r_hi) ? r_newton : 0.5 * (r_lo + r_hi);
+    }
+    double n = 0.0, dn = 0.0;
+    for (double d : ds) {
+      n += bump_cutoff(d, r, width);
+      dn += bump_dcutoff_dr(d, r, width);
+    }
+    const double x = r * inv_rmax;
+    n += target * x * x * x;
+    dn += 3.0 * target * x * x * inv_rmax;
+
+    const double dn_root = std::max(dn, kDnFloor);
+    const double adapted = r - (n - target) / dn_root;
+    const double clamped = std::min(std::max(adapted, lo_bound), rmax);
+    out[a] = clamped;
+    if (out_r) (*out_r)[a] = r;
+    // Zero signals "clamped, so no gradient" -- the same convention the device
+    // forward uses, so the backward needs only one rule.
+    if (out_dn) (*out_dn)[a] = (adapted > lo_bound && adapted < rmax) ? dn_root : 0.0;
+  }
+  return out;
+}
+
+// Adaptive per-atom cutoff, GRID method (adaptive_cutoff.py's legacy
+// get_adaptive_cutoffs_grid). Returns atomic_cutoffs[N].
 inline std::vector<double> adaptive_cutoffs(int N, const Hypers& h,
                                             const std::vector<RawEdgeIn>& edges) {
   const double min_cutoff = 0.5;
@@ -337,7 +440,12 @@ inline EdgeData build_edge_data_from_raw(int N, const std::vector<int>& species,
 
   // adaptive cutoff masking + cutoff factors
   std::vector<double> acut;
-  if (h.adaptive()) acut = adaptive_cutoffs(N, h, edges);
+  if (h.adaptive()) {
+    if (h.adaptive_cutoff_method == AdaptiveCutoffMethod::Solver)
+      acut = adaptive_cutoffs_solver(N, h, edges, &ed.adapt_r, &ed.adapt_dn);
+    else
+      acut = adaptive_cutoffs(N, h, edges);
+  }
 
   std::vector<const RawEdgeIn*> kept;
   std::vector<double> kept_pair_cutoff, kept_factor;

@@ -67,8 +67,16 @@ struct DeviceEdgeData {
   // [N,P] effective neighbor counts over the probe grid, computed by the on-device
   // neighbor build to set the adaptive cutoff. Referenced (not copied) so the
   // adaptive backward can reuse it instead of recomputing K1 (ad_eff). Empty on
-  // the host-upload path (the backward then recomputes).
+  // the host-upload path (the backward then recomputes). GRID method only.
   RView2D adapt_eff;
+
+  // SOLVER method only: [N] the root r where the smoothed neighbour count reaches
+  // the target, and [N] dn/dr there. The backward's implicit-function step needs
+  // both, and recomputing them would mean redoing the whole Newton solve. A zero
+  // in adapt_dn means that atom's cutoff hit a clamp bound and has no gradient.
+  // Empty on the host-upload path, which recomputes.
+  RView1D adapt_r;
+  RView1D adapt_dn;
 
   // Batched evaluation: when several structures are concatenated into one NEF,
   // struct_id[atom] is the owning structure and n_struct the count. Default

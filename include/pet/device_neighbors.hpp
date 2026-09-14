@@ -53,6 +53,40 @@ KOKKOS_INLINE_FUNCTION double dev_cutoff_value(double d, double rc, double width
   return is_bump ? dev_bump_cutoff(d, rc, width) : dev_cosine_cutoff(d, rc, width);
 }
 
+// d/d(rc) of dev_bump_cutoff at fixed distance. With s = (d - rc + w)/w and
+// f = 0.5*(1 + tanh(cot(pi*s))),
+//     df/ds  = -(pi/2) * sech^2(cot(pi s)) / sin^2(pi s)
+//     ds/drc = -1/w
+//   => df/drc = (pi / 2w) * sech^2(cot(pi s)) / sin^2(pi s),  positive.
+//
+// This is exactly -bump_ddist() from model.cpp, in the same float arithmetic, and
+// that identity is load-bearing: the solver root-finds on dev_bump_cutoff, so its
+// derivative has to be the derivative of THAT function rather than of the exact
+// one, and the backward reuses bump_ddist for the same quantity.
+//
+// The clamp keeps sech^2/sin^2 off its 0*inf corner: as s -> 0 or 1 the cotangent
+// diverges, tanh saturates to +-1 in float, and the product becomes 0 * inf = NaN
+// unless the singular factor is kept finite. metatrain clamps to the same
+// [1e-6, 1-1e-6] for the same reason.
+KOKKOS_INLINE_FUNCTION double dev_bump_dcutoff_dr(double d, double rc, double width) {
+  const float scaled = (float) ((d - (rc - width)) / width);
+  if (scaled <= 0.0f || scaled >= 1.0f) return 0.0;
+  const float safe = Kokkos::fmin(Kokkos::fmax(scaled, 1e-6f), 1.0f - 1e-6f);
+  const float ps = (float) PET_PI * safe;
+  const float si = Kokkos::sin(ps);
+  const float tt = Kokkos::tanh(Kokkos::cos(ps) / si);
+  const float dudr = ((float) PET_PI / (si * si)) / (float) width;
+  return 0.5 * (1.0 - (double) (tt * tt)) * (double) dudr;
+}
+
+// Lower bound on a solver-chosen cutoff, as a fraction of the model cutoff, and
+// the number of Newton-bisection iterations. Both match metatrain
+// (adaptive_cutoff.py: min_cutoff_factor = 1/16, range(10)); changing either
+// changes which cutoff an atom gets, so they are not tuning knobs.
+constexpr double PET_SOLVER_MIN_CUTOFF_FACTOR = 1.0 / 16.0;
+constexpr int PET_SOLVER_ITERS = 10;
+constexpr double PET_SOLVER_DN_FLOOR = 1e-6;
+
 // Pack (center, neigh-owner, cell-shift) into a 64-bit reverse-matching key.
 // Layout: center:24 | neigh:24 | (sa+SHIFT_BIAS):5 | (sb+..):5 | (sc+..):5  = 63 bits.
 // Supports up to 16,777,216 local+ghost atoms per rank and cell shifts in
@@ -177,8 +211,96 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
   dev.raw_reverse = raw_rev;
 
   // ---- adaptive per-atom cutoff (adaptive_cutoffs, on device) ----
+  //
+  // Two schemes, and they do NOT agree -- see AdaptiveCutoffMethod in config.hpp.
+  // Both search the same smoothed neighbour count
+  //     n_total(r) = sum_j bump(d_j, r, w) + target * (r / r_max)^3
+  // for the radius where it reaches `target`; Grid samples it on a fixed probe
+  // grid and takes a Gaussian-weighted average of the probes, Solver root-finds
+  // it directly.
+  //
+  // Both use the BUMP taper whatever the model's cutoff_function is: metatrain's
+  // adaptive_cutoff.py imports `cutoff_func_bump as cutoff_func` unconditionally,
+  // so a Cosine model still gets a bump-shaped neighbour count here.
   RView1D acut = ws.r1("nef:acut", N);
-  if (adaptive) {
+  const bool solver = (h.adaptive_cutoff_method == AdaptiveCutoffMethod::Solver);
+  if (adaptive && solver) {
+    // Newton-bisection on f(r) = n_total(r) - target.
+    //
+    // The cubic baseline is what makes this well posed: it runs from 0 at r = 0
+    // to `target` at r = r_max, so n_total is non-decreasing on [0, r_max] and
+    // crosses `target` exactly once. [0, r_max] therefore brackets the root from
+    // the start and never has to be widened.
+    //
+    // One thread per atom over its own contiguous raw-edge range. That is not
+    // just convenient: the per-atom sums accumulate in a fixed order with no
+    // atomics, so the root -- and hence which edges survive the keep test below
+    // -- is reproducible run to run. A float-atomic reduction here would put
+    // last-bit noise directly into a discrete keep/drop decision.
+    const double target = h.num_neighbors_adaptive;
+    const double rmax = model_cutoff;
+    const double inv_rmax = 1.0 / rmax;
+    const double lo_bound = rmax * detail::PET_SOLVER_MIN_CUTOFF_FACTOR;
+    // The root and the slope there, kept for the backward's implicit-function
+    // step rather than recomputed (the backward would otherwise redo the whole
+    // solve just to recover dn/dr).
+    RView1D ar = ws.r1("nef:adapt_r", N), adn = ws.r1("nef:adapt_dn", N);
+    Kokkos::parallel_for(
+        "pet_adapt_solver", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
+          const int e0 = roff(a), e1 = roff(a + 1);
+          double r_lo = 0.0, r_hi = rmax, r = 0.5 * rmax;
+          double n = 0.0, dn = 0.0;
+          for (int it = 0; it < detail::PET_SOLVER_ITERS; ++it) {
+            n = 0.0;
+            dn = 0.0;
+            for (int e = e0; e < e1; ++e) {
+              const double d = re_dist(e);
+              n += detail::dev_bump_cutoff(d, r, width_adaptive);
+              dn += detail::dev_bump_dcutoff_dr(d, r, width_adaptive);
+            }
+            const double x = r * inv_rmax;
+            n += target * x * x * x;
+            dn += 3.0 * target * x * x * inv_rmax;
+
+            const double f = n - target;
+            if (f <= 0.0) r_lo = r; else r_hi = r;
+            // A Newton step, unless it would leave the bracket -- which happens
+            // on the "shoulders" where one bump is crossing from active to
+            // saturated and the local slope is tiny. Bisect there instead, so
+            // the iteration cannot diverge however flat f gets.
+            const double r_newton = r - f / Kokkos::fmax(dn, detail::PET_SOLVER_DN_FLOOR);
+            r = (r_newton >= r_lo && r_newton <= r_hi) ? r_newton : 0.5 * (r_lo + r_hi);
+          }
+          // Re-evaluate at the final r: the loop's n/dn are from the previous
+          // iterate, and the implicit-function step below needs both AT the root.
+          n = 0.0;
+          dn = 0.0;
+          for (int e = e0; e < e1; ++e) {
+            const double d = re_dist(e);
+            n += detail::dev_bump_cutoff(d, r, width_adaptive);
+            dn += detail::dev_bump_dcutoff_dr(d, r, width_adaptive);
+          }
+          {
+            const double x = r * inv_rmax;
+            n += target * x * x * x;
+            dn += 3.0 * target * x * x * inv_rmax;
+          }
+          const double dn_root = Kokkos::fmax(dn, detail::PET_SOLVER_DN_FLOOR);
+          // One trailing implicit-function step. In the converged regime the
+          // residual is at float noise and this moves nothing; its purpose is to
+          // be the point the BACKWARD differentiates, so gradients reach the
+          // distances through the residual instead of through ten iterations.
+          double adapted = r - (n - target) / dn_root;
+          adapted = Kokkos::fmin(Kokkos::fmax(adapted, lo_bound), rmax);
+          acut(a) = adapted;
+          ar(a) = r;
+          // Sign the slope so the backward knows the clamp was active without
+          // recomputing the bound: a clamped cutoff has no gradient.
+          adn(a) = (adapted > lo_bound && adapted < rmax) ? dn_root : 0.0;
+        });
+    dev.adapt_r = ar;
+    dev.adapt_dn = adn;
+  } else if (adaptive) {
     // Exec-space overload throughout this builder: the space-less deep_copy fences
     // the device before and after (see Workspace::get2).
     Kokkos::deep_copy(ExecSpace(), acut, model_cutoff);
