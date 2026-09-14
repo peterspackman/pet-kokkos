@@ -41,8 +41,6 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
   const int Ntot = g.Ntot, B = g.B;
   const double cutoff2 = cutoff * cutoff;
   const IView1D& sid = g.sid;
-  const IView1D& soff = g.soff;
-  const IView1D& scnt = g.scnt;
   const IView1D& sper = g.sper;
   const RView2D& scell = g.scell;
 

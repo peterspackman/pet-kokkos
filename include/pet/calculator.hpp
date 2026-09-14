@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "pet/config.hpp"
@@ -182,6 +183,14 @@ class Calculator {
   // call returns a measured per-featurizer floor and every call after it adapts.
   // Ask per chunk, not once.
   int recommended_batch_atoms() const;
+
+  // Device scratch the evaluator is holding, and where it went. The pool is
+  // grow-only and keyed by label, so the breakdown attributes every byte to the
+  // buffer that asked for it -- which is the only practical way to find out why
+  // a large model in fp64 does not fit. Both are zero until something has been
+  // evaluated.
+  std::size_t workspace_bytes() const;
+  std::vector<std::pair<std::string, std::size_t>> workspace_breakdown() const;
 
   Options& options();
   const Options& options() const;

@@ -118,12 +118,12 @@ void layernorm(View2D out, View2D in, View1D weight, View1D bias) {
 }
 
 // SwiGLU FF: out = w_out( v * sigmoid(g) ), [v,g]=w_in(in).chunk(2). tmp holds w_in(in).
-void feedforward_swiglu(Workspace& ws, const std::string& key, View2D out, View2D in, View2D w_in,
-                        View1D b_in, View2D w_out, View1D b_out, View2D tmp) {
+void feedforward_swiglu(Workspace& ws, const std::string& key, View2D out, View2D in,
+                        WeightRef w_in, View1D b_in, WeightRef w_out, View1D b_out, View2D tmp) {
   const int R = in.extent(0);
   const int dff = tmp.extent(1) / 2;
   linear(tmp, in, w_in, b_in);
-  View2D h = ws.n2(key + ":ffh", R, dff);
+  View2D h = ws.n2_any("scratch:ffh", R, dff);
   {
     Kokkos::parallel_for(
         "swiglu", RangePolicy(0, (R) * (dff)),
@@ -380,12 +380,12 @@ void layernorm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight) {
 
 // in_adj(R,Dmodel) += backward of SwiGLU FF. tmp holds w_in(in) from forward.
 void feedforward_swiglu_bwd(Workspace& ws, const std::string& key, View2D in_adj, View2D out_adj,
-                            View2D tmp, View2D w_in, View2D w_out) {
+                            View2D tmp, WeightRef w_in, WeightRef w_out) {
   const int R = out_adj.extent(0);
   const int dff = tmp.extent(1) / 2;
-  View2D h_adj = ws.n2(key + ":hadj", R, dff);
+  View2D h_adj = ws.n2_any("scratch:hadj", R, dff);
   linear_bwd(h_adj, out_adj, w_out);  // h_adj = out_adj @ w_out
-  View2D tmp_adj = ws.n2(key + ":tmpadj", R, 2 * dff);
+  View2D tmp_adj = ws.n2_any("scratch:tmpadj", R, 2 * dff);
   {
     Kokkos::parallel_for(
         "swiglu_bwd", RangePolicy(0, (R) * (dff)),
@@ -432,14 +432,14 @@ void feedforward_swiglu_bwd(Workspace& ws, const std::string& key, View2D in_adj
 template <int HD>
 void attention_bwd_impl(Workspace& ws, const std::string& key, const std::string& fwd_key,
                         View2D an_adj, View2D cf_seq_adj, View2D ao_adj, View2D qkv, View2D cf_seq,
-                        View2D w_in, View2D w_out, int N, int S, int num_heads, int head_dim,
+                        WeightRef w_in, WeightRef w_out, int N, int S, int num_heads, int head_dim,
                         double temperature) {
   const int D = num_heads * head_dim;
   const int R = N * S;
   const int H = num_heads;
-  View2D merged_adj = ws.n2(key + ":madj", R, D);
+  View2D merged_adj = ws.n2_any("scratch:madj", R, D);
   linear_bwd(merged_adj, ao_adj, w_out);  // d(merged) = ao_adj @ w_out
-  View2D qkv_adj = ws.n2(key + ":qkvadj", R, 3 * D);  // each element written by exactly one thread
+  View2D qkv_adj = ws.n2_any("scratch:qkvadj", R, 3 * D);  // each element written by exactly one thread
   // softmax math in Net precision (expf/logf): much faster than fp64 on consumer GPUs.
   View2D stats = ws.n2(key + ":stats", N * H * S, 3);  // per-query (m, 1/l, dot_do_out)
   View2D cfh = ws.n2(key + ":cfh", N * S, H);          // per-(key, head) cutoff-adjoint partial
@@ -553,8 +553,8 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, const std::string
   linear_bwd(an_adj, qkv_adj, w_in);  // d(attn_in) = qkv_adj @ w_in
 }
 void attention_bwd(Workspace& ws, const std::string& key, const std::string& fwd_key, View2D an_adj,
-                   View2D cf_seq_adj, View2D ao_adj, View2D qkv, View2D cf_seq, View2D w_in,
-                   View2D w_out, int N, int S, int num_heads, int head_dim, double temperature) {
+                   View2D cf_seq_adj, View2D ao_adj, View2D qkv, View2D cf_seq, WeightRef w_in,
+                   WeightRef w_out, int N, int S, int num_heads, int head_dim, double temperature) {
   PET_ATTN_DISPATCH(attention_bwd_impl, ws, key, fwd_key, an_adj, cf_seq_adj, ao_adj, qkv, cf_seq,
                     w_in, w_out, N, S, num_heads, head_dim, temperature);
 }
@@ -982,8 +982,8 @@ View2D PetModel::conditioning(const DeviceEdgeData& dev, int N, int NS) {
     // The Views themselves: these are gathered from element-wise in a kernel,
     // not multiplied, so the Ozaki decomposition mat() also carries is of no use
     // here and a WeightRef is not indexable.
-    const View2D qe = mat("system_conditioning.charge_embedding.weight");
-    const View2D se = mat("system_conditioning.spin_multiplicity_embedding.weight");
+    const View2D qe = mat("system_conditioning.charge_embedding.weight").v;
+    const View2D se = mat("system_conditioning.spin_multiplicity_embedding.weight").v;
     const int nq = (int) qe.extent(0), ns = (int) se.extent(0);
     Kokkos::parallel_for(
         "cond_gather", RangePolicy(0, NS * Dn), KOKKOS_LAMBDA(int _i) {
@@ -1048,7 +1048,7 @@ int PetModel::ffn_pre_width(const std::string& wkey) const {
 void PetModel::feedforward(const std::string& key, View2D out, View2D in,
                            const std::string& wkey, View2D pre, bool save) {
   const int R = in.extent(0);
-  View2D w_in = mat(wkey + ".w_in.weight"), w_out = mat(wkey + ".w_out.weight");
+  WeightRef w_in = mat(wkey + ".w_in.weight"), w_out = mat(wkey + ".w_out.weight");
   View1D b_in = vec(wkey + ".w_in.bias"), b_out = vec(wkey + ".w_out.bias");
   // Delegated rather than open-coded: nvcc refuses an extended __host__ __device__
   // lambda inside a private member function, and these dispatchers are private.
@@ -1056,7 +1056,7 @@ void PetModel::feedforward(const std::string& key, View2D out, View2D in,
     feedforward_swiglu(ws_, key, out, in, w_in, b_in, w_out, b_out, pre);
   } else {
     const int dff = pre.extent(1);
-    View2D h = ws_.n2(key + ":ffh", R, dff);
+    View2D h = ws_.n2_any("scratch:ffh", R, dff);
     linear_silu(h, save ? pre : View2D(), in, w_in, b_in, save);  // h = silu(pre)
     linear(out, h, w_out, b_out);
   }
@@ -1064,13 +1064,13 @@ void PetModel::feedforward(const std::string& key, View2D out, View2D in,
 
 void PetModel::feedforward_bwd(const std::string& key, View2D in_adj, View2D out_adj,
                                const std::string& wkey, View2D pre) {
-  View2D w_in = mat(wkey + ".w_in.weight"), w_out = mat(wkey + ".w_out.weight");
+  WeightRef w_in = mat(wkey + ".w_in.weight"), w_out = mat(wkey + ".w_out.weight");
   const int R = out_adj.extent(0);
   if (h_.activation == Activation::SwiGLU) {
     feedforward_swiglu_bwd(ws_, key, in_adj, out_adj, pre, w_in, w_out);
   } else {
     const int dff = pre.extent(1);
-    View2D h_adj = ws_.n2(key + ":hadj", R, dff);
+    View2D h_adj = ws_.n2_any("scratch:hadj", R, dff);
     linear_bwd(h_adj, out_adj, w_out);
     silu_bwd(h_adj, pre);
     linear_bwd(in_adj, h_adj, w_in);
@@ -1639,7 +1639,7 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
 
   // initial edge messages = species embedding of the neighbor; geometric (v,|v|)
   View2D input_edge = ws_.n2("re_input_edge", NM, D);
-  gather(input_edge, mat("edge_embedder.weight"), d_neigh_species);
+  gather(input_edge, mat("edge_embedder.weight").v, d_neigh_species);
   View2D edge_in4 = ws_.n2("re_edge_in4", NM, 4);
   Kokkos::parallel_for(
       "re_edge_in4", RangePolicy(0, NM), KOKKOS_LAMBDA(int k) {
@@ -1668,7 +1668,7 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
     // fresh per-layer central-node embedding (residual featurizer: node input is
     // re-embedded from species every layer; only edge messages carry over).
     View2D node_L = ws_.n2("re_node_L", N, D);
-    gather(node_L, mat("node_embedders." + ls + ".weight"), d_species);
+    gather(node_L, mat("node_embedders." + ls + ".weight").v, d_species);
 
     // geometric edge embedding: Linear(4 -> D) on [edge_vec, dist]
     View2D edge_emb = ws_.n2("re_edge_emb", NM, D);
@@ -1686,7 +1686,7 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
           });
     } else {
       View2D nb_emb = ws_.n2("re_nb_emb", NM, D);
-      gather(nb_emb, mat(g + ".neighbor_embedder.weight"), d_neigh_species);
+      gather(nb_emb, mat(g + ".neighbor_embedder.weight").v, d_neigh_species);
       Kokkos::parallel_for(
           "re_cat3", RangePolicy(0, NM * D), KOKKOS_LAMBDA(int _i) {
             const int k = _i / D, d = _i % D;
@@ -2079,8 +2079,8 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   View2D input_edge = ws_.n2("input_edge", NM, D);
   View2D edge_in4 = ws_.n2("edge_in4", NM, 4);
   {
-    gather(node, mat("node_embedders.0.weight"), d_species);
-    gather(input_edge, mat("edge_embedder.weight"), d_neigh_species);
+    gather(node, mat("node_embedders.0.weight").v, d_species);
+    gather(input_edge, mat("edge_embedder.weight").v, d_neigh_species);
     Kokkos::parallel_for(
         "edge_in4", RangePolicy(0, NM), KOKKOS_LAMBDA(int k) {
           edge_in4(k, 0) = d_edge_vec(k, 0);
@@ -2135,7 +2135,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
           });
     } else {
       View2D nb_emb = ws_.n2("nb_emb", NM, D);
-      gather(nb_emb, mat(g + ".neighbor_embedder.weight"), d_neigh_species);
+      gather(nb_emb, mat(g + ".neighbor_embedder.weight").v, d_neigh_species);
       Kokkos::parallel_for(
           "cat3", RangePolicy(0, (NM) * (D)),
           KOKKOS_LAMBDA(int _i) { const int k = _i / (D), d = _i % (D);

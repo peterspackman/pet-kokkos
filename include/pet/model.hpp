@@ -3,6 +3,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "pet/checkpoint.hpp"
@@ -118,7 +119,13 @@ struct WeightRef {
       : v(m), split(s), split_t(st) {}
   // The decomposition to use when the GEMM wants B transposed (`tb`) or not.
   const OzakiSplit* for_orientation(bool tb) const { return tb ? split : split_t; }
-  operator const View2D&() const { return v; }
+  // Explicit on purpose. An implicit narrowing to View2D compiles silently and
+  // throws away both decompositions, so the GEMM re-splits the weight from
+  // scratch on every call -- correct, but it undoes the whole point of doing
+  // the factorization at load time. That happened: `View2D w = mat(...)` in the
+  // feedforward and attention-backward paths cost 20 of 64 GEMMs their pre-split.
+  // Keeping it explicit turns the mistake into a compile error.
+  explicit operator const View2D&() const { return v; }
   std::size_t extent(int d) const { return v.extent(d); }
 };
 
@@ -250,6 +257,10 @@ class PetModel {
   // evaluated.
  public:
   std::size_t workspace_bytes() const { return ws_.capacity_bytes(); }
+  // Pool buffers largest first, for diagnosing where an evaluation's memory went.
+  std::vector<std::pair<std::string, std::size_t>> workspace_breakdown() const {
+    return ws_.capacity_breakdown();
+  }
   int last_n_atoms() const { return last_n_atoms_; }
   int last_max_neighbors() const { return last_max_neighbors_; }
   // The LARGEST edge-slot count evaluated so far. The pool is grow-only, so its

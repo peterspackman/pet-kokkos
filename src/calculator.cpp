@@ -320,6 +320,12 @@ BatchResult Calculator::compute_device(const DeviceGeom& geom, bool compute_forc
   return impl_->model.energy_forces_batch(dev, compute_forces);
 }
 
+std::size_t Calculator::workspace_bytes() const { return impl_->model.workspace_bytes(); }
+
+std::vector<std::pair<std::string, std::size_t>> Calculator::workspace_breakdown() const {
+  return impl_->model.workspace_breakdown();
+}
+
 int Calculator::recommended_batch_atoms() const {
   if (impl_->opts.max_batch_atoms > 0) return impl_->opts.max_batch_atoms;
 

@@ -3,8 +3,11 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace pet {
 
@@ -49,6 +52,7 @@ using IView2D = Kokkos::View<int**, LR, MemSpace>;
 // the widest type whose pairwise products accumulate exactly in int32 over the
 // inner dimensions this network uses.
 using I8View2D = Kokkos::View<int8_t**, LR, MemSpace>;
+using I8View1D = Kokkos::View<int8_t*, LR, MemSpace>;
 
 // Persistent scratch-buffer pool reused across compute() calls. Each compute()
 // otherwise allocates ~70 Kokkos Views (cudaMalloc/cudaFree, which synchronize
@@ -86,6 +90,40 @@ class Workspace {
   IView2D i2(const std::string& k, int r, int c) { return get2<IView2D, int>(i2_, k, r, c); }
   I8View2D i8(const std::string& k, int r, int c) { return get2<I8View2D, int8_t>(i8_, k, r, c); }
   IView1D i1(const std::string& k, int n) { return get1<IView1D, int>(i1_, k, n); }
+
+  // Capacity-keyed 2-D scratch: reuse whenever the buffer holds enough ELEMENTS,
+  // whatever shape they were last used in. i2()/i8() above reuse only when the
+  // column count matches exactly, because they hand back a row prefix and a row
+  // prefix of a LayoutRight buffer is only contiguous when the columns agree.
+  // That rule is right for the model's activations, whose width is a fixed model
+  // dimension, but wrong for the Ozaki slice grid: its buffers are [m,k] and
+  // [m,n] with k and n taking half a dozen values across one evaluation, so a
+  // fixed key reallocated on almost every call -- ~590 cudaMalloc/cudaFree per
+  // evaluation, each cudaFree synchronising the device, which is precisely the
+  // churn this pool exists to prevent.
+  //
+  // Reshaping is safe here because the view is unmanaged over a contiguous
+  // buffer: any [r,c] with r*c <= capacity is a valid LayoutRight view of it.
+  // Shared scratch for a buffer whose life is one layer's forward or backward.
+  //
+  // n2() keys by label, and PET's labels carry the layer they belong to, so a
+  // per-layer temporary is held for the whole evaluation once per layer -- G*A
+  // copies of something only one layer ever uses at a time. On a 512-atom cell
+  // with pet-mad-m that was ~4.3 GiB of an 11 GiB pool. Giving those buffers one
+  // shape-independent key collapses each family to a single buffer.
+  //
+  // Use this ONLY for a buffer no later layer reads back. Anything peek2() or a
+  // backward pass retrieves is a saved activation, not scratch, and must keep
+  // its per-layer key.
+  View2D n2_any(const std::string& k, int r, int c) {
+    return get2_any<View2D, View1D, Net>(n2cap_, k, r, c);
+  }
+  IView2D i2_any(const std::string& k, int r, int c) {
+    return get2_any<IView2D, IView1D, int>(i2cap_, k, r, c);
+  }
+  I8View2D i8_any(const std::string& k, int r, int c) {
+    return get2_any<I8View2D, I8View1D, int8_t>(i8cap_, k, r, c);
+  }
   // Return an existing buffer without zeroing it (for reading data written by an
   // earlier kernel this step, e.g. saved forward activations). Returns the same
   // [r,c] prefix the matching n2() handed out this step, NOT the capacity buffer.
@@ -116,7 +154,33 @@ class Workspace {
     for (const auto& kv : i2_) b += kv.second.span() * sizeof(int);
     for (const auto& kv : i1_) b += kv.second.span() * sizeof(int);
     for (const auto& kv : i8_) b += kv.second.span() * sizeof(int8_t);
+    for (const auto& kv : n2cap_) b += kv.second.span() * sizeof(Net);
+    for (const auto& kv : i2cap_) b += kv.second.span() * sizeof(int);
+    for (const auto& kv : i8cap_) b += kv.second.span() * sizeof(int8_t);
     return b;
+  }
+
+  // Every buffer the pool holds, largest first, as (label, bytes). The pool is
+  // grow-only and keyed by label, so this is the honest answer to "what is using
+  // the memory" -- an evaluation's footprint is the sum of its labels, and a
+  // label that appears once per layer is paid for once per layer.
+  std::vector<std::pair<std::string, std::size_t>> capacity_breakdown() const {
+    std::vector<std::pair<std::string, std::size_t>> v;
+    auto add = [&v](const auto& m, std::size_t esz) {
+      for (const auto& kv : m) v.emplace_back(kv.first, kv.second.span() * esz);
+    };
+    add(n2_, sizeof(Net));
+    add(n1_, sizeof(Net));
+    add(r2_, sizeof(double));
+    add(r1_, sizeof(double));
+    add(i2_, sizeof(int));
+    add(i1_, sizeof(int));
+    add(i8_, sizeof(int8_t));
+    add(n2cap_, sizeof(Net));
+    add(i2cap_, sizeof(int));
+    add(i8cap_, sizeof(int8_t));
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    return v;
   }
 
  private:
@@ -145,6 +209,17 @@ class Workspace {
     slot = V(k, r, c);  // (re)allocate capacity; fresh allocation is zero-initialized
     return slot;
   }
+  // Capacity pool backing i2_any/i8_any: a flat buffer per key, viewed as
+  // whatever 2-D shape the caller asked for.
+  template <class V, class Base, class T, class Map>
+  V get2_any(Map& m, const std::string& k, int r, int c) {
+    Base& slot = m[k];
+    const std::size_t need = (std::size_t) r * (std::size_t) c;
+    if (slot.extent(0) < need) slot = Base(k, need);  // fresh allocations zero-init
+    V view(slot.data(), r, c);
+    if (zero_) Kokkos::deep_copy(ExecSpace(), view, T(0));
+    return view;
+  }
   template <class V, class T, class Map>
   V get1(Map& m, const std::string& k, int n) {
     V& slot = m[k];
@@ -164,6 +239,9 @@ class Workspace {
   std::unordered_map<std::string, IView2D> i2_;
   std::unordered_map<std::string, IView1D> i1_;
   std::unordered_map<std::string, I8View2D> i8_;
+  std::unordered_map<std::string, View1D> n2cap_;
+  std::unordered_map<std::string, IView1D> i2cap_;
+  std::unordered_map<std::string, I8View1D> i8cap_;
   std::unordered_map<std::string, View2D> cur2_;  // current logical n2 view per key (for peek2)
 };
 

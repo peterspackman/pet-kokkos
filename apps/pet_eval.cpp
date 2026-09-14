@@ -7,12 +7,14 @@
 // <prefix>.safetensors.
 #include <Kokkos_Core.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -43,6 +45,7 @@ void usage() {
       "      --host-neighbors build the neighbour list on the host\n"
       "      --builtin-neighbors  use the built-in O(N^2) search, not vesin\n"
       "      --repeat N       evaluate N times and report the best wall time\n"
+      "      --memory         report the device scratch pool and its largest buffers\n"
       "      --info           print the model's properties and exit\n"
       "      --models         list the model search path and exit\n"
       "  -h, --help           this message\n"
@@ -73,6 +76,7 @@ struct Args {
   std::string model_spec, structure_path, output_path;
   bool want_forces = false, batch = false, per_atom = false;
   bool host_neighbors = false, builtin_neighbors = false, info_only = false, json = false;
+  bool report_memory = false;
   int repeat = 1;
   int charge = 0;
   int spin = 1;
@@ -121,6 +125,8 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.charge = std::atoi(next("--charge").c_str());
     } else if (s == "--spin") {
       a.spin = std::atoi(next("--spin").c_str());
+    } else if (s == "--memory") {
+      a.report_memory = true;
     } else if (s == "--repeat") {
       a.repeat = std::max(1, std::atoi(next("--repeat").c_str()));
     } else if (!s.empty() && s[0] == '-') {
@@ -387,6 +393,48 @@ int run(const Args& a) {
     std::printf("\nbest of %d: %.4f s for %zu frames / %d atoms (%.4f ms/atom)\n", a.repeat,
                 best_seconds, frames.size(), total_atoms,
                 1e3 * best_seconds / std::max(1, total_atoms));
+
+  if (a.report_memory) {
+    const std::size_t pool = calc.workspace_bytes();
+    std::printf("\ndevice scratch pool: %.2f GiB\n", double(pool) / (1024.0 * 1024.0 * 1024.0));
+    // Grouped by label family, not by individual buffer. Almost every buffer in
+    // a PET evaluation is named for the layer that allocated it ("emlpb_2_0"),
+    // so a flat list is hundreds of near-identical rows and the shape of the
+    // problem -- one buffer per layer, times the layer count -- is invisible.
+    // Collapsing the digits shows it directly: a family holding G*A copies of a
+    // temporary that only one layer uses at a time is the thing worth fixing.
+    const auto rows = calc.workspace_breakdown();
+    std::map<std::string, std::pair<std::size_t, int>> fam;
+    for (const auto& [label, bytes] : rows) {
+      std::string k;
+      bool in_num = false;
+      for (char c : label) {
+        if (c >= '0' && c <= '9') {
+          if (!in_num) k += '*';
+          in_num = true;
+        } else {
+          k += c;
+          in_num = false;
+        }
+      }
+      auto& e = fam[k];
+      e.first += bytes;
+      e.second += 1;
+    }
+    std::vector<std::pair<std::string, std::pair<std::size_t, int>>> fv(fam.begin(), fam.end());
+    std::sort(fv.begin(), fv.end(), [](const auto& a, const auto& b) {
+      return a.second.first > b.second.first;
+    });
+    std::size_t shown = 0;
+    for (std::size_t i = 0; i < fv.size() && i < 18; ++i) {
+      if (fv[i].second.first < pool / 200) break;
+      std::printf("  %-34s %4d x %8.1f MiB\n", fv[i].first.c_str(), fv[i].second.second,
+                  double(fv[i].second.first) / (1024.0 * 1024.0));
+      shown += fv[i].second.first;
+    }
+    std::printf("  %-34s      %10.1f MiB\n", "(everything else)",
+                double(pool - shown) / (1024.0 * 1024.0));
+  }
 
   if (!a.output_path.empty()) {
     std::ofstream out(a.output_path);

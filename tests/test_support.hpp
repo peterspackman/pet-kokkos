@@ -175,8 +175,12 @@ inline const std::vector<std::string>& golden_models() {
     //                 "uv run tools/convert_pet.py --model pet-mad-xs
     //                  --out models/pet-mad-xs-v1.6".
     // pet-attn2  -- synthetic, num_attention_layers = 2 (see its goldens' notes,
-    //               and tools/make_multilayer_checkpoint.py). No published upet
-    //               model uses A > 1, but metatrain defaults to it.
+    //               and tools/make_multilayer_checkpoint.py). Synthetic only
+    //               because it is small enough to ship: A > 1 is the norm, not
+    //               the exception -- every published model from size m upward is
+    //               A = 2, and the XLs are A = 3. The small checkpoints that
+    //               happen to be A = 1 are the unrepresentative ones, which is
+    //               exactly why this case exists.
     std::vector<std::string> v{"pet-mad-xs", "pbe0-pet", "pet-mad-xs-v1.6", "pet-attn2"};
     if (const char* e = std::getenv("PET_TEST_MODELS")) {
       const std::string s(e);

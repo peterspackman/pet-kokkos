@@ -11,11 +11,14 @@
 
 #include <cstdlib>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace pet {
 
 namespace {
 using RangePolicy = Kokkos::RangePolicy<ExecSpace>;
+using TeamPol = Kokkos::TeamPolicy<ExecSpace>;
+using TeamMem = TeamPol::member_type;
 
 int env_int(const char* name, int fallback, int lo, int hi) {
   const char* e = std::getenv(name);
@@ -90,6 +93,63 @@ void split_into(Workspace* ws, const std::string& key, const View2D& src, int n_
 
   // Per-line (or matrix-wide) magnitude, then the normalising power of two.
   RView1D scale = ws ? ws->r1(key + ":oscale", lines) : RView1D(key + ":oscale", lines);
+  out.scale = scale;
+
+  // Slice buffers. Activation slices come from the pool (reused every call); a
+  // weight's are owned, because they are computed once at load and kept for the
+  // model's life.
+  out.slices.resize(n_slices);
+  for (int t = 0; t < n_slices; ++t) {
+    const std::string sk = key + ":osl" + std::to_string(t);
+    out.slices[t] = ws ? ws->i8_any(sk, R, C) : I8View2D(sk, R, C);
+  }
+  const int S = n_slices;
+  // Copy the slice handles into a fixed-size array the device lambda can hold;
+  // a std::vector cannot cross into a kernel.
+  I8View2D sl[kOzakiMaxSlices];
+  for (int t = 0; t < S; ++t) sl[t] = out.slices[t];
+
+  // The row-scaled case is the hot one -- it is how every activation entering a
+  // forward GEMM is split -- and it gets a fused team kernel: one team per row,
+  // which finds the row's maximum and peels its digits in a single pass.
+  //
+  // The two-kernel form below reads the whole matrix twice, and its max pass is
+  // one thread per ROW walking the columns, so neighbouring threads are C
+  // elements apart and every load is uncoalesced. Measured at 6.9x off the
+  // bandwidth this should run at. A team walks the row cooperatively instead, so
+  // the reads coalesce, and the max is then already in registers when the digits
+  // are peeled.
+  if (!uniform && !by_column) {
+    Kokkos::parallel_for(
+        key + ":osplit_row", TeamPol(R, Kokkos::AUTO), KOKKOS_LAMBDA(const TeamMem& team) {
+          const int r = team.league_rank();
+          double mu = 0.0;
+          Kokkos::parallel_reduce(
+              Kokkos::TeamThreadRange(team, C),
+              [&](int c, double& acc) { acc = Kokkos::max(acc, Kokkos::fabs((double) src(r, c))); },
+              Kokkos::Max<double>(mu));
+          // Every member holds the reduced max, so each can derive the scale
+          // without a barrier; only one of them needs to store it.
+          const double sc = norm_scale(mu);
+          if (team.team_rank() == 0) scale(r) = sc;
+          // Multiply by the reciprocal rather than divide: the scale is an exact
+          // power of two, so the reciprocal is exact too and the digits are
+          // unchanged.
+          const double inv = (sc > 0.0) ? 1.0 / sc : 0.0;
+          Kokkos::parallel_for(Kokkos::TeamThreadRange(team, C), [&](int c) {
+            double u = (double) src(r, c) * inv;  // |u| <= 1/2
+            for (int t = 0; t < S; ++t) {
+              const double v = u * 128.0;  // 2^kOzakiSliceBits
+              double d = Kokkos::round(v);
+              d = Kokkos::fmin(Kokkos::fmax(d, -127.0), 127.0);
+              sl[t](r, c) = (int8_t) d;
+              u = v - d;
+            }
+          });
+        });
+    return;
+  }
+
   if (uniform) {
     double mu = 0.0;
     Kokkos::parallel_reduce(
@@ -107,33 +167,11 @@ void split_into(Workspace* ws, const std::string& key, const View2D& src, int n_
           for (int r = 0; r < R; ++r) mu = Kokkos::max(mu, Kokkos::fabs((double) src(r, c)));
           scale(c) = norm_scale(mu);
         });
-  } else {
-    Kokkos::parallel_for(
-        key + ":omax_r", RangePolicy(0, R), KOKKOS_LAMBDA(int r) {
-          double mu = 0.0;
-          for (int c = 0; c < C; ++c) mu = Kokkos::max(mu, Kokkos::fabs((double) src(r, c)));
-          scale(r) = norm_scale(mu);
-        });
   }
-  out.scale = scale;
-
-  // Activation slices come from the pool (reused every call); a weight's are
-  // owned, because they are computed once at load and kept for the model's life.
-  out.slices.resize(n_slices);
-  for (int t = 0; t < n_slices; ++t) {
-    const std::string sk = key + ":osl" + std::to_string(t);
-    out.slices[t] = ws ? ws->i8(sk, R, C) : I8View2D(sk, R, C);
-  }
-
+  // The remaining row-scaled case returned above, through the fused kernel.
   // Peel the digits. One thread per entry, walking the whole chain, so the
   // residual stays in a register rather than round-tripping through memory
   // n_slices times.
-  const int S = n_slices;
-  // Copy the slice handles into a fixed-size array the device lambda can hold;
-  // a std::vector cannot cross into a kernel.
-  I8View2D sl[kOzakiMaxSlices];
-  for (int t = 0; t < S; ++t) sl[t] = out.slices[t];
-
   Kokkos::parallel_for(
       key + ":osplit", RangePolicy(0, R * C), KOKKOS_LAMBDA(int idx) {
         const int r = idx / C, c = idx % C;
@@ -224,12 +262,79 @@ Workspace& ozaki_ws() {
   // static is destroyed during static destruction, which runs AFTER
   // Kokkos::finalize(), and Kokkos rejects a View freed at that point. Leaking
   // it is the standard way out and costs nothing -- the process is ending.
-  static Workspace* ws = new Workspace();
+  static Workspace* ws = [] {
+    auto* w = new Workspace();
+    // Every buffer this pool hands out is fully overwritten before it is read:
+    // the slice buffers by the split kernel, the int32 accumulator by the first
+    // GEMM of each shift group (issued with beta = 0). Zeroing them first is
+    // pure memory traffic -- measured at ~29 ms per evaluation on pet-mad-xs.
+    w->set_zero(false);
+    return w;
+  }();
   return *ws;
 }
 }  // namespace
 
 std::size_t ozaki_workspace_bytes() { return ozaki_ws().capacity_bytes(); }
+
+#if defined(KOKKOS_ENABLE_CUDA)
+namespace {
+// Shapes a slice grid structurally cannot win, whatever the rest of the
+// implementation costs. The grid replaces one GEMM with ~37 of them, so it needs
+// enough arithmetic per launch to amortise that; these bounds are a floor, not
+// the performance crossover.
+//
+//   k small : PET's geometry embedder is Linear(4 -> d_pet), the [edge_vector,
+//             distance] projection the architecture is named for. A 37-GEMM grid
+//             over a 4-term contraction spends its whole budget on 0.03% of the
+//             evaluation's flops, and DGEMM at k = 4 is memory-bound anyway.
+//   n small : the readout heads contract to a single column. That is a GEMV, and
+//             a GEMV uses no tensor core at all -- the one resource the scheme
+//             exists to exploit.
+//   m*n small : below a few thousand outputs the launches cost more than the
+//             arithmetic they carry.
+//
+// Falling back is always safe: DGEMM is exact, so the fallback can only raise
+// accuracy, never lower it.
+bool ozaki_shape_worthwhile(int m, int n, int k) {
+  return k >= 32 && n >= 32 && (std::size_t) m * (std::size_t) n >= 4096u;
+}
+
+// Whether cuBLAS accepts int8 for a given shape. The exact rule is a function of
+// the cuBLAS version and the architecture's IMMA fragment size, so it is asked
+// rather than encoded -- but asked ONCE per shape. The probe is a real GEMM;
+// re-issuing it on every call made it 1 of every 37 cuBLAS calls in the grid,
+// duplicating a product the loop below immediately recomputes.
+bool igemm_shape_supported(int m, int n, int k, cublasOperation_t ob, const int8_t* a, int lda,
+                           const int8_t* b, int ldb, int32_t* c, int ldc) {
+  struct Key {
+    int m, n, k;
+    int ob;
+    bool operator==(const Key& o) const {
+      return m == o.m && n == o.n && k == o.k && ob == o.ob;
+    }
+  };
+  struct Hash {
+    std::size_t operator()(const Key& x) const {
+      return ((std::size_t) x.m * 1000003u ^ (std::size_t) x.n) * 1000003u ^
+             ((std::size_t) x.k * 31u + (std::size_t) x.ob);
+    }
+  };
+  static std::unordered_map<Key, bool, Hash> cache;
+  const Key key{m, n, k, (int) ob};
+  const auto it = cache.find(key);
+  if (it != cache.end()) return it->second;
+
+  const cublasStatus_t st = igemm_try(CUBLAS_OP_T, ob, m, n, k, a, lda, b, ldb, 0, c, ldc);
+  if (st != CUBLAS_STATUS_SUCCESS && st != CUBLAS_STATUS_NOT_SUPPORTED)
+    throw std::runtime_error("pet: cublasGemmEx (int8) probe failed with status " +
+                             std::to_string((int) st));
+  const bool ok = (st == CUBLAS_STATUS_SUCCESS);
+  cache.emplace(key, ok);
+  return ok;
+}
+}  // namespace
+#endif
 
 void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View2D& B, Net beta,
                 const View2D& C, const OzakiSplit* bsplit) {
@@ -247,6 +352,13 @@ void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View
   const int m = (int) C.extent(0), n = (int) C.extent(1);
   const int k = ta ? (int) A.extent(0) : (int) A.extent(1);
   const int S = cfg.slices;
+
+  // Gate before splitting: a shape the grid cannot win is not worth the split
+  // kernel, and the split is the expensive half of the preparation.
+  if (!ozaki_shape_worthwhile(m, n, k)) {
+    gemm(transA, transB, alpha, A, B, beta, C);
+    return;
+  }
 
   // A is normalised along the direction the inner product sums over: by row when
   // it enters untransposed, by column when transposed. Same for B, mirrored.
@@ -273,33 +385,19 @@ void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View
   // hundreds of megabytes. Allocating it per GEMM would reintroduce exactly the
   // device-synchronising cudaMalloc/cudaFree churn the Workspace exists to
   // avoid.
-  IView2D G = ws.i2(key + ":og", m, n);
+  IView2D G = ws.i2_any(key + ":og", m, n);
   static_assert(sizeof(int) == 4, "the Ozaki accumulator assumes 32-bit int");
 
   const int lda = (int) A.extent(1), ldb = (int) B.extent(1), ldc = n;
 
-  // Not every shape can go through int8 tensor cores. The exact rule is a
-  // function of the cuBLAS version and the architecture's IMMA fragment size, so
-  // rather than encode one, ask: try the shape, and on NOT_SUPPORTED use the
-  // vendor fp64 GEMM for this call instead.
-  //
-  // That fallback is always safe -- DGEMM is exact, so falling back can only
-  // improve accuracy -- and it is the right answer anyway for the shapes that
-  // fail. In this network they are PET's geometry embedder, the Linear(4 ->
-  // d_pet) on [edge_vector, distance] that gives the architecture its name: at
-  // k = 4 there is nothing for a slice decomposition to win, and a 45-GEMM grid
-  // over a k = 4 contraction would be pure overhead.
-  {
-    const cublasStatus_t probe =
-        igemm_try(CUBLAS_OP_T, ta ? CUBLAS_OP_T : CUBLAS_OP_N, n, m, k, bs->slices[0].data(),
-                  ldb_eff, asp.slices[0].data(), lda, 0, reinterpret_cast<int32_t*>(G.data()), ldc);
-    if (probe == CUBLAS_STATUS_NOT_SUPPORTED) {
-      gemm(transA, transB, alpha, A, B, beta, C);
-      return;
-    }
-    if (probe != CUBLAS_STATUS_SUCCESS)
-      throw std::runtime_error("pet: cublasGemmEx (int8) probe failed with status " +
-                               std::to_string((int) probe));
+  // Not every shape can go through int8 tensor cores, and the rule is a cuBLAS
+  // and architecture detail rather than something worth encoding. Ask once per
+  // shape (the answer is cached) and use the vendor fp64 GEMM for the rest.
+  if (!igemm_shape_supported(n, m, k, ta ? CUBLAS_OP_T : CUBLAS_OP_N, bs->slices[0].data(),
+                             ldb_eff, asp.slices[0].data(), lda,
+                             reinterpret_cast<int32_t*>(G.data()), ldc)) {
+    gemm(transA, transB, alpha, A, B, beta, C);
+    return;
   }
 
   auto scaleA = asp.scale;
