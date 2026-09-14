@@ -161,6 +161,49 @@ void feedforward_swiglu(Workspace& ws, const std::string& key, View2D out, View2
 // Padding each (atom, head) group up to a warp boundary so a warp can never
 // straddle two groups was also tried; it is consistently SLOWER (3.9x vs 5.6x at
 // S=46) -- the idle lanes cost more than the removed divergence saves.
+// Largest head_dim the attention kernels accept.
+//
+// head_dim is d_pet / num_heads, so it tracks model width: 16 for pet-mad-xs,
+// 32 for the -s models, 64 for -l, and 80 for pet-oam-xl / pet-omat-xl
+// (d_pet 640 over 8 heads). It was capped at 64, which refused those two
+// outright.
+//
+// The cost of raising it is register pressure, and it is worth writing down
+// what that actually is -- measured with `cuobjdump -res-usage` on sm_89,
+// registers and spilled bytes per thread:
+//
+//   head_dim  | forward         | backward dQ      | backward dK/dV
+//   ----------+-----------------+------------------+------------------
+//   16        | 64 reg,    0 B  | 95 reg,     0 B  | 122 reg,    0 B
+//   32        | 95 reg,    0 B  | 168 reg,    0 B  | 218 reg,    0 B
+//   48        | 128 reg,   0 B  | 255 reg,    0 B  | 255 reg,   56 B
+//   64        | 168 reg,   0 B  | 255 reg,  160 B  | 255 reg,  408 B
+//   80        | 254 reg,   0 B  | 255 reg,  392 B  | 255 reg,  728 B
+//   generic   | 40 reg, 1024 B  | 40 reg,  1536 B  | 46 reg,  2048 B
+//
+// Three things follow.
+//
+// The FORWARD is fine everywhere -- even at 80 it lands on 254 of the 255
+// available registers without spilling a byte. It is the backward that hurts:
+// it holds four CAP-sized arrays (k, v, dk, dv) against the forward's two, and
+// it saturates the register file from head_dim 48 upward, spilling to local
+// memory beyond that.
+//
+// The GENERIC path is much the worst case. It sizes its arrays from kMaxHeadDim
+// regardless of the actual head_dim, so it spills 1-2 KB per thread whatever it
+// is run on. That is the whole reason the sizes below get their own
+// instantiations: a specialization sets CAP == head_dim exactly, and the arrays
+// are then no larger than the data they hold.
+//
+// And 255 registers per thread caps occupancy at ~8 warps of the 48 an SM can
+// hold, so these kernels run near 17% occupancy at the large head_dims and are
+// latency-bound rather than throughput-bound. Anything that adds per-thread
+// state here -- compensated/double-double accumulation for accuracy, say -- has
+// no room to do it in registers and would need a different structure
+// (Kokkos scratch, or splitting the head dimension across a team) rather than
+// another CAP-sized array.
+constexpr int kMaxHeadDim = 128;
+
 template <int HD>
 void attention_impl(Workspace& ws, const std::string& key, View2D attn_out, View2D qkv,
                     View2D cf_seq, View2D w_out, View1D b_out, int N, int S, int num_heads,
@@ -169,7 +212,7 @@ void attention_impl(Workspace& ws, const std::string& key, View2D attn_out, View
   View2D merged = ws.n2(key + ":merged", N * S, D);
   View2D sml = save ? ws.n2(key + ":ml", N * H * S, 2) : View2D();
   const double scale = 1.0 / (Kokkos::sqrt((double) head_dim) * temperature);
-  constexpr int CAP = HD > 0 ? HD : 64;
+  constexpr int CAP = HD > 0 ? HD : kMaxHeadDim;
   {
     Kokkos::parallel_for(
         "attention", RangePolicy(0, N * H * S), KOKKOS_LAMBDA(int i) {
@@ -227,12 +270,18 @@ void attention_impl(Workspace& ws, const std::string& key, View2D attn_out, View
   }
   linear(attn_out, merged, w_out, b_out);
 }
-// Dispatch on the runtime head_dim to a compile-time-sized instantiation.
+// Dispatch on the runtime head_dim to a compile-time-sized instantiation. The
+// listed sizes are the ones the published upet catalogue uses -- 16 (xs), 32
+// (s), 48 (m, d_pet 384 over 8 heads), 64 (l), 80 (xl) -- and each avoids the
+// oversized per-thread arrays the generic HD=0 path has to allocate. Anything
+// else still runs, at kMaxHeadDim registers.
 #define PET_ATTN_DISPATCH(FN, ...)                                  \
   switch (head_dim) {                                               \
     case 16: FN<16>(__VA_ARGS__); break;                            \
     case 32: FN<32>(__VA_ARGS__); break;                            \
+    case 48: FN<48>(__VA_ARGS__); break;                            \
     case 64: FN<64>(__VA_ARGS__); break;                            \
+    case 80: FN<80>(__VA_ARGS__); break;                            \
     default: FN<0>(__VA_ARGS__); break;                             \
   }
 void attention(Workspace& ws, const std::string& key, View2D attn_out, View2D qkv, View2D cf_seq,
@@ -389,7 +438,9 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, const std::string
   View2D merged_saved = ws.peek2(fwd_key + ":merged");  // forward out_sq (no recompute)
   View2D sml = ws.peek2(fwd_key + ":ml");               // forward per-query (m, 1/l)
   const Net sc = (Net) (1.0 / (Kokkos::sqrt((double) head_dim) * temperature));
-  constexpr int CAP = HD > 0 ? HD : 64;  // right-size the per-thread arrays (no scratch spill)
+  // Exact size when the dispatch matched, so the arrays are no bigger than the
+  // data; the generic fallback pays kMaxHeadDim registers either way.
+  constexpr int CAP = HD > 0 ? HD : kMaxHeadDim;
 
   {
     // Kernel A: per query -> stats + dQ (atomic-free; own row). Uses the saved
@@ -1207,7 +1258,10 @@ void PetModel::load_all(const Checkpoint& ckpt) {
   }
   if (h_.num_attention_layers < 1)
     throw std::runtime_error("PetModel: num_attention_layers must be >= 1");
-  if (h_.head_dim > 64) throw std::runtime_error("PetModel: head_dim>64 not supported");
+  if (h_.head_dim > kMaxHeadDim)
+    throw std::runtime_error("PetModel: head_dim " + std::to_string(h_.head_dim) +
+                             " exceeds the attention kernels' ceiling of " +
+                             std::to_string(kMaxHeadDim) + " (see kMaxHeadDim in model.cpp)");
 
   // device mirror of composition energies (double)
   comp_view_ = RView1D("composition", composition_.size());
