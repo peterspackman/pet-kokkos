@@ -1,0 +1,121 @@
+// Shared test helpers: locating models and loading golden references.
+//
+// Model weights are not in this repository (see README.md), so every test that
+// needs one has to be able to SKIP rather than fail when it is absent. A fresh
+// clone must produce a green test run; "green except the model tests, which
+// cannot run here" is what that means in practice, and it is reported as skips
+// so the difference is visible.
+#pragma once
+
+#include <nlohmann/json.hpp>
+
+#include <array>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "pet/calculator.hpp"
+#include "pet/neighbors.hpp"
+
+namespace pet_test {
+
+// Directory holding the golden reference structures, baked in at configure time.
+inline const char* golden_dir() { return PET_TEST_GOLDEN_DIR; }
+
+// Resolve a named model, or nullopt when it is not installed on this machine.
+inline std::optional<std::pair<std::string, std::string>> find_model(const std::string& name) {
+  try {
+    std::string j, w;
+    pet::resolve_model(name, j, w);
+    return std::make_pair(j, w);
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+// A golden reference: the structure plus what metatrain's own evaluation of it
+// produced. Energies eV, positions Angstrom, forces eV/Angstrom, stress
+// eV/Angstrom^3.
+struct Golden {
+  std::string model;
+  std::string name;
+  pet::System system;
+  bool periodic = false;
+  double total_energy = 0.0;
+  double volume = 0.0;
+  std::vector<double> per_atom_energies;   // [N]
+  std::vector<double> forces;              // [N*3]
+  std::optional<std::array<double, 9>> stress;  // row-major 3x3, if periodic
+};
+
+inline Golden load_golden(const std::string& path) {
+  std::ifstream f(path);
+  if (!f) throw std::runtime_error("cannot open golden '" + path + "'");
+  nlohmann::json g;
+  f >> g;
+
+  Golden out;
+  out.model = g.value("model", std::string{});
+  out.name = g.value("case", std::string{});
+  out.periodic = g.value("periodic", false);
+  out.total_energy = g.at("total_energy").get<double>();
+  out.volume = g.value("volume", 0.0);
+
+  const int N = g.at("n_atoms").get<int>();
+  out.system.n_atoms = N;
+  out.system.atomic_numbers = g.at("atomic_numbers").get<std::vector<int>>();
+  out.system.positions.reserve(static_cast<std::size_t>(N) * 3);
+  for (const auto& p : g.at("positions"))
+    for (int c = 0; c < 3; ++c) out.system.positions.push_back(p[c].get<double>());
+
+  // Golden cells store lattice vectors as ROWS, which is what pet::System wants.
+  int r = 0;
+  for (const auto& row : g.at("cell")) {
+    for (int c = 0; c < 3; ++c) out.system.cell[r * 3 + c] = row[c].get<double>();
+    ++r;
+  }
+  const auto pbc = g.at("pbc").get<std::vector<bool>>();
+  for (int d = 0; d < 3 && d < (int) pbc.size(); ++d) out.system.pbc[d] = pbc[d];
+
+  if (g.contains("per_atom_energies") && !g.at("per_atom_energies").is_null())
+    out.per_atom_energies = g.at("per_atom_energies").get<std::vector<double>>();
+
+  for (const auto& fv : g.at("forces"))
+    for (int c = 0; c < 3; ++c) out.forces.push_back(fv[c].get<double>());
+
+  if (g.contains("stress") && !g.at("stress").is_null()) {
+    std::array<double, 9> s{};
+    int i = 0;
+    for (const auto& row : g.at("stress")) {
+      for (int c = 0; c < 3; ++c) s[i * 3 + c] = row[c].get<double>();
+      ++i;
+    }
+    out.stress = s;
+  }
+  return out;
+}
+
+// Every golden shipped for a given model.
+inline std::vector<std::string> golden_paths(const std::string& model) {
+  std::vector<std::string> out;
+  for (const auto& e : std::filesystem::directory_iterator(golden_dir())) {
+    const std::string fn = e.path().filename().string();
+    if (fn.rfind(model + "_", 0) == 0 && e.path().extension() == ".json")
+      out.push_back(e.path().string());
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// The models the shipped goldens cover. Kept here so a new architecture lands
+// as one entry plus its goldens, not as an edit to every test.
+inline const std::vector<std::string>& golden_models() {
+  static const std::vector<std::string> m{"pet-mad-xs", "pbe0-pet"};
+  return m;
+}
+
+}  // namespace pet_test

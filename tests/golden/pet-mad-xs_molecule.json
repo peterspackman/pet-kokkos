@@ -1,0 +1,98 @@
+{
+  "model": "pet-mad-xs",
+  "case": "molecule",
+  "description": "Golden reference for metatrain PET model 'pet-mad-xs', case 'molecule'. Energy in eV, positions in Angstrom, forces in eV/Angstrom. Total energy INCLUDES composition energies and the output scaler (energy_scale).",
+  "evaluation_path": "metatrain.utils.io.load_model(ckpt).export() -> metatomic AtomisticModel; metatomic ASE MetatomicCalculator.compute_energy(atoms, compute_forces_and_stresses=True, per_atom=True)",
+  "units": {
+    "energy": "eV",
+    "length": "Angstrom",
+    "forces": "eV/Angstrom"
+  },
+  "atomic_numbers": [
+    8,
+    1,
+    1
+  ],
+  "positions": [
+    [
+      0.0,
+      0.0,
+      0.11926
+    ],
+    [
+      0.0,
+      0.76323,
+      -0.47704
+    ],
+    [
+      0.0,
+      -0.76323,
+      -0.47704
+    ]
+  ],
+  "cell": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0
+    ]
+  ],
+  "pbc": [
+    false,
+    false,
+    false
+  ],
+  "periodic": false,
+  "n_atoms": 3,
+  "total_energy": -15.285557746887207,
+  "per_atom_energies": [
+    -7.429450035095215,
+    -3.9222919940948486,
+    -3.9338157176971436
+  ],
+  "forces": [
+    [
+      -0.007119348738342524,
+      -0.007884547114372253,
+      -0.5416277647018433
+    ],
+    [
+      -0.0009872992523014545,
+      -0.30509430170059204,
+      0.2667343020439148
+    ],
+    [
+      0.008106647990643978,
+      0.3129788637161255,
+      0.27489346265792847
+    ]
+  ],
+  "quantities_present": [
+    "total_energy",
+    "atomic_numbers",
+    "positions",
+    "cell",
+    "pbc",
+    "per_atom_energies",
+    "forces"
+  ],
+  "quantities_missing": [],
+  "model_metadata": {
+    "energy_scale": 2.4699176680573274,
+    "cutoff": 7.5,
+    "cutoff_function": "Bump",
+    "featurizer_type": "feedforward",
+    "converted_model_json": "models/pet-mad-xs.json"
+  },
+  "notes": "total_energy = energy_scale * sum_i(E_backbone_i) + sum_i(composition_energy[Z_i]). forces = energy_scale * F_backbone (composition energies are constant per type and do not contribute to forces). See the converted model JSON for energy_scale and composition_energies."
+}

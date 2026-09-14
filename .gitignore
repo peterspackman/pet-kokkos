@@ -1,0 +1,27 @@
+# Build trees
+build/
+build-*/
+_deps/
+compile_commands.json
+CMakeUserPresets.json
+
+# Model weights are NEVER committed. Some checkpoints are distributed under
+# terms that do not permit redistribution; none of them belong in git.
+models/
+*.safetensors
+*.ckpt
+*.pt
+
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+*.so
+*.whl
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

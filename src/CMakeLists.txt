@@ -1,0 +1,70 @@
+# The PET network itself. One static library; the forward and the analytic
+# backward stay in a single translation unit (src/model.cpp) because the fused
+# kernels and their adjoints are written against each other and splitting them
+# has only ever made them drift.
+
+add_library(pet_kokkos STATIC
+    model.cpp
+    device_geometry.cpp
+    calculator.cpp
+    io/extxyz.cpp
+)
+add_library(pet::kokkos ALIAS pet_kokkos)
+
+target_include_directories(pet_kokkos PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(pet_kokkos
+    PUBLIC  Kokkos::kokkos nlohmann_json::nlohmann_json
+    PRIVATE pet_warnings
+)
+
+set_target_properties(pet_kokkos PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_STANDARD 20
+)
+
+# --- precision ---------------------------------------------------------------
+# PUBLIC: a consumer must see the same Net/Real types the library was built with,
+# since they appear in the View typedefs on the public API.
+if(PET_PRECISION STREQUAL "fp32")
+    target_compile_definitions(pet_kokkos PUBLIC PET_KOKKOS_FP32)
+elseif(PET_PRECISION STREQUAL "fp64")
+    target_compile_definitions(pet_kokkos PUBLIC PET_KOKKOS_FP64)
+elseif(NOT PET_PRECISION STREQUAL "mixed")
+    message(FATAL_ERROR "PET_PRECISION must be one of: mixed, fp32, fp64")
+endif()
+
+# --- dense GEMM --------------------------------------------------------------
+# The only BLAS PET needs. gemm.hpp routes it to the vendor library of the
+# active Kokkos backend; on host it uses a portable Kokkos fallback.
+if(PET_BACKEND STREQUAL "cuda")
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(pet_kokkos PUBLIC CUDA::cublas)
+    message(STATUS "pet_kokkos: GEMM via cuBLAS")
+elseif(PET_BACKEND STREQUAL "hip")
+    find_package(rocblas REQUIRED)
+    target_link_libraries(pet_kokkos PUBLIC roc::rocblas)
+    message(STATUS "pet_kokkos: GEMM via rocBLAS")
+else()
+    message(STATUS "pet_kokkos: GEMM via portable Kokkos fallback (host)")
+endif()
+
+# In-tree model directory, the last entry in the runtime model search path.
+# Weights are never committed (see README.md); this only lets a developer drop a
+# <name>.json / <name>.safetensors pair into models/ and have it found.
+target_compile_definitions(pet_kokkos PUBLIC
+    PET_KOKKOS_MODEL_DIR="${PROJECT_SOURCE_DIR}/models")
+
+# --- install -----------------------------------------------------------------
+if(PET_INSTALL)
+    include(GNUInstallDirs)
+    install(TARGETS pet_kokkos pet_warnings
+            EXPORT pet-kokkos-targets
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/pet
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()

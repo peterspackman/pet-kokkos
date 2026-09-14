@@ -1,0 +1,71 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "serial",
+      "inherits": "base",
+      "displayName": "Serial (host, single-threaded)",
+      "cacheVariables": { "PET_BACKEND": "serial" }
+    },
+    {
+      "name": "openmp",
+      "inherits": "base",
+      "displayName": "OpenMP (host, threaded)",
+      "cacheVariables": { "PET_BACKEND": "openmp" }
+    },
+    {
+      "name": "cuda",
+      "inherits": "base",
+      "displayName": "CUDA (NVIDIA)",
+      "cacheVariables": {
+        "PET_BACKEND": "cuda",
+        "CMAKE_CXX_COMPILER": "${sourceDir}/build-cuda/_deps/kokkos-src/bin/nvcc_wrapper"
+      }
+    },
+    {
+      "name": "hip",
+      "inherits": "base",
+      "displayName": "HIP (AMD)",
+      "cacheVariables": {
+        "PET_BACKEND": "hip",
+        "CMAKE_CXX_COMPILER": "hipcc"
+      }
+    },
+    {
+      "name": "fp64",
+      "inherits": "serial",
+      "displayName": "Serial, all-double (a correctness instrument, not a speed mode)",
+      "cacheVariables": { "PET_PRECISION": "fp64" }
+    },
+    {
+      "name": "debug",
+      "inherits": "serial",
+      "displayName": "Serial, debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "serial", "configurePreset": "serial" },
+    { "name": "openmp", "configurePreset": "openmp" },
+    { "name": "cuda", "configurePreset": "cuda" },
+    { "name": "hip", "configurePreset": "hip" },
+    { "name": "fp64", "configurePreset": "fp64" },
+    { "name": "debug", "configurePreset": "debug" }
+  ],
+  "testPresets": [
+    { "name": "serial", "configurePreset": "serial", "output": { "outputOnFailure": true } },
+    { "name": "openmp", "configurePreset": "openmp", "output": { "outputOnFailure": true } },
+    { "name": "cuda", "configurePreset": "cuda", "output": { "outputOnFailure": true } },
+    { "name": "fp64", "configurePreset": "fp64", "output": { "outputOnFailure": true } }
+  ]
+}

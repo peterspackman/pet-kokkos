@@ -1,0 +1,183 @@
+{
+  "model": "pet-mad-xs",
+  "case": "crystal",
+  "description": "Golden reference for metatrain PET model 'pet-mad-xs', case 'crystal'. Energy in eV, positions in Angstrom, forces in eV/Angstrom. Total energy INCLUDES composition energies and the output scaler (energy_scale).",
+  "evaluation_path": "metatrain.utils.io.load_model(ckpt).export() -> metatomic AtomisticModel; metatomic ASE MetatomicCalculator.compute_energy(atoms, compute_forces_and_stresses=True, per_atom=True)",
+  "units": {
+    "energy": "eV",
+    "length": "Angstrom",
+    "forces": "eV/Angstrom"
+  },
+  "atomic_numbers": [
+    6,
+    6,
+    6,
+    6,
+    6,
+    6,
+    6,
+    6
+  ],
+  "positions": [
+    [
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      1.7835,
+      1.7835,
+      0.0
+    ],
+    [
+      1.7835,
+      0.0,
+      1.7835
+    ],
+    [
+      0.0,
+      1.7835,
+      1.7835
+    ],
+    [
+      0.89175,
+      0.89175,
+      0.89175
+    ],
+    [
+      2.67525,
+      2.67525,
+      0.89175
+    ],
+    [
+      2.67525,
+      0.89175,
+      2.67525
+    ],
+    [
+      0.89175,
+      2.67525,
+      2.67525
+    ]
+  ],
+  "cell": [
+    [
+      3.567,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      3.567,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      3.567
+    ]
+  ],
+  "pbc": [
+    true,
+    true,
+    true
+  ],
+  "periodic": true,
+  "n_atoms": 8,
+  "total_energy": -77.04180908203125,
+  "per_atom_energies": [
+    -9.630570411682129,
+    -9.630569458007812,
+    -9.630569458007812,
+    -9.630569458007812,
+    -9.629880905151367,
+    -9.629880905151367,
+    -9.629881858825684,
+    -9.629881858825684
+  ],
+  "forces": [
+    [
+      -0.00149544607847929,
+      0.00873163528740406,
+      0.015845023095607758
+    ],
+    [
+      -0.0014965152367949486,
+      0.008727462962269783,
+      0.01584377884864807
+    ],
+    [
+      -0.0014967415481805801,
+      0.008730847388505936,
+      0.015841424465179443
+    ],
+    [
+      -0.0014953706413507462,
+      0.008727030828595161,
+      0.015842914581298828
+    ],
+    [
+      0.0015012919902801514,
+      -0.008726252242922783,
+      -0.015840329229831696
+    ],
+    [
+      0.001492716372013092,
+      -0.008732755668461323,
+      -0.01583922654390335
+    ],
+    [
+      0.001492176204919815,
+      -0.008724948391318321,
+      -0.01584697514772415
+    ],
+    [
+      0.0014980509877204895,
+      -0.008732836693525314,
+      -0.015846703201532364
+    ]
+  ],
+  "stress": [
+    [
+      0.010852594405757268,
+      0.0019309579639887684,
+      -0.001421100289273812
+    ],
+    [
+      0.0020952194113147433,
+      0.013610883644075408,
+      0.0022684099616387655
+    ],
+    [
+      -0.0016979335094138544,
+      0.0021844349253573015,
+      0.011419738142643918
+    ]
+  ],
+  "virial": null,
+  "volume": 45.38468526300001,
+  "result_keys": [
+    "energy",
+    "energies",
+    "forces",
+    "stress"
+  ],
+  "quantities_present": [
+    "total_energy",
+    "atomic_numbers",
+    "positions",
+    "cell",
+    "pbc",
+    "per_atom_energies",
+    "forces"
+  ],
+  "quantities_missing": [],
+  "model_metadata": {
+    "energy_scale": 2.4699176680573274,
+    "cutoff": 7.5,
+    "cutoff_function": "Bump",
+    "featurizer_type": "feedforward",
+    "converted_model_json": "models/pet-mad-xs.json"
+  },
+  "notes": "total_energy = energy_scale * sum_i(E_backbone_i) + sum_i(composition_energy[Z_i]). forces = energy_scale * F_backbone (composition energies are constant per type and do not contribute to forces). See the converted model JSON for energy_scale and composition_energies."
+}
