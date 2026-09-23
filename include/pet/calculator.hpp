@@ -85,6 +85,12 @@ struct Options {
   // -> 0.6 s on a 16 GiB card).
   Recompute recompute = Recompute::Auto;
 
+  // Replay a repeated evaluation -- same shapes, same buffers, as in a stepping
+  // loop -- as one CUDA graph launch instead of ~160 separate ones. Bit-identical
+  // to running it eagerly; the first evaluation of a shape runs eagerly and the
+  // second records. CUDA only.
+  bool graphs = true;
+
   // Hard cap on atoms per batch, ahead of the memory estimate. 0 = derive it.
   int max_batch_atoms = 0;
 };
@@ -125,14 +131,15 @@ void resolve_model(const std::string& spec, std::string& json_out, std::string& 
 // expensive part) and evaluates structures against it. Reuse one Calculator
 // across many calls: it carries the persistent scratch pools that make a
 // stepping loop free of per-round device allocation.
-// Atom count above which a single structure is evaluated on the device path
-// rather than the host one. Below it the device NEF build's fixed cost dominates
-// and the host path wins; above it the host path's O(N^2) search (vesin absent)
-// and its per-call host->device staging dominate instead. Measured crossover is
-// well under this on a 4080 SUPER; the value is set where the device path is
-// clearly ahead rather than at the break-even point, so that small cases keep
-// the path the goldens pin.
-constexpr int kDeviceSingleMinAtoms = 256;
+// Estimated raw (pre-adaptive-cutoff) edge count above which a single structure
+// is evaluated on the device neighbour path rather than the host one. The host
+// path's cost is its single-threaded work over the raw list -- the adaptive
+// cutoff, the NEF packing -- so this is the quantity that decides, not the atom
+// count: a 216-atom diamond cell at an 8 A cutoff has ~80k raw edges and took
+// 18.5 ms on the host path against ~6 ms on the device, while a 12-atom molecule
+// (132) is faster on the host. Measured crossover on a 4080 SUPER lies between
+// a 64-atom (24k: host 6.6 ms, device 7.3 ms) and that 216-atom cell.
+constexpr double kDeviceSingleMinRawEdges = 5e4;
 
 class Calculator {
  public:

@@ -16,6 +16,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -115,6 +116,17 @@ void find_named_model(const std::string& name, std::string& json_out, std::strin
   throw std::runtime_error(msg);
 }
 
+// Edges within the cutoff before the adaptive cutoff prunes them: every pair for
+// a molecule, the cutoff sphere at the cell's mean density for anything periodic.
+double raw_edges_estimate(const System& s, double rc) {
+  const double n = s.n_atoms;
+  if (!(s.pbc[0] || s.pbc[1] || s.pbc[2])) return n * (n - 1);
+  const auto& c = s.cell;
+  const double vol = std::fabs(c[0] * (c[4] * c[8] - c[5] * c[7]) - c[1] * (c[3] * c[8] - c[5] * c[6]) +
+                               c[2] * (c[3] * c[7] - c[4] * c[6]));
+  return vol > 0 ? n * n / vol * (4.0 / 3.0) * M_PI * rc * rc * rc : n * (n - 1);
+}
+
 }  // namespace
 
 std::vector<std::string> model_search_dirs() {
@@ -190,6 +202,7 @@ struct Calculator::Impl {
     if (o.allow_tf32) set_tf32(true);
     std::size_t free_b = 0, total_b = 0;
     device_memory(o.memory_budget_bytes, free_b, total_b);
+    model.set_graphs(o.graphs);
     model.set_memory_policy(std::size_t(double(total_b) * kMemCardFraction * kMemHeadroom), o.recompute);
     // Likewise process-global: build_edge_data has too many call sites to thread
     // a per-Calculator choice through, and the two searches are meant to agree.
@@ -254,7 +267,7 @@ Results Calculator::compute(const System& system, bool compute_forces) const {
   // Small structures stay on the host path deliberately: below the threshold the
   // device build's fixed cost dominates, and this is the path the goldens pin to
   // 1e-9 (the two differ by ~3e-8 relative, tests/test_device_vs_host.cpp).
-  if (impl_->opts.device_neighbors && system.n_atoms >= kDeviceSingleMinAtoms)
+  if (impl_->opts.device_neighbors && raw_edges_estimate(system, cutoff()) >= kDeviceSingleMinRawEdges)
     return compute_batch(std::vector<System>{system}, compute_forces);
 
   // Host neighbour-list path: what the goldens validate, it returns the virial

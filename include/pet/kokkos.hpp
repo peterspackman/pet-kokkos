@@ -134,6 +134,7 @@ class Workspace {
       if (grow < 0) tmp_.emplace_back(), busy_.push_back(false);
       tmp_[fit] = View1D();  // free before growing, so the old and new never coexist
       tmp_[fit] = View1D("ws:tmp", need);
+      ++generation_;
     }
     busy_[fit] = true;
     held_.push_back(fit);
@@ -184,6 +185,10 @@ class Workspace {
     static const bool p = [] { const char* e = std::getenv("PET_WS_POISON"); return e && e[0] == '1'; }();
     return p;
   }
+
+  // Bumped whenever the pool (re)allocates anything, i.e. whenever a pointer it
+  // has handed out may have changed. A recorded CUDA graph keys on it.
+  std::size_t generation() const { return generation_; }
 
   // Total device memory held by the pool. This is what a PET evaluation actually
   // costs, and it is the only honest basis for choosing a batch width: the
@@ -248,7 +253,7 @@ class Workspace {
   V get2(Map& m, const std::string& k, int r, int c) {
     V& slot = m[k];
     if (slot.extent(0) < (size_t) r || slot.extent(1) != (size_t) c)
-      slot = V(k, r, c);  // (re)allocate capacity; fresh allocation is zero-initialized
+      slot = V(k, r, c), ++generation_;  // (re)allocate capacity; zero-initialized
     V view(slot.data(), r, c);  // contiguous prefix (columns match -> LayoutRight)
     fill(view);
     return view;
@@ -259,7 +264,7 @@ class Workspace {
   V get2_any(Map& m, const std::string& k, int r, int c) {
     Base& slot = m[k];
     const std::size_t need = (std::size_t) r * (std::size_t) c;
-    if (slot.extent(0) < need) slot = Base(k, need);  // fresh allocations zero-init
+    if (slot.extent(0) < need) slot = Base(k, need), ++generation_;  // fresh allocations zero-init
     V view(slot.data(), r, c);
     fill(view);
     return view;
@@ -267,7 +272,7 @@ class Workspace {
   template <class V, class T, class Map>
   V get1(Map& m, const std::string& k, int n) {
     V& slot = m[k];
-    if (slot.extent(0) < (size_t) n) slot = V(k, n);
+    if (slot.extent(0) < (size_t) n) slot = V(k, n), ++generation_;
     V view(slot.data(), n);
     fill(view);
     return view;
@@ -281,6 +286,7 @@ class Workspace {
       if (poison()) Kokkos::deep_copy(ExecSpace(), v, std::numeric_limits<T>::quiet_NaN());
   }
   bool zero_ = true;  // zeroing policy for reused buffers (see set_zero)
+  std::size_t generation_ = 0;
   std::unordered_map<std::string, View2D> n2_;
   std::unordered_map<std::string, View1D> n1_;
   std::unordered_map<std::string, RView2D> r2_;

@@ -1576,15 +1576,8 @@ BatchResult PetModel::energy_forces_batch(const DeviceEdgeData& dev, bool comput
 // Kept as a separate method so the tightly-optimized feedforward path is
 // untouched; the geometry-gradient scatter tail mirrors compute().
 // ============================================================================
-EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<double>* host_forces,
-                                        RView2D* dev_forces, RView1D* dev_per_atom,
-                                        RView2D* dev_virial) {
+DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   Workspace::Scope scope(ws_);  // every Workspace::tmp() is inside some Scope
-  last_n_atoms_ = dev.n_atoms;
-  last_max_neighbors_ = dev.max_neighbors;
-  peak_max_neighbors_ = std::max(peak_max_neighbors_, dev.max_neighbors);
-  peak_edge_slots_ = std::max(peak_edge_slots_,
-                              (long) dev.n_atoms * std::max(1, dev.max_neighbors));
   const int N = dev.n_atoms;
   const int M = dev.max_neighbors;
   const int S = M + 1;
@@ -1597,7 +1590,6 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
   // Charge / spin conditioning, computed once and reused by every GNN layer.
   // Empty (and free) for a model without it.
   View2D cond = conditioning(dev, dev.n_atoms, dev.n_struct);
-  const bool grad = (host_forces != nullptr || dev_forces != nullptr);
 
   // Forward activations are fully overwritten; skip per-reuse zeroing.
   ws_.set_zero(false);
@@ -1746,21 +1738,7 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
           per_atom(n) = scale * per_atom_net(n) + comp(species(n));
         });
   }
-  if (dev_per_atom) *dev_per_atom = per_atom;
-
-  EnergyResult res;
-  if (!dev_per_atom) {
-    res.per_atom.resize(N);
-    auto h_pa = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, per_atom);
-    Kokkos::deep_copy(h_pa, per_atom);
-    double total = 0.0;
-    for (int i = 0; i < N; ++i) {
-      res.per_atom[i] = h_pa(i);
-      total += h_pa(i);
-    }
-    res.total = total;
-  }
-  if (!grad) return res;
+  if (!grad) return {per_atom, {}, {}};
 
   // ==========================================================================
   // backward: adjoint of sum(per_atom_net) wrt edge vectors (energy_scale is
@@ -1937,38 +1915,7 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
   fold_edge_gradients(ws_, "re", edge_grad, d_edge_vec, d_mask, d_reverse, d_forces, dvir,
                       sid, N, M, NS, energy_scale_);
 
-  if (dev_virial) {
-    RView2D bvir = ws_.r2("re_batch_virial", NS, 6);  // pooled; see batch_virial
-    Kokkos::parallel_for(
-        "re_virial_voigt", RangePolicy(0, NS), KOKKOS_LAMBDA(int b) {
-          bvir(b, 0) = dvir(b, 0);
-          bvir(b, 1) = dvir(b, 4);
-          bvir(b, 2) = dvir(b, 8);
-          bvir(b, 3) = 0.5 * (dvir(b, 1) + dvir(b, 3));
-          bvir(b, 4) = 0.5 * (dvir(b, 2) + dvir(b, 6));
-          bvir(b, 5) = 0.5 * (dvir(b, 5) + dvir(b, 7));
-        });
-    *dev_virial = bvir;
-  } else {
-    auto h_vir = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dvir);
-    Kokkos::deep_copy(h_vir, dvir);
-    res.virial[0] = h_vir(0, 0);
-    res.virial[1] = h_vir(0, 4);
-    res.virial[2] = h_vir(0, 8);
-    res.virial[3] = 0.5 * (h_vir(0, 1) + h_vir(0, 3));
-    res.virial[4] = 0.5 * (h_vir(0, 2) + h_vir(0, 6));
-    res.virial[5] = 0.5 * (h_vir(0, 5) + h_vir(0, 7));
-  }
-  if (dev_forces) *dev_forces = d_forces;
-  if (host_forces) {
-    host_forces->resize(static_cast<std::size_t>(N) * 3);
-    auto h_f = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, d_forces);
-    Kokkos::deep_copy(h_f, d_forces);
-    for (int i = 0; i < N; ++i)
-      for (int c = 0; c < 3; ++c) (*host_forces)[3 * i + c] = h_f(i, c);
-  }
-
-  return res;
+  return {per_atom, d_forces, dvir};
 }
 
 // ============================================================================
@@ -2233,17 +2180,8 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& 
   compress_bwd(cpre_adj, sav.cpre, compress_fold(L), edge_in4_adj, input_edge_adj);
 }
 
-EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* host_forces,
-                               RView2D* dev_forces, RView1D* dev_per_atom, RView2D* dev_virial) {
-  if (h_.featurizer_type == FeaturizerType::Residual)
-    return compute_residual(dev, host_forces, dev_forces, dev_per_atom, dev_virial);
+DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   Workspace::Scope scope(ws_);  // every Workspace::tmp() is inside some Scope
-
-  last_n_atoms_ = dev.n_atoms;
-  last_max_neighbors_ = dev.max_neighbors;
-  peak_max_neighbors_ = std::max(peak_max_neighbors_, dev.max_neighbors);
-  peak_edge_slots_ = std::max(peak_edge_slots_,
-                              (long) dev.n_atoms * std::max(1, dev.max_neighbors));
   const int N = dev.n_atoms;
   const int M = dev.max_neighbors;
   const int S = M + 1;
@@ -2251,7 +2189,6 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   const int Dn = h_.d_node;
   const int Dh = h_.d_head;  // readout-head hidden width (not necessarily d_pet)
   const int NM = N * M;
-  const bool grad = (host_forces != nullptr || dev_forces != nullptr);
   const int G = h_.num_gnn_layers;
   const int A = h_.num_attention_layers;
 
@@ -2339,24 +2276,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
           per_atom(n) = scale * per_atom_net(n) + comp(species(n));
         });
   }
-  if (dev_per_atom) *dev_per_atom = per_atom;  // device view for batched segmentation
-  EnergyResult res;
-  // Host per-atom/total are only consumed by the single-structure host callers
-  // (energy / energy_forces). The batched device path sets dev_per_atom, segments
-  // the energy on-device, and discards this EnergyResult -- so skip the D2H copy +
-  // host reduction there, which otherwise forces a device sync on every step.
-  if (!dev_per_atom) {
-    res.per_atom.resize(N);
-    auto h_pa = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, per_atom);
-    Kokkos::deep_copy(h_pa, per_atom);
-    double total = 0.0;
-    for (int i = 0; i < N; ++i) {
-      res.per_atom[i] = h_pa(i);
-      total += h_pa(i);
-    }
-    res.total = total;
-  }
-  if (!grad) return res;
+  if (!grad) return {per_atom, {}, {}};
 
   // ==========================================================================
   // backward pass: adjoint of sum(per_atom_net) wrt edge vectors
@@ -2506,46 +2426,77 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
                       dev.adapt_eff);
   }
 
-  // symmetrize the virial into Voigt order [xx,yy,zz,xy,xz,yz]. When the caller
-  // requested a device virial, fill the per-structure View [NS,6] with one kernel
-  // (no host copy) — this works for any NS>=1 (dvir is populated for NS==1 by the
-  // binned scatter above). Otherwise (host single-structure callers) fill the
-  // scalar res.virial[6].
+  return {per_atom, d_forces, dvir};
+}
+
+// One evaluation: the device pass for this featurizer -- through the graph cache,
+// which replays it as one launch when this exact evaluation has been seen before
+// -- then the results off the device.
+EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* host_forces,
+                               RView2D* dev_forces, RView1D* dev_per_atom, RView2D* dev_virial) {
+  last_n_atoms_ = dev.n_atoms;
+  last_max_neighbors_ = dev.max_neighbors;
+  peak_max_neighbors_ = std::max(peak_max_neighbors_, dev.max_neighbors);
+  peak_edge_slots_ = std::max(peak_edge_slots_, (long) dev.n_atoms * std::max(1, dev.max_neighbors));
+  const bool grad = host_forces || dev_forces;
+  auto pass = [&] {
+    return h_.featurizer_type == FeaturizerType::Residual ? residual_pass(dev, grad) : ff_pass(dev, grad);
+  };
+  const DeviceOut out = graphs_ && !ozaki_active() ? graph_.run(graph_key(dev, grad), pass) : pass();
+  const int N = dev.n_atoms, NS = dev.n_struct;
+
+  EnergyResult res;
+  // The batched device path segments per_atom on the device and never reads
+  // this EnergyResult, so it gets no host copy (which would be a device sync).
+  if (dev_per_atom) *dev_per_atom = out.per_atom;
+  else {
+    auto h_pa = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out.per_atom);
+    res.per_atom.assign(h_pa.data(), h_pa.data() + N);
+    for (double e : res.per_atom) res.total += e;
+  }
+  if (!grad) return res;
+
+  // The symmetric virial in Voigt order [xx, yy, zz, xy, xz, yz]: per structure
+  // on the device for a batched caller, otherwise the one structure's on the host.
+  const RView2D w9 = out.vir9;
   if (dev_virial) {
-    // Pooled (see batch_energy): fully overwritten by the kernel below, so no zero fill.
-    RView2D bvir = ws_.r2("batch_virial", NS, 6);
+    RView2D bvir = ws_.r2("batch_virial", NS, 6);  // pooled; fully overwritten
     Kokkos::parallel_for(
         "virial_voigt", RangePolicy(0, NS), KOKKOS_LAMBDA(int b) {
-          bvir(b, 0) = dvir(b, 0);
-          bvir(b, 1) = dvir(b, 4);
-          bvir(b, 2) = dvir(b, 8);
-          bvir(b, 3) = 0.5 * (dvir(b, 1) + dvir(b, 3));
-          bvir(b, 4) = 0.5 * (dvir(b, 2) + dvir(b, 6));
-          bvir(b, 5) = 0.5 * (dvir(b, 5) + dvir(b, 7));
+          bvir(b, 0) = w9(b, 0), bvir(b, 1) = w9(b, 4), bvir(b, 2) = w9(b, 8);
+          bvir(b, 3) = 0.5 * (w9(b, 1) + w9(b, 3));
+          bvir(b, 4) = 0.5 * (w9(b, 2) + w9(b, 6));
+          bvir(b, 5) = 0.5 * (w9(b, 5) + w9(b, 7));
         });
     *dev_virial = bvir;
   } else {
-    auto h_vir = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dvir);
-    Kokkos::deep_copy(h_vir, dvir);
-    res.virial[0] = h_vir(0, 0);                        // xx
-    res.virial[1] = h_vir(0, 4);                        // yy
-    res.virial[2] = h_vir(0, 8);                        // zz
-    res.virial[3] = 0.5 * (h_vir(0, 1) + h_vir(0, 3));  // xy
-    res.virial[4] = 0.5 * (h_vir(0, 2) + h_vir(0, 6));  // xz
-    res.virial[5] = 0.5 * (h_vir(0, 5) + h_vir(0, 7));  // yz
+    auto w = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), w9);
+    const double v[6] = {w(0, 0), w(0, 4), w(0, 8), 0.5 * (w(0, 1) + w(0, 3)),
+                         0.5 * (w(0, 2) + w(0, 6)), 0.5 * (w(0, 5) + w(0, 7))};
+    std::copy(v, v + 6, res.virial);
   }
-  // device force output: hand back the [N,3] device view directly
-  if (dev_forces) *dev_forces = d_forces;
-  // host force output (single-structure callers): one N*3 copy to host
+  if (dev_forces) *dev_forces = out.forces;
   if (host_forces) {
-    host_forces->resize(static_cast<std::size_t>(N) * 3);
-    auto h_f = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, d_forces);
-    Kokkos::deep_copy(h_f, d_forces);
-    for (int i = 0; i < N; ++i)
-      for (int c = 0; c < 3; ++c) (*host_forces)[3 * i + c] = h_f(i, c);
+    auto h_f = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out.forces);
+    host_forces->assign(h_f.data(), h_f.data() + std::size_t(N) * 3);
   }
-
   return res;
+}
+
+// Everything the recorded device work depends on that is not a model constant:
+// the shapes, where each input lives, and the workspace's allocation generation
+// (a replay must never touch a buffer the pool has since reallocated).
+std::vector<std::uintptr_t> PetModel::graph_key(const DeviceEdgeData& d, bool grad) const {
+  std::vector<std::uintptr_t> k{(std::uintptr_t) grad, (std::uintptr_t) d.n_atoms,
+                                (std::uintptr_t) d.max_neighbors, (std::uintptr_t) d.n_raw,
+                                (std::uintptr_t) d.n_struct, ws_.generation()};
+  auto add = [&k](const auto& v) { k.push_back((std::uintptr_t) v.data()), k.push_back(v.size()); };
+  add(d.species), add(d.neigh_species), add(d.reverse_index), add(d.edge_vec), add(d.dist);
+  add(d.mask), add(d.pair_cutoff), add(d.cutoff_factor), add(d.cf_seq), add(d.raw_center);
+  add(d.raw_neigh), add(d.raw_dist), add(d.raw_vec), add(d.raw_off), add(d.raw_reverse);
+  add(d.adapt_eff), add(d.adapt_r), add(d.adapt_dn), add(d.struct_id), add(d.charge);
+  add(d.spin_multiplicity);
+  return k;
 }
 
 }  // namespace pet

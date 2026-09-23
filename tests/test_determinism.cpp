@@ -211,3 +211,22 @@ TEST_CASE("recomputing activations in the backward changes nothing", "[model][de
     }
   }
 }
+
+TEST_CASE("a replayed CUDA graph gives the eager answer", "[model][determinism]") {
+  // The first evaluation of a shape runs eagerly, the second records a graph and
+  // the rest replay it; all of them must equal an evaluation that never uses one.
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    pet::Options eager;
+    eager.graphs = false;
+    pet::Calculator a(found->first, found->second, eager), b(found->first, found->second);
+    for (const auto& path : golden_paths(model)) {
+      const Golden g = load_golden(path);
+      DYNAMIC_SECTION(model << " / " << g.name) {
+        const pet::Results ref = a.compute(g.system, true);
+        for (int k = 0; k < kRepeats; ++k) require_bit_identical(ref, b.compute(g.system, true), "graph");
+      }
+    }
+  }
+}

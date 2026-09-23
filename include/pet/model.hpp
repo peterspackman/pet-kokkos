@@ -8,6 +8,7 @@
 
 #include "pet/checkpoint.hpp"
 #include "pet/config.hpp"
+#include "pet/graph.hpp"
 #include "pet/kokkos.hpp"
 #include "pet/neighbors.hpp"
 #include "pet/ozaki.hpp"
@@ -143,6 +144,14 @@ struct CompressFold {
   WeightRef wi;  // [D,D] the input_edge block; empty at layer 0, where it is in `tab`
 };
 
+// Every output of one evaluation, on the device: per-atom energy [N], and with
+// forces the forces [N,3] and the per-structure virial [n_struct,9] (row-major
+// 3x3, not yet symmetrised). Empty forces/vir9 for an energy-only evaluation.
+struct DeviceOut {
+  RView1D per_atom;
+  RView2D forces, vir9;
+};
+
 // What one GNN layer of the feedforward featurizer saves for its backward.
 // Workspace keys carry `tag`: the layer index normally, or one shared tag when
 // the backward re-runs each layer's forward (Recompute::Layers), so that only
@@ -261,12 +270,16 @@ class PetModel {
   // member function. It is not part of the intended API.
   View2D conditioning(const DeviceEdgeData& dev, int N, int n_struct);
 
-  // Residual-featurizer forward/backward (PostLN, LayerNorm, SiLU, non-expanded
-  // central token, num_attention_layers>=1). compute() dispatches here when
-  // featurizer_type == Residual. Same signature/contract as compute().
-  EnergyResult compute_residual(const DeviceEdgeData& dev, std::vector<double>* host_forces,
-                                RView2D* dev_forces, RView1D* dev_per_atom = nullptr,
-                                RView2D* dev_virial = nullptr);
+  // The device work of one evaluation, per featurizer: forward, and with `grad`
+  // the analytic backward. No host synchronisation, so compute() can record it
+  // as a CUDA graph. The residual featurizer is PostLN, LayerNorm, SiLU, with a
+  // non-expanded central token.
+  DeviceOut ff_pass(const DeviceEdgeData& dev, bool grad);
+  DeviceOut residual_pass(const DeviceEdgeData& dev, bool grad);
+
+  // Replay repeated evaluations as one CUDA graph launch (see graph.hpp). On by
+  // default; a no-op off CUDA.
+  void set_graphs(bool on) { graphs_ = on; }
 
  private:
   Hypers h_;
@@ -280,6 +293,9 @@ class PetModel {
   mutable Upload upload_;            // host-path staging, reused (upload_edge_data)
   std::size_t mem_budget_ = 0;       // see set_memory_policy
   Recompute recompute_ = Recompute::Auto;
+  bool graphs_ = true;
+  GraphCache<DeviceOut> graph_;
+  std::vector<std::uintptr_t> graph_key(const DeviceEdgeData& dev, bool grad) const;
 
   std::unordered_map<std::string, View2D> mat_;  // matrices / embedding tables
   std::unordered_map<std::string, View1D> vec_;  // biases / norm weights
