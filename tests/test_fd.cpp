@@ -88,12 +88,12 @@ TEST_CASE("analytic forces match -dE/dx by finite difference", "[model][fd]") {
         const int N = g.system.n_atoms;
 
         double max_f = 0.0;
-        for (double f : r0.forces) max_f = std::max(max_f, std::fabs(f));
+        for (double f : r0.forces) max_f = worst(max_f, std::fabs(f));
 
         double best = 1e300;
         double best_h = 0.0;
         for (double h : kSteps) {
-          double worst = 0.0;
+          double err_h = 0.0;  // worst error at this step
           for (int i = 0; i < N; ++i)
             for (int c = 0; c < 3; ++c) {
               pet::System sp = g.system, sm = g.system;
@@ -103,10 +103,10 @@ TEST_CASE("analytic forces match -dE/dx by finite difference", "[model][fd]") {
               const double em = calc.compute(sm, false).energy[0];
               const double f_num = -(ep - em) / (2 * h);
               const double f_ana = r0.forces[static_cast<std::size_t>(i) * 3 + c];
-              worst = std::max(worst, std::fabs(f_num - f_ana));
+              err_h = worst(err_h, std::fabs(f_num - f_ana));
             }
-          if (worst < best) {
-            best = worst;
+          if (err_h < best) {
+            best = err_h;
             best_h = h;
           }
           // The sweep exists to find the step where truncation and round-off
@@ -140,13 +140,13 @@ TEST_CASE("analytic virial matches dE/dstrain by finite difference", "[model][fd
         REQUIRE(r0.virial.size() == 6);
 
         double max_w = 0.0;
-        for (double w : r0.virial) max_w = std::max(max_w, std::fabs(w));
+        for (double w : r0.virial) max_w = worst(max_w, std::fabs(w));
 
         double best = 1e300;
         double best_h = 0.0;
         int worst_v = -1;
         for (double h : kSteps) {
-          double worst = 0.0;
+          double err_h = 0.0;  // worst error at this step
           int wv = -1;
           for (int v = 0; v < 6; ++v) {
             const double ep = calc.compute(strained(g.system, v, h), false).energy[0];
@@ -154,13 +154,13 @@ TEST_CASE("analytic virial matches dE/dstrain by finite difference", "[model][fd
             const double w_num = (ep - em) / (2 * h);
             const double w_ana = r0.virial[v] * voigt_multiplicity(v);
             const double err = std::fabs(w_num - w_ana);
-            if (err > worst) {
-              worst = err;
+            if (!(err <= err_h)) {  // so that a NaN counts as the worst
+              err_h = err;
               wv = v;
             }
           }
-          if (worst < best) {
-            best = worst;
+          if (err_h < best) {
+            best = err_h;
             best_h = h;
             worst_v = wv;
           }

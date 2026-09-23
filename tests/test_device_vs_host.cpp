@@ -42,8 +42,8 @@ struct Deviation {
 Deviation deviation(const std::vector<double>& a, const std::vector<double>& b) {
   Deviation d;
   for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
-    d.abs = std::max(d.abs, std::fabs(a[i] - b[i]));
-    d.scale = std::max(d.scale, std::fabs(b[i]));
+    d.abs = worst(d.abs, std::fabs(a[i] - b[i]));
+    d.scale = worst(d.scale, std::fabs(b[i]));
   }
   return d;
 }

@@ -26,6 +26,12 @@
 
 namespace pet_test {
 
+// The larger of a running worst case and a new deviation, where NaN wins. Every
+// tolerance check accumulates a maximum, and std::max(m, NaN) returns m -- so a
+// result that had gone entirely NaN passed every one of them. (Found by poisoning
+// the workspace: forces were all NaN and the goldens stayed green.)
+inline double worst(double m, double x) { return (std::isnan(x) || x > m) ? x : m; }
+
 // Directory holding the golden reference structures, baked in at configure time.
 inline const char* golden_dir() { return PET_TEST_GOLDEN_DIR; }
 

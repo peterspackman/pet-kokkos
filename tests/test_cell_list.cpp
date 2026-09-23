@@ -59,10 +59,10 @@ struct SearchGuard {
   void use(pet::DeviceSearch s) { pet::device_search() = s; }
 };
 
-double worst(const std::vector<double>& a, const std::vector<double>& b) {
+double max_abs_diff(const std::vector<double>& a, const std::vector<double>& b) {
   double m = 0.0;
   for (std::size_t i = 0; i < a.size() && i < b.size(); ++i)
-    m = std::max(m, std::fabs(a[i] - b[i]));
+    m = worst(m, std::fabs(a[i] - b[i]));
   return m;
 }
 
@@ -118,11 +118,11 @@ TEST_CASE("the device cell list agrees with the brute-force search", "[model][ce
       REQUIRE_FALSE(brute.forces.empty());
 
       double escale = 0.0, fscale = 0.0;
-      for (double e : brute.energy) escale = std::max(escale, std::fabs(e));
-      for (double f : brute.forces) fscale = std::max(fscale, std::fabs(f));
-      const double de = worst(brute.energy, cells.energy);
-      const double df = worst(brute.forces, cells.forces);
-      const double dw = worst(brute.virial, cells.virial);
+      for (double e : brute.energy) escale = worst(escale, std::fabs(e));
+      for (double f : brute.forces) fscale = worst(fscale, std::fabs(f));
+      const double de = max_abs_diff(brute.energy, cells.energy);
+      const double df = max_abs_diff(brute.forces, cells.forces);
+      const double dw = max_abs_diff(brute.virial, cells.virial);
       INFO("dE = " << de << " (scale " << escale << "), dF = " << df << " (scale " << fscale
                    << "), dW = " << dw);
       // A missing or duplicated edge moves the energy far more than this. The

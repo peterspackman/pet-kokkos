@@ -116,12 +116,12 @@ TEST_CASE("a batch gives each structure the same answer as evaluating it alone",
 
         const double de = std::abs(batched.energy[b] - alone.energy[0]);
         INFO("|dE| = " << de << " eV on E = " << alone.energy[0]);
-        CHECK(de <= 1e-5 * std::max(1.0, std::abs(alone.energy[0])));
+        CHECK(de <= 1e-5 * worst(1.0, std::abs(alone.energy[0])));
 
         double max_f = 0.0, max_df = 0.0;
         for (std::size_t i = 0; i < alone.forces.size(); ++i) {
-          max_f = std::max(max_f, std::abs(alone.forces[i]));
-          max_df = std::max(max_df, std::abs(batched.forces[foff + i] - alone.forces[i]));
+          max_f = worst(max_f, std::abs(alone.forces[i]));
+          max_df = worst(max_df, std::abs(batched.forces[foff + i] - alone.forces[i]));
         }
         INFO("max|dF| = " << max_df << " eV/A on max|F| = " << max_f << " eV/A");
         CHECK(max_df <= 1e-5 * std::max(max_f, 1.0));

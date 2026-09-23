@@ -346,7 +346,8 @@ class PetModel {
   // The dispatch has to happen before the weight lookup, not after: RMSNorm
   // checkpoints carry no `.bias` at all, so asking for one would throw.
   void norm(View2D out, View2D in, const std::string& key) const;
-  void norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key) const;
+  // acc = false overwrites in_adj instead of accumulating into it.
+  void norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key, bool acc = true) const;
 
   // out = w_out(activation(w_in(in))). `pre` receives w_in(in) and is what the
   // backward reads: [R, 2*dff] for SwiGLU, whose w_in emits an interleaved
@@ -356,7 +357,7 @@ class PetModel {
   void feedforward(const std::string& key, View2D out, View2D in, const std::string& wkey,
                    View2D pre, bool save, Net beta = 0);
   void feedforward_bwd(const std::string& key, View2D in_adj, View2D out_adj,
-                       const std::string& wkey, View2D pre);
+                       const std::string& wkey, View2D pre, Net beta = 1);
   // Width of `pre` for a given w_in — 2*dff or dff, per the activation.
   int ffn_pre_width(const std::string& wkey) const;
 

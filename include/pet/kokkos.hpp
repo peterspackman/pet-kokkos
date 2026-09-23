@@ -4,6 +4,9 @@
 #include <Kokkos_Core.hpp>
 
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
+#include <type_traits>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -135,7 +138,7 @@ class Workspace {
     busy_[fit] = true;
     held_.push_back(fit);
     View2D v(tmp_[fit].data(), r, c);
-    if (zero_) Kokkos::deep_copy(ExecSpace(), v, Net(0));
+    fill(v);
     return v;
   }
   // Capacity-keyed 2-D scratch: reuse whenever the buffer holds enough ELEMENTS,
@@ -171,6 +174,16 @@ class Workspace {
   // pass (linear_bwd beta=1 / norm_bwd += / atomic accumulators) keeps it on.
   // Freshly allocated buffers are always zero-initialized by Kokkos regardless.
   void set_zero(bool z) { zero_ = z; }
+
+  // Debugging aid for the policy above: with PET_WS_POISON=1 every floating-point
+  // buffer handed out WITHOUT zeroing is filled with NaN instead of left holding
+  // whatever it last held, so any read-before-write turns the result into NaN
+  // rather than into a silently plausible number. Run the tests with it set after
+  // touching the backward.
+  static bool poison() {
+    static const bool p = [] { const char* e = std::getenv("PET_WS_POISON"); return e && e[0] == '1'; }();
+    return p;
+  }
 
   // Total device memory held by the pool. This is what a PET evaluation actually
   // costs, and it is the only honest basis for choosing a batch width: the
@@ -234,13 +247,11 @@ class Workspace {
   template <class V, class T, class Map>
   V get2(Map& m, const std::string& k, int r, int c) {
     V& slot = m[k];
-    if (slot.extent(0) >= (size_t) r && slot.extent(1) == (size_t) c) {
-      V view(slot.data(), r, c);  // contiguous prefix (columns match -> LayoutRight)
-      if (zero_) Kokkos::deep_copy(ExecSpace(), view, T(0));
-      return view;
-    }
-    slot = V(k, r, c);  // (re)allocate capacity; fresh allocation is zero-initialized
-    return slot;
+    if (slot.extent(0) < (size_t) r || slot.extent(1) != (size_t) c)
+      slot = V(k, r, c);  // (re)allocate capacity; fresh allocation is zero-initialized
+    V view(slot.data(), r, c);  // contiguous prefix (columns match -> LayoutRight)
+    fill(view);
+    return view;
   }
   // Capacity pool backing i2_any/i8_any: a flat buffer per key, viewed as
   // whatever 2-D shape the caller asked for.
@@ -250,19 +261,24 @@ class Workspace {
     const std::size_t need = (std::size_t) r * (std::size_t) c;
     if (slot.extent(0) < need) slot = Base(k, need);  // fresh allocations zero-init
     V view(slot.data(), r, c);
-    if (zero_) Kokkos::deep_copy(ExecSpace(), view, T(0));
+    fill(view);
     return view;
   }
   template <class V, class T, class Map>
   V get1(Map& m, const std::string& k, int n) {
     V& slot = m[k];
-    if (slot.extent(0) >= (size_t) n) {
-      V view(slot.data(), n);
-      if (zero_) Kokkos::deep_copy(ExecSpace(), view, T(0));
-      return view;
-    }
-    slot = V(k, n);
-    return slot;
+    if (slot.extent(0) < (size_t) n) slot = V(k, n);
+    V view(slot.data(), n);
+    fill(view);
+    return view;
+  }
+  // The zeroing policy (and the poison debug mode) applied to a handed-out view.
+  template <class V>
+  void fill(const V& v) {
+    using T = typename V::non_const_value_type;
+    if (zero_) Kokkos::deep_copy(ExecSpace(), v, T(0));
+    else if constexpr (std::is_floating_point_v<T>)
+      if (poison()) Kokkos::deep_copy(ExecSpace(), v, std::numeric_limits<T>::quiet_NaN());
   }
   bool zero_ = true;  // zeroing policy for reused buffers (see set_zero)
   std::unordered_map<std::string, View2D> n2_;

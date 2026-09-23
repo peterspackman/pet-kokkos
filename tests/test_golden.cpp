@@ -67,7 +67,7 @@ TEST_CASE("goldens reproduce the reference energy, forces and stress", "[model][
         REQUIRE(r.forces.size() == g.forces.size());
         double max_df = 0.0;
         for (std::size_t i = 0; i < r.forces.size(); ++i)
-          max_df = std::max(max_df, std::fabs(r.forces[i] - g.forces[i]));
+          max_df = worst(max_df, std::fabs(r.forces[i] - g.forces[i]));
         INFO("max|dF| = " << max_df << " eV/A");
         CHECK(max_df <= kForceTolerance);
 
@@ -78,7 +78,7 @@ TEST_CASE("goldens reproduce the reference energy, forces and stress", "[model][
           REQUIRE(r.per_atom_energy.size() == g.per_atom_energies.size());
           double max_dea = 0.0;
           for (std::size_t i = 0; i < r.per_atom_energy.size(); ++i)
-            max_dea = std::max(max_dea, std::fabs(r.per_atom_energy[i] - g.per_atom_energies[i]));
+            max_dea = worst(max_dea, std::fabs(r.per_atom_energy[i] - g.per_atom_energies[i]));
           INFO("max|dE_atom| = " << max_dea << " eV");
           CHECK(max_dea <= energy_tolerance(g.total_energy));
         }
@@ -101,7 +101,7 @@ TEST_CASE("goldens reproduce the reference energy, forces and stress", "[model][
             const double s_pet = r.virial[t] / g.volume;
             const double s_ref =
                 0.5 * ((*g.stress)[vi[t][0] * 3 + vi[t][1]] + (*g.stress)[vi[t][1] * 3 + vi[t][0]]);
-            max_ds = std::max(max_ds, std::fabs(s_pet - s_ref));
+            max_ds = worst(max_ds, std::fabs(s_pet - s_ref));
           }
           INFO("max|dStress| = " << max_ds << " eV/A^3");
           CHECK(max_ds <= kStressTolerance);

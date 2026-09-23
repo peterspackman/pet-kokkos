@@ -285,16 +285,18 @@ void attention(Workspace& ws, const std::string& key, View2D attn_out, View2D qk
 }
 
 // ----------------------------------------------------------------------------
-// backward helpers (adjoints accumulate with +=; fresh Views are zero-init)
+// backward helpers. Each takes `beta` (or `acc`): 1 accumulates into its output,
+// 0 overwrites it -- so a first writer needs no zeroed buffer, and nothing
+// depends on the workspace's zeroing policy.
 // ----------------------------------------------------------------------------
 
-// in_adj(R,Din) += out_adj(R,Dout) @ W(Dout,Din)
-void linear_bwd(View2D in_adj, View2D out_adj, WeightRef W) {
+// in_adj(R,Din) = beta * in_adj + out_adj(R,Dout) @ W(Dout,Din)
+void linear_bwd(View2D in_adj, View2D out_adj, WeightRef W, Net beta = 1) {
   // The BACKWARD goes through the same path as the forward, which is the point
   // for anything that differentiates the forces again -- a Hessian, a phonon
   // calculation, a nested finite difference. An accurate forward with an fp32
   // backward would leave the second derivative limited by the backward.
-  gemm_ozaki('N', 'N', (Net)1.0, out_adj, W.v, (Net)1.0, in_adj, W.for_orientation(false));
+  gemm_ozaki('N', 'N', (Net)1.0, out_adj, W.v, beta, in_adj, W.for_orientation(false));
 }
 
 // grad *= dsilu(pre)  (in place)
@@ -351,12 +353,12 @@ void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, Vi
           x4_adj(r, 0) += a0, x4_adj(r, 1) += a1, x4_adj(r, 2) += a2, x4_adj(r, 3) += a3;
         });
       });
-  if (f.wi.extent(0) > 0) linear_bwd(ie_adj, g, f.wi);
+  if (f.wi.extent(0) > 0) linear_bwd(ie_adj, g, f.wi);  // accumulates
 }
 
 // in_adj += d(norm)/d(in) . out_adj. With xhat = (in - mu) * inv and gw = out_adj * weight:
 //   in_adj += inv * (gw - [mean(gw) if LayerNorm] - xhat * mean(gw * xhat)).
-void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln) {
+void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln, bool acc = true) {
   const int D = in.extent(1);
   Kokkos::parallel_for(
       "norm_bwd", TeamPol(in.extent(0), 1, NORM_VEC), KOKKOS_LAMBDA(const TeamMem& team) {
@@ -373,19 +375,20 @@ void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln) 
             sg, sgx);
         const Net mg = ln ? sg / D : Net(0), mgx = sgx / D;
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(team, D), [&](int d) {
-          in_adj(r, d) += inv * (out_adj(r, d) * weight(d) - mg - (in(r, d) - mu) * inv * mgx);
+          in_adj(r, d) = (acc ? in_adj(r, d) : Net(0)) +
+                         inv * (out_adj(r, d) * weight(d) - mg - (in(r, d) - mu) * inv * mgx);
         });
       });
 }
 
 // in_adj(R,Dmodel) += backward of SwiGLU FF. tmp holds w_in(in) from forward.
 void feedforward_swiglu_bwd(Workspace& ws, const std::string& key, View2D in_adj, View2D out_adj,
-                            View2D tmp, WeightRef w_in, WeightRef w_out) {
+                            View2D tmp, WeightRef w_in, WeightRef w_out, Net beta) {
   const int R = out_adj.extent(0);
   const int dff = tmp.extent(1) / 2;
   Workspace::Scope scope(ws);
   View2D h_adj = ws.tmp(R, dff);
-  linear_bwd(h_adj, out_adj, w_out);  // h_adj = out_adj @ w_out
+  linear_bwd(h_adj, out_adj, w_out, 0);  // h_adj = out_adj @ w_out
   View2D tmp_adj = ws.tmp(R, 2 * dff);
   {
     Kokkos::parallel_for(
@@ -396,7 +399,7 @@ void feedforward_swiglu_bwd(Workspace& ws, const std::string& key, View2D in_adj
           tmp_adj(r, dff + c) = h_adj(r, c) * v * sg * (Net(1) - sg);
         });
   }
-  linear_bwd(in_adj, tmp_adj, w_in);
+  linear_bwd(in_adj, tmp_adj, w_in, beta);
 }
 
 // Backward of attention. an_adj(N*S,D) += ; cf_seq_adj(N,S) += (atomic, heads-way).
@@ -433,13 +436,13 @@ template <int HD>
 void attention_bwd_impl(Workspace& ws, const std::string& key, const std::string& fwd_key,
                         View2D an_adj, View2D cf_seq_adj, View2D ao_adj, View2D qkv, View2D cf_seq,
                         WeightRef w_in, WeightRef w_out, int N, int S, int num_heads, int head_dim,
-                        double temperature) {
+                        double temperature, Net beta) {
   const int D = num_heads * head_dim;
   const int R = N * S;
   const int H = num_heads;
   Workspace::Scope scope(ws);
   View2D merged_adj = ws.tmp(R, D);
-  linear_bwd(merged_adj, ao_adj, w_out);  // d(merged) = ao_adj @ w_out
+  linear_bwd(merged_adj, ao_adj, w_out, 0);  // d(merged) = ao_adj @ w_out
   View2D qkv_adj = ws.tmp(R, 3 * D);  // each element written by exactly one thread
   // softmax math in Net precision (expf/logf): much faster than fp64 on consumer GPUs.
   View2D stats = ws.tmp(N * H * S, 3);  // per-query (m, 1/l, dot_do_out)
@@ -463,9 +466,13 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, const std::string
           const int moff = hh * head_dim;
           const int si = (n * H + hh) * S + sq;
           const Net m = sml(si, 0), invl = sml(si, 1);
-          // Padding query (invl==0 from the forward): its qkv_adj row and stats
-          // stay zero-initialized, so kernel B reads invl==0 and skips it too.
-          if (invl <= Net(0)) return;
+          // Padding query (invl==0 from the forward): zero dQ and its stats, and
+          // kernel B reads invl==0 and skips it too.
+          if (invl <= Net(0)) {
+            for (int d = 0; d < nd; ++d) qkv_adj(row_q, qoff + d) = Net(0);
+            stats(si, 0) = stats(si, 1) = stats(si, 2) = Net(0);
+            return;
+          }
           Net q[CAP], dout[CAP], dq[CAP];
           Net dot_do_out = Net(0);  // sum dout * out_sq (out_sq = saved merged)
           for (int d = 0; d < nd; ++d) {
@@ -501,10 +508,14 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, const std::string
           const int nd = HD > 0 ? HD : head_dim;
           const int row_k = n * S + sk;
           const Net cf = cf_seq(n, sk);
-          // padding key: no query attends -> dK=dV=0 (zero-init)
-          if (cf <= Net(0)) { cfh(row_k, hh) = Net(0); return; }
-          const Net logcf = fast_log(cf);
           const int qoff = hh * head_dim, koff = D + hh * head_dim, voff = 2 * D + hh * head_dim;
+          // padding key: no query attends -> dK = dV = 0
+          if (cf <= Net(0)) {
+            for (int d = 0; d < nd; ++d) qkv_adj(row_k, koff + d) = qkv_adj(row_k, voff + d) = Net(0);
+            cfh(row_k, hh) = Net(0);
+            return;
+          }
+          const Net logcf = fast_log(cf);
           const int moff = hh * head_dim;
           // k/v are loop-invariant over the queries: hoist them out of the sq loop.
           Net dk[CAP], dv[CAP], k[CAP], v[CAP];
@@ -551,13 +562,14 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, const std::string
           cf_seq_adj(n, sk) += cf_total / cf;
         });
   }
-  linear_bwd(an_adj, qkv_adj, w_in);  // d(attn_in) = qkv_adj @ w_in
+  linear_bwd(an_adj, qkv_adj, w_in, beta);  // d(attn_in) = qkv_adj @ w_in
 }
 void attention_bwd(Workspace& ws, const std::string& key, const std::string& fwd_key, View2D an_adj,
                    View2D cf_seq_adj, View2D ao_adj, View2D qkv, View2D cf_seq, WeightRef w_in,
-                   WeightRef w_out, int N, int S, int num_heads, int head_dim, double temperature) {
+                   WeightRef w_out, int N, int S, int num_heads, int head_dim, double temperature,
+                   Net beta = 1) {
   PET_ATTN_DISPATCH(attention_bwd_impl, ws, key, fwd_key, an_adj, cf_seq_adj, ao_adj, qkv, cf_seq,
-                    w_in, w_out, N, S, num_heads, head_dim, temperature);
+                    w_in, w_out, N, S, num_heads, head_dim, temperature, beta);
 }
 
 // Bump cutoff derivative d f / d distance. d f / d rc = -(this). Transcendentals
@@ -639,7 +651,7 @@ void fold_edge_gradients(Workspace& ws, const std::string& key, RView2D edge_gra
           if (r >= 0)
             for (int c = 0; c < 3; ++c) f[c] -= edge_grad(r, c);
         }
-        for (int c = 0; c < 3; ++c) d_forces(i, c) += scale * f[c];
+        for (int c = 0; c < 3; ++c) d_forces(i, c) = scale * f[c];  // the first writer
         for (int t = 0; t < 9; ++t) vir_atom(i, t) = scale * w[t];
       });
   // Atoms of a structure are contiguous in the batch, so a count plus a prefix sum
@@ -670,7 +682,7 @@ void fold_edge_gradients(Workspace& ws, const std::string& key, RView2D edge_gra
         const int b = _i / 9, t = _i % 9;
         double s = 0.0;
         for (int i = soff(b); i < soff(b + 1); ++i) s += vir_atom(i, t);
-        dvir(b, t) += s;
+        dvir(b, t) = s;  // the first writer
       });
 }
 
@@ -759,6 +771,7 @@ void adaptive_backward(Workspace& ws, RView2D d_forces, RView2D dvir, RView1D ad
     // it was provided (the same quantity the backward would recompute in K1).
     const bool have_eff = (eff_saved.extent(0) == (size_t) N && eff_saved.extent(1) == (size_t) P);
     RView2D eff = have_eff ? eff_saved : ws.r2("ad:eff", N, P);
+    if (!have_eff) Kokkos::deep_copy(ExecSpace(), eff, 0.0);  // atomic accumulator
     RView2D diff = ws.r2("ad:diff", N, P), grad = ws.r2("ad:grad", N, P),
             gsign = ws.r2("ad:gsign", N, P), w = ws.r2("ad:w", N, P), Cq = ws.r2("ad:Cq", N, P),
             diffadj = ws.r2("ad:diffadj", N, P);
@@ -860,6 +873,7 @@ void adaptive_backward(Workspace& ws, RView2D d_forces, RView2D dvir, RView1D ad
                            raw_reverse.extent(0) == (size_t) E);
   if (!can_gather) {
     RView2D dvir_bins = ws.r2("ad:virbins", VBINS, 9);
+    Kokkos::deep_copy(ExecSpace(), dvir_bins, 0.0);  // atomic accumulator
     Kokkos::parallel_for(
         "ad_scatter", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
           const int c = raw_center(e), j = raw_neigh(e);
@@ -1029,10 +1043,10 @@ void PetModel::norm(View2D out, View2D in, const std::string& key) const {
   norm_fwd(out, in, vec(key + ".weight"), ln ? vec(key + ".bias") : View1D());
 }
 
-void PetModel::norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key) const {
+void PetModel::norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key, bool acc) const {
   // The bias is a pure shift, so it does not enter the input adjoint.
   pet::norm_bwd(in_adj, out_adj, in, vec(key + ".weight"),
-                h_.normalization == Normalization::LayerNorm);
+                h_.normalization == Normalization::LayerNorm, acc);
 }
 
 int PetModel::ffn_pre_width(const std::string& wkey) const {
@@ -1060,18 +1074,18 @@ void PetModel::feedforward(const std::string& key, View2D out, View2D in,
 }
 
 void PetModel::feedforward_bwd(const std::string& key, View2D in_adj, View2D out_adj,
-                               const std::string& wkey, View2D pre) {
+                               const std::string& wkey, View2D pre, Net beta) {
   WeightRef w_in = mat(wkey + ".w_in.weight"), w_out = mat(wkey + ".w_out.weight");
   const int R = out_adj.extent(0);
   if (h_.activation == Activation::SwiGLU) {
-    feedforward_swiglu_bwd(ws_, key, in_adj, out_adj, pre, w_in, w_out);
+    feedforward_swiglu_bwd(ws_, key, in_adj, out_adj, pre, w_in, w_out, beta);
   } else {
     const int dff = pre.extent(1);
     Workspace::Scope scope(ws_);
     View2D h_adj = ws_.tmp(R, dff);
-    linear_bwd(h_adj, out_adj, w_out);
+    linear_bwd(h_adj, out_adj, w_out, 0);
     silu_bwd(h_adj, pre);
-    linear_bwd(in_adj, h_adj, w_in);
+    linear_bwd(in_adj, h_adj, w_in, beta);
   }
 }
 
@@ -2212,12 +2226,12 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& 
   {
     Workspace::Scope comb_scope(ws_);
     View2D cph_adj = ws_.tmp(NM, 2 * D);
-    linear_bwd(cph_adj, input_edge_adj, mat("combination_mlps." + ls + ".2.weight"));
+    linear_bwd(cph_adj, input_edge_adj, mat("combination_mlps." + ls + ".2.weight"), 0);
     silu_bwd(cph_adj, sav.cph);
     View2D cnrm_adj = ws_.tmp(NM, 2 * D);
-    linear_bwd(cnrm_adj, cph_adj, mat("combination_mlps." + ls + ".0.weight"));
+    linear_bwd(cnrm_adj, cph_adj, mat("combination_mlps." + ls + ".0.weight"), 0);
     View2D concat_adj = ws_.tmp(NM, 2 * D);
-    pet::norm_bwd(concat_adj, cnrm_adj, sav.concat, vec("combination_norms." + ls + ".weight"), true);
+    pet::norm_bwd(concat_adj, cnrm_adj, sav.concat, vec("combination_norms." + ls + ".weight"), true, false);
     // out_edge: its direct term, its own concat slot, and the reversed slot of the
     // edge pointing back at it. The reverse map is an involution, so that edge is
     // reverse(k): a gather in a fixed order, never a (float-atomic) scatter.
@@ -2239,10 +2253,11 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& 
       View2D enrm_adj = ws_.tmp(NM, D);
       feedforward_bwd("emlpb_" + as, enrm_adj, edge_adj, tl + ".mlp",
                       kept_wide ? sav.tmp_edge[a]
-                                : rebuild(sav.eps[a], tl + ".norm_mlp", tl + ".mlp.w_in"));
+                                : rebuild(sav.eps[a], tl + ".norm_mlp", tl + ".mlp.w_in"),
+                      0);
       norm_bwd(edge_adj, enrm_adj, sav.eps[a], tl + ".norm_mlp");
       View2D ncn_adj = ws_.tmp(N, Dn);
-      feedforward_bwd("cmlpb_" + as, ncn_adj, node_adj, tl + ".center_mlp", sav.tmp_center[a]);
+      feedforward_bwd("cmlpb_" + as, ncn_adj, node_adj, tl + ".center_mlp", sav.tmp_center[a], 0);
       norm_bwd(node_adj, ncn_adj, sav.node_new[a], tl + ".norm_center_features");
     }
     Workspace::Scope block_scope(ws_);
@@ -2255,7 +2270,7 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& 
     {
       Workspace::Scope attn_scope(ws_);
       View2D out_node128_adj = ws_.tmp(N, D);
-      linear_bwd(out_node128_adj, node_adj, mat(tl + ".center_expansion.weight"));
+      linear_bwd(out_node128_adj, node_adj, mat(tl + ".center_expansion.weight"), 0);
       View2D ao_adj = ws_.tmp(N * S, D);
       Kokkos::parallel_for(
           "bw_ao", RangePolicy(0, (N * S) * D), KOKKOS_LAMBDA(int _i) {
@@ -2270,8 +2285,8 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& 
                                         tl + ".attention.input_linear"),
                     dev.cf_seq, mat(tl + ".attention.input_linear.weight"),
                     mat(tl + ".attention.output_linear.weight"), N, S, h_.num_heads, h_.head_dim,
-                    h_.attention_temperature);
-      norm_bwd(tokens_adj, attn_in_adj, sav.tokens[a], tl + ".norm_attention");
+                    h_.attention_temperature, 0);
+      norm_bwd(tokens_adj, attn_in_adj, sav.tokens[a], tl + ".norm_attention", false);
     }
 
     // tokens = [input_node ; edge_in]: edge rows add onto edge_in's residual
@@ -2289,7 +2304,7 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& 
   // et = compress.2(silu(compress.0(...))): edge_adj is now et's adjoint, and
   // node_adj that of the node features entering this layer.
   View2D cpre_adj = ws_.tmp(NM, D);
-  linear_bwd(cpre_adj, edge_adj, mat(g + ".compress.2.weight"));
+  linear_bwd(cpre_adj, edge_adj, mat(g + ".compress.2.weight"), 0);
   compress_bwd(cpre_adj, sav.cpre, compress_fold(L), edge_in4_adj, input_edge_adj);
 }
 
@@ -2315,9 +2330,10 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   const int G = h_.num_gnn_layers;
   const int A = h_.num_attention_layers;
 
-  // Forward activations are all fully overwritten (gemm beta=0 / gather / norm /
-  // full-coverage writes), so skip the per-reuse zeroing here; the backward pass
-  // re-enables it for its accumulators (see Workspace::set_zero).
+  // Nothing here relies on the workspace zeroing what it hands out: every buffer's
+  // first writer overwrites it (gemm beta=0, a norm, a full-coverage kernel), and
+  // the few true accumulators are zeroed explicitly where they are taken. That
+  // was ~90 memsets per evaluation, most of them full passes over an edge tensor.
   ws_.set_zero(false);
 
   // ---- device-resident NEF data (already uploaded / built on device) ----
@@ -2420,12 +2436,11 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   // ==========================================================================
   // backward pass: adjoint of sum(per_atom_net) wrt edge vectors
   // ==========================================================================
-  // Adjoints accumulate (linear_bwd beta=1 / norm_bwd += / atomic scatters), so the
-  // backward needs reused buffers zeroed again.
-  ws_.set_zero(true);
-  // shared, cross-layer adjoints (zero-init)
+  // shared, cross-layer accumulators
   View2D edge_in4_adj = ws_.n2("edge_in4_adj", NM, 4);
   View2D cf_seq_adj = ws_.n2("cf_seq_adj", N, S);
+  Kokkos::deep_copy(ExecSpace(), edge_in4_adj, Net(0));
+  Kokkos::deep_copy(ExecSpace(), cf_seq_adj, Net(0));
 
   // ---- readout backward ----
   // per_atom_net_adj = 1 ; node_pred_adj = 1 ; edge_pred_adj = mask*cutoff
@@ -2450,20 +2465,20 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
     // weight past its own row and silu_bwd would walk off the saved activation.
     // (compute_residual's copy of this block already uses Dh.)
     View2D nh1_adj = ws_.n2("nh1_adj", N, Dh);
-    linear_bwd(nh1_adj, node_pred_adj, mat("node_last_layers.energy.0.energy___0.weight"));
+    linear_bwd(nh1_adj, node_pred_adj, mat("node_last_layers.energy.0.energy___0.weight"), 0);
     silu_bwd(nh1_adj, sav_nh1[0]);
     View2D nh0_adj = ws_.n2("nh0_adj", N, Dh);
-    linear_bwd(nh0_adj, nh1_adj, mat("node_heads.energy.0.2.weight"));
+    linear_bwd(nh0_adj, nh1_adj, mat("node_heads.energy.0.2.weight"), 0);
     silu_bwd(nh0_adj, sav_nh0[0]);
-    linear_bwd(node_adj, nh0_adj, mat("node_heads.energy.0.0.weight"));
+    linear_bwd(node_adj, nh0_adj, mat("node_heads.energy.0.0.weight"), 0);
     // edge head backward
     View2D eh1_adj = ws_.n2("eh1_adj", NM, Dh);
-    linear_bwd(eh1_adj, edge_pred_adj, mat("edge_last_layers.energy.0.energy___0.weight"));
+    linear_bwd(eh1_adj, edge_pred_adj, mat("edge_last_layers.energy.0.energy___0.weight"), 0);
     silu_bwd(eh1_adj, sav_eh1[0]);
     View2D eh0_adj = ws_.n2("eh0_adj", NM, Dh);
-    linear_bwd(eh0_adj, eh1_adj, mat("edge_heads.energy.0.2.weight"));
+    linear_bwd(eh0_adj, eh1_adj, mat("edge_heads.energy.0.2.weight"), 0);
     silu_bwd(eh0_adj, sav_eh0[0]);
-    linear_bwd(input_edge_adj, eh0_adj, mat("edge_heads.energy.0.0.weight"));
+    linear_bwd(input_edge_adj, eh0_adj, mat("edge_heads.energy.0.0.weight"), 0);
   }
 
   // ---- layers backward (reverse order) ----
@@ -2472,14 +2487,12 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
     Workspace::Scope layer_scope(ws_);
     if (ckpt) {
       // Re-run this layer's forward from its checkpointed inputs, saving into one
-      // shared set of buffers. Forward buffers are fully overwritten, so no zeroing.
-      ws_.set_zero(false);
+      // shared set of buffers.
       View2D n = ws_.tmp(N, Dn), ie = ws_.tmp(NM, D);
       Kokkos::deep_copy(ExecSpace(), n, inputs[L].first);
       Kokkos::deep_copy(ExecSpace(), ie, inputs[L].second);
       one.tag = "c";
       ff_layer(dev, L, n, ie, cond, &one, false);
-      ws_.set_zero(true);
     }
     ff_layer_bwd(dev, L, ckpt ? one : sav[L], keep_wide, node_adj, input_edge_adj, edge_in4_adj,
                  cf_seq_adj);
@@ -2489,7 +2502,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   // total cutoff_factor adjoint = readout term + attention bias term (cols 1..M)
   // (cf_seq_adj col 0 is the constant central token -> ignored)
   const bool do_adapt = h_.adaptive();
-  RView1D adapted_adj = ws_.r1("adapted_adj", N);  // dE/d(adapted_cutoff[a]) (accumulator, double)
+  RView1D adapted_adj = ws_.r1("adapted_adj", N);  // dE/d(adapted_cutoff[a]) (double)
   RView2D edge_grad = ws_.r2("edge_grad", NM, 3);  // dE/dv per kept edge (double)
   RView1D pc_adj_e = ws_.r1("pc_adj_e", NM);       // per-edge pair-cutoff adjoint (adaptive)
   {
@@ -2532,14 +2545,14 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
               const int r = rev(k);
               if (r >= 0) s += 0.5 * pc_adj_e(r);
             }
-            adapted_adj(a) += s;
+            adapted_adj(a) = s;
           });
     }
   }
 
   // scatter per-edge gradient to atoms (device): F[i]+=g, F[j]-=g, scaled by energy_scale
   // and accumulate the virial W_ab = sum_edges v_a * (scale*dE/dv)_b.
-  RView2D d_forces = ws_.r2("forces", N, 3);  // accumulator (double)
+  RView2D d_forces = ws_.r2("forces", N, 3);  // double; fold_edge_gradients writes it first
   const int NS = dev.n_struct;             // 1 = single structure; >1 = batched
   auto sid = dev.struct_id;                // [N] owning structure (valid when NS>1)
   RView2D dvir = ws_.r2("virial9", NS, 9);  // per-structure virial (scatter + adaptive)
