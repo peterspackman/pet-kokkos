@@ -419,6 +419,8 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
       "pet_maxM", RangePolicy(0, N),
       KOKKOS_LAMBDA(int a, int& m) { m = (count(a) > m) ? count(a) : m; }, Kokkos::Max<int>(M));
   if (M < 1) M = 1;  // guard (matches host build)
+  Kokkos::parallel_reduce(
+      "pet_nkept", RangePolicy(0, N), KOKKOS_LAMBDA(int a, int& c) { c += count(a); }, dev.n_edges);
   // Grow-only M (like GRACE's maxneigh): never shrink the NEF buffers, so steady-
   // state MD reuses fixed memory even as per-step neighbor counts fluctuate. The
   // extra slots are padding (mask=0), so results are unchanged.

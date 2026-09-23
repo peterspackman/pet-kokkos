@@ -3,6 +3,7 @@
 
 #include "pet/gemm.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
@@ -633,21 +634,20 @@ KOKKOS_INLINE_FUNCTION double cutoff_ddist(double d, double rc, double w, bool b
 // The virial accumulates per atom for the same reason, then sums over each
 // structure's contiguous atom range in index order.
 void fold_edge_gradients(Workspace& ws, const std::string& key, RView2D edge_grad,
-                         RView2D d_edge_vec, RView1D mask, IView1D d_reverse,
-                         RView2D d_forces, RView2D dvir, IView1D sid,
-                         int N, int M, int NS, double scale) {
+                         const PackedEdges& pk, RView2D d_forces, RView2D dvir, IView1D sid,
+                         int N, int NS, double scale) {
   RView2D vir_atom = ws.r2(key + ":vir_atom", N, 9);
+  auto off = pk.off, rev = pk.reverse;
+  auto vec = pk.vec;
   Kokkos::parallel_for(
       key + ":gather_force", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
         double f[3] = {0.0, 0.0, 0.0};
         double w[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
-        for (int s = 0; s < M; ++s) {
-          const int k = i * M + s;
-          if (mask(k) <= 0.0) continue;
+        for (int k = off(i); k < off(i + 1); ++k) {
           for (int c = 0; c < 3; ++c) f[c] += edge_grad(k, c);
           for (int a = 0; a < 3; ++a)  // this edge's own virial share v_a * g_b
-            for (int b = 0; b < 3; ++b) w[a * 3 + b] += d_edge_vec(k, a) * edge_grad(k, b);
-          const int r = d_reverse(k);
+            for (int b = 0; b < 3; ++b) w[a * 3 + b] += vec(k, a) * edge_grad(k, b);
+          const int r = rev(k);
           if (r >= 0)
             for (int c = 0; c < 3; ++c) f[c] -= edge_grad(r, c);
         }
@@ -686,11 +686,11 @@ void fold_edge_gradients(Workspace& ws, const std::string& key, RView2D edge_gra
       });
 }
 
-// per_atom_net(n) += node_pred(n) + sum over n's edges of mask*cutoff*edge_pred.
+// per_atom_net(n) += node_pred(n) + sum over n's edges of cutoff*edge_pred.
 // Free-standing because nvcc will not take an extended lambda inside a private
 // member, and PetModel::readout is one.
-void readout_accumulate(View1D per_atom_net, View2D node_pred, View2D edge_pred, RView1D mask,
-                        View1D cutoff, int N, int M, bool zero_first) {
+void readout_accumulate(View1D per_atom_net, View2D node_pred, View2D edge_pred, IView1D off,
+                        View1D cutoff, int N, bool zero_first) {
   Kokkos::parallel_for(
       "readout", RangePolicy(0, N), KOKKOS_LAMBDA(int n) {
         // Accumulated in double, not in the network type. Summing M edge terms in
@@ -698,10 +698,7 @@ void readout_accumulate(View1D per_atom_net, View2D node_pred, View2D edge_pred,
         // two paths disagreed on it (the feedforward one used double, the residual
         // one did not), and this is the more accurate of the two.
         double e = node_pred(n, 0);
-        for (int m = 0; m < M; ++m) {
-          const int k = n * M + m;
-          e += (double) mask(k) * (double) cutoff(k) * (double) edge_pred(k, 0);
-        }
+        for (int k = off(n); k < off(n + 1); ++k) e += (double) cutoff(k) * (double) edge_pred(k, 0);
         per_atom_net(n) = zero_first ? Net(e) : Net(per_atom_net(n) + e);
       });
 }
@@ -1090,13 +1087,13 @@ void PetModel::feedforward_bwd(const std::string& key, View2D in_adj, View2D out
 }
 
 void PetModel::readout(const std::vector<View2D>& node_feat, const std::vector<View2D>& edge_feat,
-                       View1D per_atom_net, RView1D d_mask, View1D d_cutoff, int N, int M,
+                       View1D per_atom_net, const PackedEdges& pk, int N,
                        std::vector<View2D>& sav_nh0, std::vector<View2D>& sav_nh1,
                        std::vector<View2D>& sav_eh0, std::vector<View2D>& sav_eh1,
                        std::vector<View2D>& sav_epred, const std::string& key, bool grad) {
   const int R = static_cast<int>(node_feat.size());
   const int Dh = h_.d_head;
-  const int NM = N * M;
+  const int NM = pk.E;
   for (int i = 0; i < R; ++i) {
     const std::string si = std::to_string(i);
     // node head: Linear(D->Dh) SiLU Linear(Dh->Dh) SiLU -> Linear(Dh->1)
@@ -1130,8 +1127,7 @@ void PetModel::readout(const std::vector<View2D>& node_feat, const std::vector<V
     linear(edge_pred, eh1, mat("edge_last_layers.energy." + si + ".energy___0.weight"),
            vec("edge_last_layers.energy." + si + ".energy___0.bias"));
 
-    readout_accumulate(per_atom_net, node_pred, edge_pred, d_mask, d_cutoff, N, M,
-                       /*zero_first=*/i == 0);
+    readout_accumulate(per_atom_net, node_pred, edge_pred, pk.off, pk.cut, N, /*zero_first=*/i == 0);
   }
 }
 
@@ -1143,6 +1139,57 @@ WeightRef PetModel::mat(const std::string& name) const {
   return WeightRef{it->second, sit == wsplit_.end() ? nullptr : &sit->second,
                    tit == wsplit_t_.end() ? nullptr : &tit->second};
 }
+PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
+  const int N = d.n_atoms, M = d.max_neighbors;
+  PackedEdges p;
+  p.E = d.n_edges;
+  p.off = ws_.i1("pk:off", N + 1);
+  p.center = ws_.i1("pk:center", p.E), p.species = ws_.i1("pk:species", p.E);
+  p.reverse = ws_.i1("pk:reverse", p.E);
+  p.vec = ws_.r2("pk:vec", p.E, 3);
+  p.dist = ws_.r1("pk:dist", p.E), p.pcut = ws_.r1("pk:pcut", p.E);
+  p.cut = ws_.n1("pk:cut", p.E);
+  IView1D pos = ws_.i1("pk:pos", N * M);  // slot -> packed index, -1 for padding
+  auto mask = d.mask;
+  auto kept = KOKKOS_LAMBDA(int n, int end) {  // kept slots of atom n before `end`
+    int c = 0;
+    for (int m = 0; m < end; ++m) c += mask(n * M + m) > 0.0;
+    return c;
+  };
+  auto off = p.off;
+  Kokkos::parallel_scan(
+      "pk_off", RangePolicy(0, N), KOKKOS_LAMBDA(int n, int& upd, bool final) {
+        if (final) off(n) = upd;
+        upd += kept(n, M);
+        if (final && n == N - 1) off(N) = upd;
+      });
+  if (N == 0) Kokkos::deep_copy(ExecSpace(), off, 0);
+  // An edge keeps its slot order: its packed index is its rank among the atom's
+  // kept slots, whatever the builder put between them.
+  auto center = p.center, species = p.species, reverse = p.reverse;
+  auto vec = p.vec;
+  auto dist = p.dist, pcut = p.pcut;
+  auto cut = p.cut;
+  auto nsp = d.neigh_species, rev = d.reverse_index;
+  auto ev = d.edge_vec;
+  auto dd = d.dist, dpc = d.pair_cutoff;
+  auto dcut = d.cutoff_factor;
+  Kokkos::parallel_for(
+      "pk_edges", RangePolicy(0, N * M), KOKKOS_LAMBDA(int k) {
+        const int n = k / M;
+        if (mask(k) <= 0.0) return (void) (pos(k) = -1);
+        const int e = off(n) + kept(n, k % M);
+        pos(k) = e, center(e) = n, species(e) = nsp(k);
+        for (int c = 0; c < 3; ++c) vec(e, c) = ev(k, c);
+        dist(e) = dd(k), pcut(e) = dpc(k), cut(e) = dcut(k);
+      });
+  Kokkos::parallel_for(
+      "pk_reverse", RangePolicy(0, N * M), KOKKOS_LAMBDA(int k) {
+        if (pos(k) >= 0) reverse(pos(k)) = rev(k) >= 0 ? pos(rev(k)) : -1;
+      });
+  return p;
+}
+
 CompressFold PetModel::compress_fold(int L) const {
   const std::string c0 = "gnn_layers." + std::to_string(L) + ".compress.0";
   return {mat(c0 + "@x4").v, vec(c0 + "@b"), mat(c0 + "@tab").v, L ? mat(c0 + "@in") : WeightRef{}};
@@ -1364,6 +1411,7 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse)
   dev.n_atoms = N;
   dev.max_neighbors = M;
   dev.n_raw = E;
+  dev.n_edges = (int) std::count_if(ed.mask.begin(), ed.mask.end(), [](char m) { return m != 0; });
 
   // cf_seq: the attention bias source, col 0 = 1 (the central token), then the
   // per-edge cutoff factors.
@@ -1583,7 +1631,6 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   const int S = M + 1;
   const int D = h_.d_pet;   // == d_node (non-expanded central token)
   const int Dh = h_.d_head;
-  const int NM = N * M;
   const int G = h_.num_gnn_layers;
   const int A = h_.num_attention_layers;
   const int R = h_.num_readout_layers;  // == G for the residual featurizer
@@ -1595,17 +1642,15 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   ws_.set_zero(false);
 
   auto d_species = dev.species;
-  auto d_neigh_species = dev.neigh_species;
-  auto d_reverse = dev.reverse_index;
-  auto d_edge_vec = dev.edge_vec;
-  auto d_dist = dev.dist;
-  auto d_mask = dev.mask;
-  auto d_cutoff = dev.cutoff_factor;
   auto d_cf_seq = dev.cf_seq;
+  // Edge tensors are [NM, .] over the kept edges only (see PackedEdges).
+  const PackedEdges pk = pack_edges(dev);
+  const int NM = pk.E;
+  auto off = pk.off, d_reverse = pk.reverse;
 
   // initial edge messages = species embedding of the neighbor; geometric (v,|v|)
   View2D input_edge = ws_.n2("re_input_edge", NM, D);
-  gather(input_edge, mat("edge_embedder.weight").v, d_neigh_species);
+  gather(input_edge, mat("edge_embedder.weight").v, pk.species);
 
   // per-GNN-layer node/edge features (all live simultaneously at readout).
   std::vector<View2D> node_feat(G), edge_feat(G);
@@ -1631,8 +1676,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     // the load-time fold (CompressFold), exactly as in the feedforward path.
     View2D cpre = ws_.n2("re_cpre", NM, D);
     if (grad) sav_scpre[L] = ws_.n2("rs_cpre_" + ls, NM, D);
-    compress_fwd(cpre, sav_scpre[L], grad, compress_fold(L), input_edge, d_neigh_species,
-                 d_edge_vec, d_dist);
+    compress_fwd(cpre, sav_scpre[L], grad, compress_fold(L), input_edge, pk.species, pk.vec, pk.dist);
     View2D et = ws_.n2("re_et", NM, D);
     linear(et, cpre, mat(g + ".compress.2.weight"), vec(g + ".compress.2.bias"));
 
@@ -1640,9 +1684,8 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     View2D tokens = ws_.n2("re_tokens", N * S, D);
     Kokkos::parallel_for(
         "re_tok", RangePolicy(0, (N * S) * D), KOKKOS_LAMBDA(int _i) {
-          const int row = _i / D, d = _i % D;
-          const int n = row / S, s = row % S;
-          tokens(row, d) = (s == 0) ? node_L(n, d) : et(n * M + (s - 1), d);
+          const int row = _i / D, d = _i % D, n = row / S, k = off(n) + row % S - 1;
+          tokens(row, d) = row % S == 0 ? node_L(n, d) : k < off(n + 1) ? et(k, d) : Net(0);
         });
 
     // PostLN transformer stack
@@ -1691,10 +1734,9 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     edge_feat[L] = oedge;
     Kokkos::parallel_for(
         "re_split", RangePolicy(0, (N * S) * D), KOKKOS_LAMBDA(int _i) {
-          const int row = _i / D, d = _i % D;
-          const int n = row / S, s = row % S;
-          if (s == 0) onode(n, d) = tokens(row, d);
-          else oedge(n * M + (s - 1), d) = tokens(row, d);
+          const int row = _i / D, d = _i % D, n = row / S, k = off(n) + row % S - 1;
+          if (row % S == 0) onode(n, d) = tokens(row, d);
+          else if (k < off(n + 1)) oedge(k, d) = tokens(row, d);
         });
 
     // Charge / spin conditioning, added to this layer's node output before it is
@@ -1724,7 +1766,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   // Readout: the residual featurizer reads out from every GNN layer (R == G) and
   // sums; see PetModel::readout, shared with the feedforward path.
   View1D per_atom_net = ws_.n1("re_per_atom_net", N);
-  readout(node_feat, edge_feat, per_atom_net, d_mask, d_cutoff, N, M,
+  readout(node_feat, edge_feat, per_atom_net, pk, N,
           sav_nh0, sav_nh1, sav_eh0, sav_eh1, sav_epred, "re_", grad);
 
   // per-atom energy assembly: e = scale*net + composition[species]
@@ -1763,12 +1805,13 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     View2D node_pred_adj = ws_.n2("re_npa", N, 1);
     View2D edge_pred_adj = ws_.n2("re_epa", NM, 1);
     auto epred = sav_epred[i];
+    auto cut = pk.cut;
     Kokkos::parallel_for(
         "re_ro_seed_n", RangePolicy(0, N), KOKKOS_LAMBDA(int n) { node_pred_adj(n, 0) = Net(1); });
     Kokkos::parallel_for(
         "re_ro_seed_e", RangePolicy(0, NM), KOKKOS_LAMBDA(int k) {
-          edge_pred_adj(k, 0) = d_mask(k) * d_cutoff(k);
-          cutoff_adj(k) += d_mask(k) * epred(k, 0);  // sequential over i: no race
+          edge_pred_adj(k, 0) = cut(k);
+          cutoff_adj(k) += epred(k, 0);  // sequential over i: no race
         });
     // node head backward
     View2D nh1_adj = ws_.n2("re_nh1_adj", N, Dh);
@@ -1814,9 +1857,8 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
       auto efa = efeat_adj[L];
       Kokkos::parallel_for(
           "reb_asm_tok", RangePolicy(0, (N * S) * D), KOKKOS_LAMBDA(int _i) {
-            const int row = _i / D, d = _i % D;
-            const int n = row / S, s = row % S;
-            tokens_adj(row, d) = (s == 0) ? nfa(n, d) : efa(n * M + (s - 1), d);
+            const int row = _i / D, d = _i % D, n = row / S, k = off(n) + row % S - 1;
+            tokens_adj(row, d) = row % S == 0 ? nfa(n, d) : k < off(n + 1) ? efa(k, d) : Net(0);
           });
     }
 
@@ -1856,11 +1898,11 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     // tokens_L = [node_L ; et]. Central token -> species embedding (no geometry);
     // edge tokens -> et.
     View2D et_adj = ws_.n2("re_et_adj", NM, D);
+    auto center = pk.center;
     Kokkos::parallel_for(
         "reb_split_tok", RangePolicy(0, NM * D), KOKKOS_LAMBDA(int _i) {
-          const int k = _i / D, d = _i % D;
-          const int n = k / M, m = k % M;
-          et_adj(k, d) = tokens_adj((n * S) + (1 + m), d);
+          const int k = _i / D, d = _i % D, n = center(k);
+          et_adj(k, d) = tokens_adj(n * S + 1 + k - off(n), d);
         });
     // input_edge_L feeds compress.0 AND, through message passing, carries 0.5 of
     // input_edge_{L+1}'s adjoint. Two buffers alternating by layer parity: the
@@ -1887,23 +1929,18 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   {
     const bool is_bump = (h_.cutoff_function == CutoffFunction::Bump);
     const double width = h_.cutoff_width;
-    auto d_pcut = dev.pair_cutoff;
+    auto center = pk.center;
+    auto vec = pk.vec;
+    auto dist = pk.dist, pcut = pk.pcut;
     Kokkos::parallel_for(
         "re_geom_bwd", RangePolicy(0, NM), KOKKOS_LAMBDA(int k) {
-          const double mask = d_mask(k);
-          if (mask <= 0.0) {
-            edge_grad(k, 0) = edge_grad(k, 1) = edge_grad(k, 2) = 0.0;
-            return;
-          }
-          const int n = k / M, m = k % M;
+          const int n = center(k), m = k - off(n);
           const double cutoff_total = cutoff_adj(k) + cf_seq_adj(n, 1 + m);
-          const double dist = d_dist(k);
-          const double rc = d_pcut(k);
-          const double dcut_dd = cutoff_ddist(dist, rc, width, is_bump);
+          const double dcut_dd = cutoff_ddist(dist(k), pcut(k), width, is_bump);
           const double dist_adj = edge_in4_adj(k, 3) + cutoff_total * dcut_dd;
-          const double invd = (dist > 0.0) ? 1.0 / dist : 0.0;
+          const double invd = (dist(k) > 0.0) ? 1.0 / dist(k) : 0.0;
           for (int c = 0; c < 3; ++c)
-            edge_grad(k, c) = edge_in4_adj(k, c) + dist_adj * d_edge_vec(k, c) * invd;
+            edge_grad(k, c) = edge_in4_adj(k, c) + dist_adj * vec(k, c) * invd;
           // non-adaptive: pair_cutoff is fixed, so no cutoff-radius backward term.
         });
   }
@@ -1912,8 +1949,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   const int NS = dev.n_struct;
   auto sid = dev.struct_id;
   RView2D dvir = ws_.r2("re_virial9", NS, 9);
-  fold_edge_gradients(ws_, "re", edge_grad, d_edge_vec, d_mask, d_reverse, d_forces, dvir,
-                      sid, N, M, NS, energy_scale_);
+  fold_edge_gradients(ws_, "re", edge_grad, pk, d_forces, dvir, sid, N, NS, energy_scale_);
 
   return {per_atom, d_forces, dvir};
 }
@@ -1921,12 +1957,13 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
 // ============================================================================
 // Feedforward featurizer: one GNN layer, forward and backward (see model.hpp).
 // ============================================================================
-void PetModel::ff_layer(const DeviceEdgeData& dev, int L, View2D& node, View2D input_edge,
-                        View2D cond, LayerSaves* sav, bool save_wide) {
-  const int N = dev.n_atoms, M = dev.max_neighbors, S = M + 1, NM = N * M;
+void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D& node,
+                        View2D input_edge, View2D cond, LayerSaves* sav, bool save_wide) {
+  const int N = dev.n_atoms, S = dev.max_neighbors + 1, NM = pk.E;  // NM: edge rows
   const int D = h_.d_pet, Dn = h_.d_node, A = h_.num_attention_layers;
   const bool save = sav != nullptr;
-  auto d_reverse = dev.reverse_index;
+  auto rev = pk.reverse;
+  auto off = pk.off;
   const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
   if (save)
     for (auto* v : {&sav->tokens, &sav->qkv, &sav->node_new, &sav->tmp_center, &sav->eps, &sav->tmp_edge})
@@ -1938,7 +1975,7 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, int L, View2D& node, View2D i
   // compress.0 through its fold (CompressFold) -- no edge_emb, no concat.
   View2D cpre = ws_.tmp(NM, D);
   compress_fwd(cpre, save ? keep(sav->cpre, "s_cpre_", NM, D) : View2D(), save, compress_fold(L),
-               input_edge, dev.neigh_species, dev.edge_vec, dev.dist);
+               input_edge, pk.species, pk.vec, pk.dist);
   View2D et = ws_.tmp(NM, D);
   linear(et, cpre, mat(g + ".compress.2.weight"), vec(g + ".compress.2.bias"));
 
@@ -1971,8 +2008,9 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, int L, View2D& node, View2D i
                          : ws_.tmp(N * S, D);
     Kokkos::parallel_for(
         "tok", RangePolicy(0, (N * S) * D), KOKKOS_LAMBDA(int _i) {
-          const int row = _i / D, d = _i % D, n = row / S, s = row % S;  // s==0: central token
-          tokens(row, d) = (s == 0) ? input_node(n, d) : edge_cur(n * M + (s - 1), d);
+          // row % S == 0 is the central token; edge rows past the atom's count are padding
+          const int row = _i / D, d = _i % D, n = row / S, e = off(n) + row % S - 1;
+          tokens(row, d) = row % S == 0 ? input_node(n, d) : e < off(n + 1) ? edge_cur(e, d) : Net(0);
         });
 
     // Split the attention output and take both residuals, one pass per side.
@@ -2000,9 +2038,9 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, int L, View2D& node, View2D i
       }
       Kokkos::parallel_for(
           "split_res", RangePolicy(0, (N * S) * D), KOKKOS_LAMBDA(int _i) {
-            const int row = _i / D, d = _i % D, n = row / S, s = row % S;
-            if (s == 0) return (void) (out_node128(n, d) = attn_out(row, d));
-            const int k = n * M + s - 1;
+            const int row = _i / D, d = _i % D, n = row / S, k = off(n) + row % S - 1;
+            if (row % S == 0) return (void) (out_node128(n, d) = attn_out(row, d));
+            if (k >= off(n + 1)) return;  // padding
             eps(k, d) = attn_out(row, d) + edge_cur(k, d);
             if (save) edge_next(k, d) = eps(k, d);
           });
@@ -2054,7 +2092,7 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, int L, View2D& node, View2D i
   View2D concat = save ? keep(sav->concat, "s_cc_", NM, 2 * D) : ws_.tmp(NM, 2 * D);
   Kokkos::parallel_for(
       "cat_rev", RangePolicy(0, NM * D), KOKKOS_LAMBDA(int _i) {
-        const int k = _i / D, d = _i % D, r = d_reverse(k);
+        const int k = _i / D, d = _i % D, r = rev(k);
         concat(k, d) = out_edge(k, d);
         concat(k, D + d) = (r >= 0) ? out_edge(r, d) : Net(0);
         input_edge(k, d) += out_edge(k, d);
@@ -2070,12 +2108,13 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, int L, View2D& node, View2D i
          vec("combination_mlps." + ls + ".2.bias"), 1);
 }
 
-void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& sav,
-                            bool kept_wide, View2D node_adj, View2D input_edge_adj,
-                            View2D edge_in4_adj, View2D cf_seq_adj) {
-  const int N = dev.n_atoms, M = dev.max_neighbors, S = M + 1, NM = N * M;
+void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
+                            const LayerSaves& sav, bool kept_wide, View2D node_adj,
+                            View2D input_edge_adj, View2D edge_in4_adj, View2D cf_seq_adj) {
+  const int N = dev.n_atoms, S = dev.max_neighbors + 1, NM = pk.E;  // NM: edge rows
   const int D = h_.d_pet, Dn = h_.d_node, A = h_.num_attention_layers;
-  auto d_reverse = dev.reverse_index;
+  auto rev = pk.reverse;
+  auto off = pk.off;
   const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
   // Rebuild `lin(norm(in))` into scratch: a wide activation the forward did not keep.
   auto rebuild = [&](View2D in, const std::string& nkey, const std::string& lin) {
@@ -2109,7 +2148,7 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& 
     // reverse(k): a gather in a fixed order, never a (float-atomic) scatter.
     Kokkos::parallel_for(
         "bw_concat", RangePolicy(0, NM * D), KOKKOS_LAMBDA(int _i) {
-          const int k = _i / D, d = _i % D, r = d_reverse(k);
+          const int k = _i / D, d = _i % D, r = rev(k);
           edge_adj(k, d) = input_edge_adj(k, d) + concat_adj(k, d) + (r >= 0 ? concat_adj(r, D + d) : Net(0));
         });
   }
@@ -2146,8 +2185,8 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& 
       View2D ao_adj = ws_.tmp(N * S, D);
       Kokkos::parallel_for(
           "bw_ao", RangePolicy(0, (N * S) * D), KOKKOS_LAMBDA(int _i) {
-            const int row = _i / D, d = _i % D, n = row / S, s = row % S;
-            ao_adj(row, d) = (s == 0) ? out_node128_adj(n, d) : edge_adj(n * M + (s - 1), d);
+            const int row = _i / D, d = _i % D, n = row / S, k = off(n) + row % S - 1;
+            ao_adj(row, d) = row % S == 0 ? out_node128_adj(n, d) : k < off(n + 1) ? edge_adj(k, d) : Net(0);
           });
 
       View2D attn_in_adj = ws_.tmp(N * S, D);
@@ -2166,9 +2205,9 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& 
     View2D input_node_adj = ws_.tmp(N, D);
     Kokkos::parallel_for(
         "bw_tok", RangePolicy(0, (N * S) * D), KOKKOS_LAMBDA(int _i) {
-          const int row = _i / D, d = _i % D, n = row / S, s = row % S;
-          if (s == 0) input_node_adj(n, d) = tokens_adj(row, d);
-          else edge_adj(n * M + (s - 1), d) += tokens_adj(row, d);
+          const int row = _i / D, d = _i % D, n = row / S, k = off(n) + row % S - 1;
+          if (row % S == 0) input_node_adj(n, d) = tokens_adj(row, d);
+          else if (k < off(n + 1)) edge_adj(k, d) += tokens_adj(row, d);
         });
     linear_bwd(node_adj, input_node_adj, mat(tl + ".center_contraction.weight"));
   }
@@ -2188,7 +2227,6 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   const int D = h_.d_pet;
   const int Dn = h_.d_node;
   const int Dh = h_.d_head;  // readout-head hidden width (not necessarily d_pet)
-  const int NM = N * M;
   const int G = h_.num_gnn_layers;
   const int A = h_.num_attention_layers;
 
@@ -2200,20 +2238,16 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
 
   // ---- device-resident NEF data (already uploaded / built on device) ----
   auto d_species = dev.species;
-  auto d_neigh_species = dev.neigh_species;
-  auto d_reverse = dev.reverse_index;
-  auto d_edge_vec = dev.edge_vec;
-  auto d_dist = dev.dist;
-  auto d_mask = dev.mask;
-  auto d_pcut = dev.pair_cutoff;
-  auto d_cutoff = dev.cutoff_factor;
   auto d_cf_seq = dev.cf_seq;
+  // Edge tensors are [NM, .] over the kept edges only (see PackedEdges).
+  const PackedEdges pk = pack_edges(dev);
+  const int NM = pk.E;
 
   // ---- initial embeddings ----
   View2D node = ws_.n2("node", N, Dn);
   View2D input_edge = ws_.n2("input_edge", NM, D);
   gather(node, mat("node_embedders.0.weight").v, d_species);
-  gather(input_edge, mat("edge_embedder.weight").v, d_neigh_species);
+  gather(input_edge, mat("edge_embedder.weight").v, pk.species);
 
   // Charge / spin conditioning, computed once and reused by every GNN layer.
   // Empty (and free) for a model without it.
@@ -2252,7 +2286,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
       Kokkos::deep_copy(ExecSpace(), inputs[L].second, input_edge);
     }
     if (!sav.empty()) sav[L].tag = std::to_string(L);
-    ff_layer(dev, L, node, input_edge, cond, sav.empty() ? nullptr : &sav[L], grad && keep_wide);
+    ff_layer(dev, pk, L, node, input_edge, cond, sav.empty() ? nullptr : &sav[L], grad && keep_wide);
   }
 
   // ---- readout ----
@@ -2261,7 +2295,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   View1D per_atom_net = ws_.n1("per_atom_net", N);
   {
     std::vector<View2D> nfeat{node}, efeat{input_edge};
-    readout(nfeat, efeat, per_atom_net, d_mask, d_cutoff, N, M,
+    readout(nfeat, efeat, per_atom_net, pk, N,
             sav_nh0, sav_nh1, sav_eh0, sav_eh1, sav_epred, "", grad);
   }
 
@@ -2288,7 +2322,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   Kokkos::deep_copy(ExecSpace(), cf_seq_adj, Net(0));
 
   // ---- readout backward ----
-  // per_atom_net_adj = 1 ; node_pred_adj = 1 ; edge_pred_adj = mask*cutoff
+  // per_atom_net_adj = 1 ; node_pred_adj = 1 ; edge_pred_adj = cutoff
   View2D node_adj = ws_.n2("node_adj", N, Dn);      // adjoint of final node features
   View2D input_edge_adj = ws_.n2("ie_adj", NM, D);  // adjoint of final edge features (accumulator)
   View1D cutoff_adj = ws_.n1("cutoff_adj", NM);     // adjoint of cutoff_factor[k]
@@ -2296,12 +2330,13 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
     View2D node_pred_adj = ws_.n2("npa", N, 1);
     View2D edge_pred_adj = ws_.n2("epa", NM, 1);
     View2D epred = sav_epred[0];  // the readout's saved edge predictions
+    auto cut = pk.cut;
     Kokkos::parallel_for(
         "ro_seed_n", RangePolicy(0, N), KOKKOS_LAMBDA(int n) { node_pred_adj(n, 0) = 1.0; });
     Kokkos::parallel_for(
         "ro_seed_e", RangePolicy(0, NM), KOKKOS_LAMBDA(int k) {
-          edge_pred_adj(k, 0) = d_mask(k) * d_cutoff(k);
-          cutoff_adj(k) = d_mask(k) * epred(k, 0);
+          edge_pred_adj(k, 0) = cut(k);
+          cutoff_adj(k) = epred(k, 0);
         });
     // node head backward. The head's hidden width is d_head, NOT d_pet: these are
     // the adjoints of PetModel::readout's nh0/nh1, which are [N, d_head]. They were
@@ -2337,9 +2372,9 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
       Kokkos::deep_copy(ExecSpace(), n, inputs[L].first);
       Kokkos::deep_copy(ExecSpace(), ie, inputs[L].second);
       one.tag = "c";
-      ff_layer(dev, L, n, ie, cond, &one, false);
+      ff_layer(dev, pk, L, n, ie, cond, &one, false);
     }
-    ff_layer_bwd(dev, L, ckpt ? one : sav[L], keep_wide, node_adj, input_edge_adj, edge_in4_adj,
+    ff_layer_bwd(dev, pk, L, ckpt ? one : sav[L], keep_wide, node_adj, input_edge_adj, edge_in4_adj,
                  cf_seq_adj);
   }
 
@@ -2353,23 +2388,19 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   {
     const bool is_bump = (h_.cutoff_function == CutoffFunction::Bump);
     const double width = h_.cutoff_width;
+    auto off = pk.off, center = pk.center, rev = pk.reverse;
+    auto vec = pk.vec;
+    auto dist = pk.dist, pcut = pk.pcut;
     Kokkos::parallel_for(
         "geom_bwd", RangePolicy(0, NM), KOKKOS_LAMBDA(int k) {
-          const double mask = d_mask(k);
-          if (mask <= 0.0) {
-            edge_grad(k, 0) = edge_grad(k, 1) = edge_grad(k, 2) = 0.0;
-            return;
-          }
-          const int n = k / M, m = k % M;
+          const int n = center(k), m = k - off(n);
           const double cutoff_total = cutoff_adj(k) + cf_seq_adj(n, 1 + m);
-          const double dist = d_dist(k);
-          const double rc = d_pcut(k);
-          const double dcut_dd = cutoff_ddist(dist, rc, width, is_bump);
+          const double dcut_dd = cutoff_ddist(dist(k), pcut(k), width, is_bump);
           // direct dependence of cutoff_factor on its own edge distance (rc fixed)
           const double dist_adj = edge_in4_adj(k, 3) + cutoff_total * dcut_dd;
-          const double invd = (dist > 0.0) ? 1.0 / dist : 0.0;
+          const double invd = (dist(k) > 0.0) ? 1.0 / dist(k) : 0.0;
           for (int c = 0; c < 3; ++c)
-            edge_grad(k, c) = edge_in4_adj(k, c) + dist_adj * d_edge_vec(k, c) * invd;
+            edge_grad(k, c) = edge_in4_adj(k, c) + dist_adj * vec(k, c) * invd;
           // adaptive path: d cutoff_factor / d pair_cutoff = -d cutoff_factor / d dist.
           // Parked per edge here and gathered per atom below, rather than scattered
           // with atomics -- adapted_adj feeds the adaptive cutoff, whose value
@@ -2379,16 +2410,12 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
     if (do_adapt) {
       // atom a's share is half of each of its own edges plus half of each edge
       // pointing at it -- and the latter are exactly the reverses of the former.
-      auto rev = d_reverse;
       Kokkos::parallel_for(
           "adapted_adj_gather", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
             double s = 0.0;
-            for (int m = 0; m < M; ++m) {
-              const int k = a * M + m;
-              if (d_mask(k) <= 0.0) continue;
+            for (int k = off(a); k < off(a + 1); ++k) {
               s += 0.5 * pc_adj_e(k);
-              const int r = rev(k);
-              if (r >= 0) s += 0.5 * pc_adj_e(r);
+              if (rev(k) >= 0) s += 0.5 * pc_adj_e(rev(k));
             }
             adapted_adj(a) = s;
           });
@@ -2402,8 +2429,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   auto sid = dev.struct_id;                // [N] owning structure (valid when NS>1)
   RView2D dvir = ws_.r2("virial9", NS, 9);  // per-structure virial (scatter + adaptive)
   {
-    fold_edge_gradients(ws_, "ff", edge_grad, d_edge_vec, d_mask, d_reverse, d_forces, dvir,
-                        sid, N, M, NS, energy_scale_);
+    fold_edge_gradients(ws_, "ff", edge_grad, pk, d_forces, dvir, sid, N, NS, energy_scale_);
   }
 
   // adaptive-cutoff chain rule: propagate adapted_adj to all raw edges
@@ -2439,10 +2465,19 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   peak_max_neighbors_ = std::max(peak_max_neighbors_, dev.max_neighbors);
   peak_edge_slots_ = std::max(peak_edge_slots_, (long) dev.n_atoms * std::max(1, dev.max_neighbors));
   const bool grad = host_forces || dev_forces;
+  // The kept-edge count sizes the packed edge tensors, so the pass needs it on the
+  // host; the builders supply it, and anything else gets it counted here, once,
+  // outside anything a graph records.
+  DeviceEdgeData d = dev;
+  if (d.n_edges < 0) {
+    auto mask = d.mask;
+    Kokkos::parallel_reduce("pk_count", RangePolicy(0, d.n_atoms * d.max_neighbors),
+                            KOKKOS_LAMBDA(int k, int& c) { c += mask(k) > 0.0; }, d.n_edges);
+  }
   auto pass = [&] {
-    return h_.featurizer_type == FeaturizerType::Residual ? residual_pass(dev, grad) : ff_pass(dev, grad);
+    return h_.featurizer_type == FeaturizerType::Residual ? residual_pass(d, grad) : ff_pass(d, grad);
   };
-  const DeviceOut out = graphs_ && !ozaki_active() ? graph_.run(graph_key(dev, grad), pass) : pass();
+  const DeviceOut out = graphs_ && !ozaki_active() ? graph_.run(graph_key(d, grad), pass) : pass();
   const int N = dev.n_atoms, NS = dev.n_struct;
 
   EnergyResult res;
@@ -2489,7 +2524,8 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
 std::vector<std::uintptr_t> PetModel::graph_key(const DeviceEdgeData& d, bool grad) const {
   std::vector<std::uintptr_t> k{(std::uintptr_t) grad, (std::uintptr_t) d.n_atoms,
                                 (std::uintptr_t) d.max_neighbors, (std::uintptr_t) d.n_raw,
-                                (std::uintptr_t) d.n_struct, ws_.generation()};
+                                (std::uintptr_t) d.n_struct, (std::uintptr_t) d.n_edges,
+                                ws_.generation()};
   auto add = [&k](const auto& v) { k.push_back((std::uintptr_t) v.data()), k.push_back(v.size()); };
   add(d.species), add(d.neigh_species), add(d.reverse_index), add(d.edge_vec), add(d.dist);
   add(d.mask), add(d.pair_cutoff), add(d.cutoff_factor), add(d.cf_seq), add(d.raw_center);

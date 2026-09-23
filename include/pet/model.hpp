@@ -46,6 +46,7 @@ struct DeviceEdgeData {
   int n_atoms = 0;        // N
   int max_neighbors = 0;  // M
   int n_raw = 0;          // E (raw edges retained for the adaptive-cutoff backward)
+  int n_edges = -1;       // kept edges (the real slots of mask); -1 = unknown, counted on use
 
   IView1D species;        // [N]   per-atom species index
   IView1D neigh_species;  // [N*M] neighbor species index (padding -> 0)
@@ -142,6 +143,24 @@ struct CompressFold {
   View1D b;      // [D]   compress.0's bias plus that block times edge_embedder's bias
   View2D tab;    // [n_species, D] the species-only block, pre-multiplied
   WeightRef wi;  // [D,D] the input_edge block; empty at layer 0, where it is in `tab`
+};
+
+// The kept edges, packed: row e of every edge tensor inside the model is a real
+// edge. The neighbour builders hand over an [N, M] slot layout -- atom n's kept
+// edges, then padding up to the largest count M -- and the model used to carry
+// its edge tensors as [N*M, D] over it; the padding was 3% of the rows on a
+// crystal, 15-20% on water or a surface, and more in a batch that mixes
+// structure types. Attention keeps the padded [N, S = M+1] token layout, which it
+// masks anyway: token (n, 1 + m) is edge off(n) + m when m < off(n+1) - off(n).
+struct PackedEdges {
+  int E = 0;
+  IView1D off;         // [N+1] atom n's edges are [off(n), off(n+1)), in slot order
+  IView1D center;      // [E] the edge's own atom
+  IView1D species;     // [E] the neighbour's species
+  IView1D reverse;     // [E] packed index of the (j, i, -shift) edge, -1 if none
+  RView2D vec;         // [E,3]
+  RView1D dist, pcut;  // [E] length, pair cutoff
+  View1D cut;          // [E] smooth cutoff factor
 };
 
 // Every output of one evaluation, on the device: per-atom energy [N], and with
@@ -255,10 +274,13 @@ class PetModel {
   // are kept (see Recompute). Backward: node_adj / input_edge_adj arrive as the
   // adjoints of the layer's outputs and leave as those of its inputs; the
   // geometry and attention-bias adjoints accumulate. Public for nvcc, as above.
-  void ff_layer(const DeviceEdgeData& dev, int L, View2D& node, View2D input_edge, View2D cond,
-                LayerSaves* sav, bool save_wide);
-  void ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& sav, bool kept_wide,
-                    View2D node_adj, View2D input_edge_adj, View2D edge_in4_adj, View2D cf_seq_adj);
+  void ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D& node,
+                View2D input_edge, View2D cond, LayerSaves* sav, bool save_wide);
+  void ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, int L, const LayerSaves& sav,
+                    bool kept_wide, View2D node_adj, View2D input_edge_adj, View2D edge_in4_adj,
+                    View2D cf_seq_adj);
+  // Pack dev's kept edges (see PackedEdges) into the workspace. Public for nvcc.
+  PackedEdges pack_edges(const DeviceEdgeData& dev);
 
   // Per-atom charge/spin conditioning features, or an empty View when the model
   // is not conditioned. Computed once per evaluation and added to the node
@@ -392,7 +414,7 @@ class PetModel {
   // sav_* receive the pre-activations the backward needs; pass empty vectors when
   // not computing gradients.
   void readout(const std::vector<View2D>& node_feat, const std::vector<View2D>& edge_feat,
-               View1D per_atom_net, RView1D d_mask, View1D d_cutoff, int N, int M,
+               View1D per_atom_net, const PackedEdges& pk, int N,
                std::vector<View2D>& sav_nh0, std::vector<View2D>& sav_nh1,
                std::vector<View2D>& sav_eh0, std::vector<View2D>& sav_eh1,
                std::vector<View2D>& sav_epred, const std::string& key, bool grad);
