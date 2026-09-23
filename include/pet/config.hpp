@@ -1,8 +1,5 @@
-// PET model hyperparameters and small enums.
-//
-// Mirrors the metatrain PET "ModelHypers" subset that the libtorch-free
-// evaluation needs. Populated from the <model>.json emitted by
-// tools/convert_pet.py.
+// The model hyperparameters: the subset of metatrain's PET ModelHypers that
+// evaluation needs, read from the <model>.json (checkpoint.hpp).
 #pragma once
 
 #include <string>
@@ -14,32 +11,26 @@ enum class Activation { SwiGLU, SiLU };
 enum class TransformerType { PreLN, PostLN };
 enum class FeaturizerType { FeedForward, Residual };
 enum class CutoffFunction { Bump, Cosine };
-// How the per-atom adaptive cutoff is chosen. Grid evaluates the smoothed
-// neighbour count on a discrete probe grid and takes a Gaussian-weighted
-// average of the probes; Solver root-finds n_total(r) = num_neighbors_adaptive
-// with Newton-bisection. They do NOT agree, and metatrain switched its default
-// from Grid to Solver -- so a checkpoint that does not say which it used is one
-// trained before the choice existed, i.e. Grid.
+// How the adaptive cutoff is chosen: a Gaussian-weighted average over a probe
+// grid, or a Newton-bisection root of n_total(r) = num_neighbors_adaptive. They
+// give different answers; a checkpoint that does not say is Grid.
 enum class AdaptiveCutoffMethod { Grid, Solver };
-// How much of the forward the backward recomputes rather than keeps, cheapest in
-// time first: Never; Wide -- the two widest saved activations (attention qkv and
-// the edge MLP's pre-activation), each one norm and one GEMM from a saved input;
-// Layers -- keep only each GNN layer's inputs and re-run one layer's forward at a
-// time (about one extra forward pass). Auto picks the first that fits the budget.
+// How much of the forward the backward recomputes rather than keeps, cheapest
+// first: Never; Wide, the two widest activations (attention qkv, the edge MLP's
+// pre-activation), one norm and GEMM each; Layers, each GNN layer re-run from
+// its inputs (about one more forward). Auto takes the first that fits memory.
 enum class Recompute { Auto, Never, Wide, Layers };
 
 struct Hypers {
-  int d_pet = 128;            // edge/transformer model dim
-  int d_head = 128;           // readout head hidden dim
-  int d_node = 512;           // node (central token) feature dim
-  int d_feedforward = 256;    // edge FFN inner dim
+  int d_pet = 128;          // edge / transformer width
+  int d_head = 128;         // readout hidden width
+  int d_node = 512;         // node (central token) width
+  int d_feedforward = 256;  // edge MLP inner width
   int num_heads = 8;
-  int head_dim = 16;          // d_pet / num_heads
+  int head_dim = 16;  // d_pet / num_heads
   int num_attention_layers = 1;
   int num_gnn_layers = 2;
-  // Readout layers: feedforward featurizer reads out once (final layer only);
-  // residual featurizer reads out from every GNN layer (== num_gnn_layers).
-  int num_readout_layers = 1;
+  int num_readout_layers = 1;  // feedforward: 1; residual: num_gnn_layers
 
   Normalization normalization = Normalization::RMSNorm;
   Activation activation = Activation::SwiGLU;
@@ -50,33 +41,21 @@ struct Hypers {
   double attention_temperature = 1.0;
   double cutoff = 7.5;
   double cutoff_width = 0.5;
-  // num_neighbors_adaptive: <0 means "disabled".
-  double num_neighbors_adaptive = -1.0;
+  double num_neighbors_adaptive = -1.0;  // <= 0: no adaptive cutoff
   bool adaptive() const { return num_neighbors_adaptive > 0.0; }
   AdaptiveCutoffMethod adaptive_cutoff_method = AdaptiveCutoffMethod::Grid;
-  // Taper width for the SMOOTHED NEIGHBOUR COUNT the adaptive scheme minimises
-  // over -- a different quantity from cutoff_width, which tapers the edge's own
-  // cutoff factor. metatrain passes them separately. A checkpoint predating the
-  // split carries only cutoff_width, and the loader mirrors it here, which is
-  // the behaviour the shipped goldens are validated against.
+  // The taper of the smoothed neighbour count the adaptive cutoff solves on;
+  // cutoff_width tapers the edges themselves. Older checkpoints have only that.
   double cutoff_width_adaptive = 0.5;
-  // Central-token features are "expanded" (contract d_node->d_pet, run the
-  // per-layer center MLP, expand back) only when d_node != d_pet. When equal,
-  // metatrain makes center_contraction/expansion/norm_center/center_mlp Identity
-  // and the checkpoint carries no center_* weights.
+  // Node features go through their own contract / MLP / expand only when
+  // d_node != d_pet; otherwise those are identities with no weights.
   bool expanded_node() const { return d_node != d_pet; }
 
   bool zbl = false;
   bool long_range_enabled = false;
 
-  // Charge / spin conditioning. When on, the per-system total charge and spin
-  // multiplicity are embedded and added to the node features after every GNN
-  // layer, so the same geometry can yield different predictions for different
-  // electronic states.
-  //
-  // It is a per-system CONSTANT -- it does not depend on any position -- so it
-  // affects the forward only: no gradient flows into it, and the geometry
-  // backward is untouched.
+  // Charge and spin multiplicity, embedded and added to the node features after
+  // every GNN layer. A per-structure constant, so it has no gradient.
   bool system_conditioning = false;
   int max_charge = 10;             // table covers charges in [-max_charge, +max_charge]
   int max_spin_multiplicity = 10;  // table covers 2S+1 in [1, max_spin_multiplicity]

@@ -7,12 +7,11 @@
 #include <vesin.h>
 #endif
 
-#include <cstdlib>
-#include <string>
-
 #include <algorithm>
-#include <cstring>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+#include <tuple>
 
 namespace pet {
 
@@ -28,17 +27,14 @@ NeighborBackend& neighbor_backend() {
   static NeighborBackend b = [] {
     const char* e = std::getenv("PET_NEIGHBORS");
     if (e && std::string(e) == "builtin") return NeighborBackend::Builtin;
-    return NeighborBackend::Vesin;  // used only when compiled in; see dispatch
+    return NeighborBackend::Vesin;
   }();
   return b;
 }
 
 namespace detail {
 
-// Route to whichever search is selected AND available. Asking for vesin in a
-// build without it is not an error -- the two are meant to agree, so falling
-// back silently is the right behaviour and `pet::vesin_available()` is how a
-// caller finds out which it got.
+// Vesin if selected and built in, else the built-in search.
 std::vector<RawEdge> build_raw_edges_dispatch(const System& sys, double cutoff) {
 #ifdef PET_HAVE_VESIN
   if (neighbor_backend() == NeighborBackend::Vesin) return build_raw_edges_vesin(sys, cutoff);
@@ -50,8 +46,6 @@ std::vector<RawEdge> build_raw_edges_dispatch(const System& sys, double cutoff) 
 
 namespace {
 
-// vesin allocates into a VesinNeighborList and expects vesin_free to release it.
-// Scoped so an exception between the call and the copy-out cannot leak it.
 struct ListGuard {
   VesinNeighborList list{};
   ~ListGuard() { vesin_free(&list); }
@@ -64,17 +58,13 @@ std::vector<RawEdge> build_raw_edges_vesin(const System& sys, double cutoff) {
   std::vector<RawEdge> edges;
   if (N == 0) return edges;
 
-  // vesin takes the cell with lattice vectors as ROWS, which is how System
-  // stores it, so this is a straight copy rather than a transpose.
+  // Lattice vectors as rows, like System.
   double box[3][3];
   for (int r = 0; r < 3; ++r)
     for (int c = 0; c < 3; ++c) box[r][c] = sys.cell[r * 3 + c];
   bool periodic[3] = {sys.pbc[0], sys.pbc[1], sys.pbc[2]};
 
-  // A system periodic in some directions but not others is not something vesin
-  // models as a per-axis flag in the same way the built-in search does, and PET
-  // itself only ever sees fully periodic or fully isolated systems. Refuse the
-  // mixed case rather than quietly treating it as one or the other.
+  // Mixed periodicity is refused rather than guessed at.
   const bool any = periodic[0] || periodic[1] || periodic[2];
   const bool all = periodic[0] && periodic[1] && periodic[2];
   if (any && !all)
@@ -84,11 +74,11 @@ std::vector<RawEdge> build_raw_edges_vesin(const System& sys, double cutoff) {
 
   VesinOptions opts{};
   opts.cutoff = cutoff;
-  opts.full = true;    // both i->j and j->i; the NEF's reverse-edge map needs it
-  opts.sorted = true;  // grouped by i, which is what the per-atom scan assumes
+  opts.full = true;    // both i->j and j->i, for the reverse map
+  opts.sorted = true;  // grouped by i
   opts.algorithm = VesinAutoAlgorithm;
-  opts.skin = 0.0;     // caching is handled a level up, not here
-  opts.n_threads = 0;  // vesin's own default
+  opts.skin = 0.0;
+  opts.n_threads = 0;
   opts.return_shifts = true;
   opts.return_distances = true;
   opts.return_vectors = true;
@@ -117,20 +107,8 @@ std::vector<RawEdge> build_raw_edges_vesin(const System& sys, double cutoff) {
     o.dist = g.list.distances[e];
   }
 
-  // Canonical order. vesin guarantees grouping by `i` and explicitly leaves the
-  // order within a group unspecified; it is also threaded, so that order is not
-  // something to depend on across runs, builds or thread counts. The NEF packer
-  // assigns neighbour slots in list order and the slot order fixes the attention
-  // softmax's summation order, so an unstable order here is an unstable energy
-  // in the last bits -- which is precisely what the determinism work removed
-  // everywhere else. A stable sort on (i, j, shift) costs one pass and makes the
-  // result reproducible by construction.
   std::sort(edges.begin(), edges.end(), [](const RawEdge& a, const RawEdge& b) {
-    if (a.i != b.i) return a.i < b.i;
-    if (a.j != b.j) return a.j < b.j;
-    if (a.sa != b.sa) return a.sa < b.sa;
-    if (a.sb != b.sb) return a.sb < b.sb;
-    return a.sc < b.sc;
+    return std::tie(a.i, a.j, a.sa, a.sb, a.sc) < std::tie(b.i, b.j, b.sa, b.sb, b.sc);
   });
   return edges;
 }

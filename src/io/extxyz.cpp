@@ -1,6 +1,5 @@
 #include "pet/io.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cctype>
 #include <charconv>
@@ -14,7 +13,7 @@ namespace pet {
 
 namespace {
 
-// Z = 1..118, indexed directly by atomic number (slot 0 is the "unknown" hole).
+// Indexed by atomic number; 0 is "unknown".
 constexpr const char* kSymbols[] = {
     "X",  "H",  "He", "Li", "Be", "B",  "C",  "N",  "O",  "F",  "Ne", "Na", "Mg", "Al", "Si",
     "P",  "S",  "Cl", "Ar", "K",  "Ca", "Sc", "Ti", "V",  "Cr", "Mn", "Fe", "Co", "Ni", "Cu",
@@ -26,20 +25,17 @@ constexpr const char* kSymbols[] = {
     "Db", "Sg", "Bh", "Hs", "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og"};
 constexpr int kMaxZ = static_cast<int>(sizeof(kSymbols) / sizeof(kSymbols[0])) - 1;
 
-// Pull `key="quoted value"` or `key=bare_value` out of an extxyz comment line.
-// The quoted form is what Lattice uses; everything else here is bare.
+// `key="quoted value"` or `key=bare_value` from an extxyz comment line.
 std::string extract_key(const std::string& line, const std::string& key) {
-  // Case-insensitive key match, since ASE writes "Lattice" and "pbc" but other
-  // producers are not consistent about it.
-  std::string lower_line = line, lower_key = key;
-  std::transform(lower_line.begin(), lower_line.end(), lower_line.begin(),
-                 [](unsigned char c) { return (char) std::tolower(c); });
-  std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                 [](unsigned char c) { return (char) std::tolower(c); });
-
+  // Keys match case-insensitively: producers disagree on "Lattice" vs "lattice".
+  auto lower = [](std::string x) {
+    for (auto& c : x) c = (char) std::tolower((unsigned char) c);
+    return x;
+  };
+  const std::string lower_line = lower(line), lower_key = lower(key);
   std::size_t p = 0;
   while ((p = lower_line.find(lower_key, p)) != std::string::npos) {
-    // Must be preceded by whitespace or start of line, and followed by '='.
+    // A whole key: at the start of the line or after a space, then '='.
     const bool at_start = (p == 0) || std::isspace((unsigned char) line[p - 1]);
     const std::size_t eq = p + key.size();
     if (at_start && eq < line.size() && line[eq] == '=') {
@@ -77,7 +73,7 @@ int element_number(const std::string& symbol) {
     const auto r = std::from_chars(symbol.data(), symbol.data() + symbol.size(), z);
     return (r.ec == std::errc{}) ? z : 0;
   }
-  // Normalize "he" / "HE" to "He" before comparing.
+  // "he" and "HE" are "He".
   std::string s = symbol;
   s[0] = (char) std::toupper((unsigned char) s[0]);
   for (std::size_t i = 1; i < s.size(); ++i) s[i] = (char) std::tolower((unsigned char) s[i]);
@@ -91,7 +87,6 @@ std::vector<System> read_extxyz(std::istream& in) {
   std::string line;
 
   while (std::getline(in, line)) {
-    // Skip blank lines between frames.
     if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
 
     int n = 0;
@@ -110,8 +105,7 @@ std::vector<System> read_extxyz(std::istream& in) {
     s.atomic_numbers.reserve(n);
     s.positions.reserve(static_cast<std::size_t>(n) * 3);
 
-    // Lattice="ax ay az bx by bz cx cy cz" -- row-major, lattice vectors as
-    // ROWS, which is exactly what System::cell wants.
+    // Lattice="ax ay az bx by bz cx cy cz": vectors as rows, like System::cell.
     const std::string lat = extract_key(comment, "Lattice");
     bool has_cell = false;
     if (!lat.empty()) {
@@ -124,8 +118,7 @@ std::vector<System> read_extxyz(std::istream& in) {
       has_cell = true;
     }
 
-    // pbc="T T T". Absent means "periodic iff a lattice was given", which is
-    // what ASE's writer implies and what every file in the wild relies on.
+    // pbc="T T T"; absent, periodic if and only if there is a lattice (as ASE).
     const std::string pbc = extract_key(comment, "pbc");
     if (!pbc.empty()) {
       std::istringstream ps(pbc);
@@ -148,7 +141,6 @@ std::vector<System> read_extxyz(std::istream& in) {
       if (Z == 0) throw std::runtime_error("extxyz: unknown species '" + species + "'");
       s.atomic_numbers.push_back(Z);
       s.positions.insert(s.positions.end(), {x, y, z});
-      // Any further columns (forces, charges, ...) are ignored.
     }
     frames.push_back(std::move(s));
   }
