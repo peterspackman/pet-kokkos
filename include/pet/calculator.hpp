@@ -49,9 +49,10 @@ struct Options {
   // one.
   bool cache_neighbors = false;
 
-  // Allow TF32 tensor-core GEMMs on NVIDIA. Faster, and it CHANGES THE ANSWER,
-  // so it stays off unless asked for and must be off for anything compared
-  // against a reference or checked for determinism.
+  // Allow TF32 tensor-core GEMMs on NVIDIA. Faster (~15% on an RTX 4080, more
+  // on A100/H100), and it CHANGES THE ANSWER -- by ~0.1 meV/atom and a few
+  // meV/A -- so it stays off unless asked for and must be off for anything
+  // compared against a reference or checked for determinism.
   //
   // PROCESS-GLOBAL despite living here: cuBLAS fixes a handle's math mode when
   // the handle is created, and there is one handle per process. A Calculator
@@ -88,7 +89,7 @@ struct Options {
   // Replay a repeated evaluation -- same shapes, same buffers, as in a stepping
   // loop -- as one CUDA graph launch instead of ~160 separate ones. Bit-identical
   // to running it eagerly; the first evaluation of a shape runs eagerly and the
-  // second records. CUDA only.
+  // second records. CUDA only; PET_GRAPHS=0 in the environment turns it off.
   bool graphs = true;
 
   // Hard cap on atoms per batch, ahead of the memory estimate. 0 = derive it.

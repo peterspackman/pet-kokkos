@@ -34,13 +34,17 @@
 namespace pet {
 
 // TF32 tensor-core GEMMs for the fp32 (Net=float) path: ~10-bit mantissa
-// truncation on the inputs, fp32 accumulate. The PET GEMMs are tall-skinny and
-// memory-bound, so the win is modest -- but it CHANGES THE ANSWER, and not
-// subtly: measured on the 8-atom pet-mad-xs crystal golden, enabling it moves
-// the total energy by 9.4 meV (1.2 meV/atom), which is ~2800x the fp32 noise
-// floor the same golden otherwise sits at. So it is off by default, and it must
-// stay off for anything compared against a reference or checked for
-// determinism.
+// truncation on the inputs, fp32 accumulate. It CHANGES THE ANSWER: on the
+// 8-atom pet-mad-xs crystal golden it moves the total energy by 0.53 meV and the
+// forces by up to 2.3 meV/A -- far inside model error, far outside the fp32
+// noise the goldens pin. So it is off by default, and must stay off for anything
+// compared against a reference or checked for determinism. ~15% faster on an
+// RTX 4080 (whose TF32 peak equals its fp32 peak); much more on A100/H100.
+//
+// It was 9.4 meV (1.2 meV/atom) when the atomic geometry entered through a
+// K=4 GEMM, so that TF32 truncated the coordinates themselves to 10 bits. The
+// geometry now enters compress.0 through an fp32 elementwise term (see
+// CompressFold); every GEMM left sees only learned activations.
 //
 // Process-global, not per-Calculator, because the cuBLAS handle below is a
 // process-wide singleton and its math mode is fixed when it is created. That

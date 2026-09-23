@@ -257,11 +257,13 @@ recovers those ranges is itself safe. `tests/test_determinism.cpp` checks this
 against the model, needing no golden.
 
 TF32 tensor-core GEMMs (`PET_TF32=1`, or `Options::allow_tf32`) are **off by
-default** and must stay off for anything compared against a reference. They are
-not a free speedup: on the 8-atom `pet-mad-xs` crystal golden, turning them on
-moves the total energy by 9.4 meV — 1.2 meV/atom, about 2800x the fp32 noise the
-same golden otherwise sits at. The setting is process-global, because cuBLAS
-fixes a handle's math mode when the handle is created.
+default** and must stay off for anything compared against a reference: on the
+8-atom `pet-mad-xs` crystal golden they move the total energy by 0.53 meV and
+the forces by up to 2.3 meV/Å (0.1–0.2 meV/atom and ~3 meV/Å on larger cells) —
+well inside model error, well outside the fp32 noise the goldens pin. They are
+~15% faster on an RTX 4080 and considerably more on data-centre GPUs. The
+setting is process-global, because cuBLAS fixes a handle's math mode when the
+handle is created.
 
 ## Virial convention
 

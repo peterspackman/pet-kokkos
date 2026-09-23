@@ -202,7 +202,10 @@ struct Calculator::Impl {
     if (o.allow_tf32) set_tf32(true);
     std::size_t free_b = 0, total_b = 0;
     device_memory(o.memory_budget_bytes, free_b, total_b);
-    model.set_graphs(o.graphs);
+    // PET_GRAPHS=0 overrides, for profilers that fence around every kernel
+    // (which a capture cannot contain) or count launches.
+    const char* g = std::getenv("PET_GRAPHS");
+    model.set_graphs(o.graphs && !(g && g[0] == '0'));
     model.set_memory_policy(std::size_t(double(total_b) * kMemCardFraction * kMemHeadroom), o.recompute);
     // Likewise process-global: build_edge_data has too many call sites to thread
     // a per-Calculator choice through, and the two searches are meant to agree.
