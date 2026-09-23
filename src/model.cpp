@@ -1354,198 +1354,123 @@ void PetModel::load_all(const Checkpoint& ckpt) {
   Kokkos::deep_copy(comp_view_, hcomp);
 }
 
-// Marshal a host EdgeData into device Views. This is the single host->device
-// boundary for the host-neighbor-list path; compute() itself is device-native
-// and never touches the host EdgeData.
+// Marshal a host EdgeData into device Views: the single host->device boundary of
+// the host neighbour path, as one copy (see Upload). The Views alias pooled
+// memory, so they are valid until the next upload -- every caller consumes them
+// straight away.
 DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse) const {
-  const int N = ed.n_atoms;
-  const int M = ed.max_neighbors;
-  const int S = M + 1;
-  const int NM = N * M;
-  const int E = ed.n_raw;
-
+  const int N = ed.n_atoms, M = ed.max_neighbors, S = M + 1, NM = N * M, E = ed.n_raw;
   DeviceEdgeData dev;
   dev.n_atoms = N;
   dev.max_neighbors = M;
   dev.n_raw = E;
-  dev.species = IView1D("species", N);
-  dev.neigh_species = IView1D("neigh_species", NM);
-  dev.reverse_index = IView1D("reverse", NM);
-  dev.edge_vec = RView2D("edge_vec", NM, 3);
-  dev.dist = RView1D("dist", NM);
-  dev.mask = RView1D("mask", NM);
-  dev.pair_cutoff = RView1D("pcut", NM);
-  dev.cutoff_factor = View1D("cutoff", NM);
-  dev.cf_seq = View2D("cf_seq", N, S);
 
+  // cf_seq: the attention bias source, col 0 = 1 (the central token), then the
+  // per-edge cutoff factors.
+  std::vector<double> cf((std::size_t) N * S, 1.0);
+  for (int n = 0; n < N; ++n)
+    for (int m = 0; m < M; ++m) cf[(std::size_t) n * S + 1 + m] = ed.cutoff_factor[(std::size_t) n * M + m];
+
+  // Per-centre ranges and edge partners of the raw list, so the adaptive
+  // backward can gather instead of scattering with atomics (see
+  // adaptive_backward). Built only when the list really is grouped by centre and
+  // every edge finds its partner, and only when a backward of an adaptive model
+  // will read them; otherwise left empty and the gather falls back.
+  std::vector<int> off(N + 1, 0), rev;
+  bool grouped = E > 0 && need_reverse && h_.adaptive();
+  for (int e = 0; e < E && grouped; ++e) {
+    if (e > 0 && ed.raw_center[e] < ed.raw_center[e - 1]) grouped = false;
+    ++off[ed.raw_center[e] + 1];
+  }
+  if (grouped) {
+    for (int a = 0; a < N; ++a) off[a + 1] += off[a];
+    // Partner of (i, j, v) is (j, i, -v). Matched on the neighbour index and the
+    // closest opposing vector, which distinguishes periodic images of the same
+    // pair; an exact float compare would be at the mercy of how each vector was
+    // rounded.
+    //
+    // Is raw_neigh non-decreasing within each centre's run? Both host searches
+    // emit the list sorted by (i, j, shift) -- the vesin wrapper sorts
+    // explicitly, the built-in search's nested loops produce it naturally -- but
+    // neither is contractually required to, and a caller supplying its own edge
+    // list certainly is not. Checked in one pass rather than assumed.
+    bool sorted_runs = true;
+    for (int a = 0; a < N && sorted_runs; ++a)
+      for (int f = off[a] + 1; f < off[a + 1]; ++f)
+        if (ed.raw_neigh[f] < ed.raw_neigh[f - 1]) { sorted_runs = false; break; }
+
+    rev.assign(E, -1);
+    for (int e = 0; e < E && grouped; ++e) {
+      const int i = ed.raw_center[e], j = ed.raw_neigh[e];
+      const double vx = -ed.raw_vec[3 * e + 0], vy = -ed.raw_vec[3 * e + 1],
+                   vz = -ed.raw_vec[3 * e + 2];
+      // Narrow the scan to the block of j's edges that point back at i.
+      //
+      // Without this the loop walks all of atom j's neighbours for every edge:
+      // O(E x neighbours), 147 million iterations on a 1728-atom supercell and
+      // ~72 ms -- more than the adaptive-cutoff solver and the whole NEF packer
+      // combined. When the run is sorted, the edges with raw_neigh == i are
+      // contiguous (one to three periodic images of the same pair), so a pair of
+      // binary searches finds them directly. It only skips entries the scan
+      // would have rejected on the `raw_neigh != i` test anyway.
+      int lo = off[j], hi = off[j + 1];
+      if (sorted_runs) {
+        const auto begin = ed.raw_neigh.begin();
+        lo = (int) (std::lower_bound(begin + off[j], begin + off[j + 1], i) - begin);
+        hi = (int) (std::upper_bound(begin + lo, begin + off[j + 1], i) - begin);
+      }
+      double best = 1e300;
+      int found = -1;
+      for (int f = lo; f < hi; ++f) {
+        if (ed.raw_neigh[f] != i) continue;
+        const double dx = ed.raw_vec[3 * f + 0] - vx, dy = ed.raw_vec[3 * f + 1] - vy,
+                     dz = ed.raw_vec[3 * f + 2] - vz;
+        const double r2 = dx * dx + dy * dy + dz * dz;
+        if (r2 < best) { best = r2; found = f; }
+      }
+      if (found < 0 || best > 1e-12) grouped = false;  // unmatched -> use the fallback
+      rev[e] = found;
+    }
+  }
+
+  Upload& up = upload_;
+  up.clear();
+  const auto o_sp = up.add<int>(ed.species), o_ns = up.add<int>(ed.neigh_species),
+             o_rev = up.add<int>(ed.reverse_index), o_ev = up.add<Real>(ed.edge_vec),
+             o_d = up.add<Real>(ed.edge_dist), o_mask = up.add<Real>(ed.mask),
+             o_pc = up.add<Real>(ed.pair_cutoff), o_cut = up.add<Net>(ed.cutoff_factor),
+             o_cf = up.add<Net>(cf), o_rc = up.add<int>(ed.raw_center),
+             o_rj = up.add<int>(ed.raw_neigh), o_rd = up.add<Real>(ed.raw_dist),
+             o_rv = up.add<Real>(ed.raw_vec);
   // Per-structure electronic state, for a conditioned model.
-  if (!ed.charge.empty()) {
-    const int B = (int) ed.charge.size();
-    dev.charge = IView1D("charge", B);
-    dev.spin_multiplicity = IView1D("spin", B);
-    auto h_q = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.charge);
-    auto h_s = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.spin_multiplicity);
-    for (int b = 0; b < B; ++b) {
-      h_q(b) = ed.charge[b];
-      h_s(b) = (b < (int) ed.spin_multiplicity.size()) ? ed.spin_multiplicity[b] : 1;
-    }
-    Kokkos::deep_copy(dev.charge, h_q);
-    Kokkos::deep_copy(dev.spin_multiplicity, h_s);
-  }
+  const int B = (int) ed.charge.size();
+  std::vector<int> spin(B, 1);
+  for (int b = 0; b < B && b < (int) ed.spin_multiplicity.size(); ++b) spin[b] = ed.spin_multiplicity[b];
+  const auto o_q = up.add<int>(ed.charge), o_s = up.add<int>(spin);
+  // Solver adaptive cutoff: the forward's root and slope. Without these the
+  // backward has nothing to differentiate through -- it cannot recompute them,
+  // having no per-atom segmentation of the raw edge list on this path.
+  const bool solver = (int) ed.adapt_r.size() == N && N > 0;
+  const auto o_ar = up.add<Real>(ed.adapt_r), o_adn = up.add<Real>(ed.adapt_dn);
+  const auto o_off = up.add<int>(off), o_rrev = up.add<int>(rev);
+  up.send();
 
-  // Solver adaptive cutoff: the forward's root and slope, uploaded alongside
-  // everything else. Without these the backward has nothing to differentiate
-  // through -- it cannot recompute them, because it has no per-atom segmentation
-  // of the raw edge list on this path.
-  if (!ed.adapt_r.empty() && (int) ed.adapt_r.size() == N) {
-    dev.adapt_r = RView1D("adapt_r", N);
-    dev.adapt_dn = RView1D("adapt_dn", N);
-    auto h_ar = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.adapt_r);
-    auto h_adn = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.adapt_dn);
-    for (int i = 0; i < N; ++i) {
-      h_ar(i) = ed.adapt_r[i];
-      h_adn(i) = ed.adapt_dn[i];
-    }
-    Kokkos::deep_copy(dev.adapt_r, h_ar);
-    Kokkos::deep_copy(dev.adapt_dn, h_adn);
-  }
-
-  auto h_species = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.species);
-  for (int i = 0; i < N; ++i) h_species(i) = ed.species[i];
-  Kokkos::deep_copy(dev.species, h_species);
-
-  auto h_ns = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.neigh_species);
-  auto h_rev = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.reverse_index);
-  auto h_ev = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.edge_vec);
-  auto h_dist = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.dist);
-  auto h_cut = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.cutoff_factor);
-  auto h_mask = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.mask);
-  auto h_pc = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.pair_cutoff);
-  for (int k = 0; k < NM; ++k) {
-    h_ns(k) = ed.neigh_species[k];
-    h_rev(k) = ed.reverse_index[k];
-    h_ev(k, 0) = ed.edge_vec[3 * k + 0];
-    h_ev(k, 1) = ed.edge_vec[3 * k + 1];
-    h_ev(k, 2) = ed.edge_vec[3 * k + 2];
-    h_dist(k) = ed.edge_dist[k];
-    h_cut(k) = ed.cutoff_factor[k];
-    h_mask(k) = ed.mask[k] ? 1.0 : 0.0;
-    h_pc(k) = ed.pair_cutoff[k];
-  }
-  Kokkos::deep_copy(dev.neigh_species, h_ns);
-  Kokkos::deep_copy(dev.reverse_index, h_rev);
-  Kokkos::deep_copy(dev.edge_vec, h_ev);
-  Kokkos::deep_copy(dev.dist, h_dist);
-  Kokkos::deep_copy(dev.cutoff_factor, h_cut);
-  Kokkos::deep_copy(dev.mask, h_mask);
-  Kokkos::deep_copy(dev.pair_cutoff, h_pc);
-
-  auto h_cf = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.cf_seq);
-  for (int n = 0; n < N; ++n) {
-    h_cf(n, 0) = 1.0;
-    for (int m = 0; m < M; ++m) h_cf(n, 1 + m) = ed.cutoff_factor[n * M + m];
-  }
-  Kokkos::deep_copy(dev.cf_seq, h_cf);
-
-  // raw edges (for the adaptive-cutoff backward)
-  dev.raw_center = IView1D("raw_center", E);
-  dev.raw_neigh = IView1D("raw_neigh", E);
-  dev.raw_dist = RView1D("raw_dist", E);
-  dev.raw_vec = RView2D("raw_vec", E, 3);
-  if (E > 0) {
-    auto h_rc = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_center);
-    auto h_rj = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_neigh);
-    auto h_rd = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_dist);
-    auto h_rv = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_vec);
-    for (int e = 0; e < E; ++e) {
-      h_rc(e) = ed.raw_center[e];
-      h_rj(e) = ed.raw_neigh[e];
-      h_rd(e) = ed.raw_dist[e];
-      h_rv(e, 0) = ed.raw_vec[3 * e + 0];
-      h_rv(e, 1) = ed.raw_vec[3 * e + 1];
-      h_rv(e, 2) = ed.raw_vec[3 * e + 2];
-    }
-    Kokkos::deep_copy(dev.raw_center, h_rc);
-    Kokkos::deep_copy(dev.raw_neigh, h_rj);
-    Kokkos::deep_copy(dev.raw_dist, h_rd);
-    Kokkos::deep_copy(dev.raw_vec, h_rv);
-
-    // Per-centre ranges and edge partners, so the adaptive backward can gather
-    // instead of scattering with atomics here too (see adaptive_backward). Built
-    // only when the list really is grouped by centre and every edge finds its
-    // partner; otherwise both are left empty and the gather falls back.
-    std::vector<int> off(N + 1, 0);
-    bool grouped = true;
-    for (int e = 0; e < E; ++e) {
-      if (e > 0 && ed.raw_center[e] < ed.raw_center[e - 1]) { grouped = false; break; }
-      ++off[ed.raw_center[e] + 1];
-    }
-    // Only the adaptive-cutoff backward consumes these, so a fixed-cutoff model
-    // never needs them either.
-    if (grouped && need_reverse && h_.adaptive()) {
-      for (int a = 0; a < N; ++a) off[a + 1] += off[a];
-      // Partner of (i, j, v) is (j, i, -v). Matched on the neighbour index and the
-      // closest opposing vector, which distinguishes periodic images of the same
-      // pair; an exact float compare would be at the mercy of how each vector was
-      // rounded.
-      // Is raw_neigh non-decreasing within each centre's run? Both host searches
-      // emit the list sorted by (i, j, shift) -- the vesin wrapper sorts
-      // explicitly, the built-in search's nested loops produce it naturally --
-      // but neither is contractually required to, and a caller supplying its own
-      // edge list certainly is not. Checked in one pass rather than assumed.
-      bool sorted_runs = true;
-      for (int a = 0; a < N && sorted_runs; ++a)
-        for (int f = off[a] + 1; f < off[a + 1]; ++f)
-          if (ed.raw_neigh[f] < ed.raw_neigh[f - 1]) { sorted_runs = false; break; }
-
-      std::vector<int> rev(E, -1);
-      for (int e = 0; e < E && grouped; ++e) {
-        const int i = ed.raw_center[e], j = ed.raw_neigh[e];
-        const double vx = -ed.raw_vec[3 * e + 0], vy = -ed.raw_vec[3 * e + 1],
-                     vz = -ed.raw_vec[3 * e + 2];
-        // Narrow the scan to the block of j's edges that point back at i.
-        //
-        // Without this the loop walks all of atom j's neighbours for every edge:
-        // O(E x neighbours), 147 million iterations on a 1728-atom supercell and
-        // ~72 ms -- more than the adaptive-cutoff solver and the whole NEF packer
-        // combined, and the single largest cost on the host path. When the run is
-        // sorted, the edges with raw_neigh == i are contiguous (one to three
-        // periodic images of the same pair), so a pair of binary searches finds
-        // them directly.
-        //
-        // The candidate set and the closest-vector choice below are unchanged, so
-        // the output is byte-identical; this only skips entries the scan would
-        // have rejected on the `raw_neigh != i` test anyway.
-        int lo = off[j], hi = off[j + 1];
-        if (sorted_runs) {
-          const auto begin = ed.raw_neigh.begin();
-          lo = (int) (std::lower_bound(begin + off[j], begin + off[j + 1], i) - begin);
-          hi = (int) (std::upper_bound(begin + lo, begin + off[j + 1], i) - begin);
-        }
-        double best = 1e300;
-        int found = -1;
-        for (int f = lo; f < hi; ++f) {
-          if (ed.raw_neigh[f] != i) continue;
-          const double dx = ed.raw_vec[3 * f + 0] - vx, dy = ed.raw_vec[3 * f + 1] - vy,
-                       dz = ed.raw_vec[3 * f + 2] - vz;
-          const double r2 = dx * dx + dy * dy + dz * dz;
-          if (r2 < best) { best = r2; found = f; }
-        }
-        if (found < 0 || best > 1e-12) grouped = false;  // unmatched -> use the fallback
-        rev[e] = found;
-      }
-      if (grouped) {
-        dev.raw_off = IView1D("raw_off", N + 1);
-        dev.raw_reverse = IView1D("raw_reverse", E);
-        auto h_off = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_off);
-        auto h_rev2 = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, dev.raw_reverse);
-        for (int a = 0; a <= N; ++a) h_off(a) = off[a];
-        for (int e = 0; e < E; ++e) h_rev2(e) = rev[e];
-        Kokkos::deep_copy(dev.raw_off, h_off);
-        Kokkos::deep_copy(dev.raw_reverse, h_rev2);
-      }
-    }
-  }
+  dev.species = up.get<IView1D>(o_sp, N);
+  dev.neigh_species = up.get<IView1D>(o_ns, NM);
+  dev.reverse_index = up.get<IView1D>(o_rev, NM);
+  dev.edge_vec = up.get<RView2D>(o_ev, NM, 3);
+  dev.dist = up.get<RView1D>(o_d, NM);
+  dev.mask = up.get<RView1D>(o_mask, NM);
+  dev.pair_cutoff = up.get<RView1D>(o_pc, NM);
+  dev.cutoff_factor = up.get<View1D>(o_cut, NM);
+  dev.cf_seq = up.get<View2D>(o_cf, N, S);
+  dev.raw_center = up.get<IView1D>(o_rc, E);
+  dev.raw_neigh = up.get<IView1D>(o_rj, E);
+  dev.raw_dist = up.get<RView1D>(o_rd, E);
+  dev.raw_vec = up.get<RView2D>(o_rv, E, 3);
+  if (B > 0) dev.charge = up.get<IView1D>(o_q, B), dev.spin_multiplicity = up.get<IView1D>(o_s, B);
+  if (solver) dev.adapt_r = up.get<RView1D>(o_ar, N), dev.adapt_dn = up.get<RView1D>(o_adn, N);
+  if (grouped) dev.raw_off = up.get<IView1D>(o_off, N + 1), dev.raw_reverse = up.get<IView1D>(o_rrev, E);
   return dev;
 }
 

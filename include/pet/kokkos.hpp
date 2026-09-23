@@ -296,6 +296,49 @@ class Workspace {
   std::unordered_map<std::string, View2D> cur2_;  // current logical n2 view per key (for peek2)
 };
 
+// Many small host arrays to the device as ONE copy. add() converts an array to
+// its device type and appends it to a host staging area; send() copies the lot,
+// asynchronously on the default instance, from pinned memory into a device
+// buffer kept between calls; get() then views each array where it landed.
+// Views from get() are valid until the next send().
+//
+// This replaces, per array, a fresh View (a cudaMalloc, a fill kernel and a
+// fence, then a synchronising cudaFree when it died) and a synchronous copy
+// that fenced the device on both sides: ~20 arrays, ~40 syncs and ~35 allocator
+// calls per evaluation on the host neighbour path, which for a small molecule
+// was most of the call.
+class Upload {
+ public:
+  void clear() { host_.clear(); }
+  template <class T, class U>
+  std::size_t add(const std::vector<U>& v) {
+    const std::size_t off = (host_.size() + 15) & ~std::size_t(15);
+    host_.resize(off + v.size() * sizeof(T));
+    T* dst = reinterpret_cast<T*>(host_.data() + off);
+    for (std::size_t i = 0; i < v.size(); ++i) dst[i] = static_cast<T>(v[i]);
+    return off;
+  }
+  void send() {
+    const std::size_t n = host_.size();
+    if (pinned_.extent(0) < n) pinned_ = Pinned(Kokkos::view_alloc(Kokkos::WithoutInitializing, "upload:host"), n);
+    if (dev_.extent(0) < n) dev_ = Kokkos::View<char*, MemSpace>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "upload"), n);
+    ExecSpace().fence();  // the previous send may still be reading pinned_
+    std::copy(host_.begin(), host_.end(), pinned_.data());
+    Kokkos::deep_copy(ExecSpace(), Kokkos::subview(dev_, std::make_pair(std::size_t(0), n)),
+                      Kokkos::subview(pinned_, std::make_pair(std::size_t(0), n)));
+  }
+  template <class V, class... Extents>
+  V get(std::size_t off, Extents... n) const {
+    return V(reinterpret_cast<typename V::pointer_type>(dev_.data() + off), n...);
+  }
+
+ private:
+  using Pinned = Kokkos::View<char*, Kokkos::SharedHostPinnedSpace>;
+  std::vector<char> host_;
+  Pinned pinned_;
+  Kokkos::View<char*, MemSpace> dev_;
+};
+
 template <class T>
 KOKKOS_INLINE_FUNCTION T sigmoidd(T x) {
   return T(1) / (T(1) + Kokkos::exp(-x));

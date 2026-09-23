@@ -199,7 +199,8 @@ class PetModel {
     return compute(dev, nullptr, &out_forces);
   }
 
-  // Marshal a host EdgeData into device Views (one host->device copy per array).
+  // Marshal a host EdgeData into device Views (one host->device copy in all).
+  // The Views alias the model's upload buffer: valid until the next upload.
   // `need_reverse` builds raw_off / raw_reverse, the per-atom segmentation and
   // partner map the adaptive-cutoff BACKWARD needs in order to gather rather
   // than scatter. They cost real time to construct -- on a 1728-atom supercell
@@ -276,6 +277,7 @@ class PetModel {
   RView1D probes_;                   // adaptive-cutoff probe grid (constant, precomputed)
   int n_probes_ = 0;
   Workspace ws_;                     // persistent scratch buffers reused per compute()
+  mutable Upload upload_;            // host-path staging, reused (upload_edge_data)
   std::size_t mem_budget_ = 0;       // see set_memory_policy
   Recompute recompute_ = Recompute::Auto;
 
