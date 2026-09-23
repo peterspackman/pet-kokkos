@@ -125,8 +125,9 @@ inline void add_bias(const View2D& C, const View1D& b) {
 // kernels, and ~6% of an evaluation, per call). A plan -- descriptors plus the
 // heuristic's algorithm -- is cached per shape: the heuristic query alone costs
 // tens of microseconds, and a fixed choice keeps repeated runs bit-identical.
-// Arguments are already in column-major (cuBLAS) order.
-inline void lt_gemm_bias(bool ta, bool tb, int m, int n, int k, float alpha, const float* A,
+// Arguments are already in column-major (cuBLAS) order. Returns whether it ran:
+// the double overload below declines, and the caller adds the bias itself.
+inline bool lt_gemm_bias(bool ta, bool tb, int m, int n, int k, float alpha, const float* A,
                          int lda, const float* B, int ldb, float beta, float* C, int ldc,
                          const float* bias) {
   struct Plan {
@@ -165,6 +166,11 @@ inline void lt_gemm_bias(bool ta, bool tb, int m, int n, int k, float alpha, con
   cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof bias);
   cublasLtMatmul(lt, p.op, &alpha, A, p.a, B, p.b, &beta, C, p.c, C, p.c, &p.algo, ws, kWs,
                  ExecSpace().cuda_stream());
+  return true;
+}
+inline bool lt_gemm_bias(bool, bool, int, int, int, double, const double*, int, const double*, int,
+                         double, double*, int, const double*) {
+  return false;
 }
 #endif
 
@@ -179,11 +185,9 @@ inline void gemm(char transA, char transB, Net alpha, const View2D& A, const Vie
   [[maybe_unused]] const int lda = A.extent(1), ldb = B.extent(1), ldc = C.extent(1);
 
 #if defined(KOKKOS_ENABLE_CUDA)
-  if constexpr (std::is_same_v<Net, float>) {
-    if (has_bias)
-      return lt_gemm_bias(tb, ta, n, m, k, alpha, B.data(), ldb, A.data(), lda, beta, C.data(),
-                          ldc, bias.data());
-  }
+  if (has_bias && lt_gemm_bias(tb, ta, n, m, k, alpha, B.data(), ldb, A.data(), lda, beta,
+                               C.data(), ldc, bias.data()))
+    return;
   vendor_gemm(tb ? CUBLAS_OP_T : CUBLAS_OP_N, ta ? CUBLAS_OP_T : CUBLAS_OP_N, n, m, k, alpha,
               B.data(), ldb, A.data(), lda, beta, C.data(), ldc);
   if (has_bias) add_bias(C, bias);

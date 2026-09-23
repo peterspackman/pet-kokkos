@@ -438,8 +438,7 @@ void gemm_ozaki_nobias(char transA, char transB, Net alpha, const View2D& A, con
         });
   }
 #else
-  (void) cfg;
-  (void) bsplit;
+  (void) cfg, (void) ws, (void) key, (void) bsplit;
   gemm(transA, transB, alpha, A, B, beta, C);
 #endif
 }
