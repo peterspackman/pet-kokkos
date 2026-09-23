@@ -101,7 +101,7 @@ void split_into(Workspace* ws, const std::string& key, const View2D& src, int n_
   out.slices.resize(n_slices);
   for (int t = 0; t < n_slices; ++t) {
     const std::string sk = key + ":osl" + std::to_string(t);
-    out.slices[t] = ws ? ws->i8_any(sk, R, C) : I8View2D(sk, R, C);
+    out.slices[t] = ws ? ws->i8(sk, R, C) : I8View2D(sk, R, C);
   }
   const int S = n_slices;
   // Copy the slice handles into a fixed-size array the device lambda can hold;
@@ -382,7 +382,7 @@ void gemm_ozaki_nobias(char transA, char transB, Net alpha, const View2D& A, con
   // hundreds of megabytes. Allocating it per GEMM would reintroduce exactly the
   // device-synchronising cudaMalloc/cudaFree churn the Workspace exists to
   // avoid.
-  IView2D G = ws.i2_any(key + ":og", m, n);
+  IView2D G = ws.i2(key + ":og", m, n);
   static_assert(sizeof(int) == 4, "the Ozaki accumulator assumes 32-bit int");
 
   const int lda = (int) A.extent(1), ldb = (int) B.extent(1), ldc = n;

@@ -1,10 +1,20 @@
-# The PET network itself. One static library; the forward and the analytic
-# backward stay in a single translation unit (src/model.cpp) because the fused
-# kernels and their adjoints are written against each other and splitting them
-# has only ever made them drift.
+# The PET network itself, one static library. Each piece of the network keeps
+# its forward and its analytic backward side by side in one file -- they are
+# written against each other, and apart they drift.
+#   ops.cpp          dense layers, norms, SwiGLU, compress.0, energy assembly
+#   attention.cpp    attention
+#   feedforward.cpp  the feedforward featurizer
+#   residual.cpp     the residual featurizer
+#   forces.cpp       edge gradients -> forces and virial, adaptive cutoff
+#   model.cpp        loading, upload, packing, readout, compute()
 
 add_library(pet_kokkos STATIC
     model.cpp
+    ops.cpp
+    attention.cpp
+    feedforward.cpp
+    residual.cpp
+    forces.cpp
     device_geometry.cpp
     device_cell_list.cpp
     calculator.cpp

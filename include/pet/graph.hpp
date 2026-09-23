@@ -1,19 +1,15 @@
 // Record-and-replay of an evaluation's device work as one CUDA graph launch.
 //
-// A PET evaluation is ~160 kernel launches and GEMMs whose shapes and buffers are
-// fixed once the shapes are. For a small structure the GPU work takes
-// microseconds and the launches are nearly all of the call. run() does the work
-// eagerly the first time it sees a key, captures it the second time, and from
-// then on replays the captured graph, which is bit-identical: the same kernels,
-// in the same order, on the same buffers.
+// For a small structure the ~160 launches of an evaluation are nearly all of its
+// cost. run() does the work eagerly the first time it sees a key, captures it
+// the second time, and replays the graph after that: the same kernels, in the
+// same order, on the same buffers, so the result is bit-identical.
 //
-// The key must name everything the recorded work depends on -- shapes, where the
-// inputs live, and the workspace's allocation generation -- because a replay
-// re-reads the recorded pointers and re-applies the recorded kernel arguments.
-// Only the most recent graph is kept: a replay after a different key has grown
-// the workspace could reach freed memory, and one graph is what a stepping loop
-// needs anyway. A capture that fails for any reason turns graphs off for good
-// and redoes the work eagerly. CUDA only; elsewhere run() just calls the work.
+// The key must name everything the recorded work depends on -- shapes, where
+// the inputs live, the workspace's allocation generation -- since a replay reuses
+// the recorded pointers and arguments. Only the latest graph is kept, which is
+// what a stepping loop needs. A failed capture turns graphs off and redoes the
+// work eagerly. Off CUDA, run() just does the work.
 #pragma once
 
 #include "pet/kokkos.hpp"
