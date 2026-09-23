@@ -67,46 +67,37 @@ void add_inplace(View2D a, View2D b) {
   Kokkos::parallel_for("add", RangePolicy(0, n), KOKKOS_LAMBDA(int i) { a1(i) += b1(i); });
 }
 
-// Warp-per-row norms: one team (1 thread x 32 vector lanes = a warp) per row,
-// ThreadVectorRange over D -> coalesced reads (consecutive lanes = consecutive
-// memory in LayoutRight) + a warp-shuffle reduction, vs the strided one-thread-
-// per-row pattern.
+// RMSNorm and LayerNorm are one operation: LayerNorm centres (mu = mean) and
+// adds a bias, RMSNorm has mu = 0 and none. One warp per row (a team of 1 x 32
+// vector lanes): coalesced reads and a shuffle reduction. Computed in the network
+// type, as torch does -- fp64 here ran the norms at a fraction of bandwidth on a
+// consumer GPU -- and in two passes, so LayerNorm's variance never subtracts two
+// large squares. The row is re-read from L1, not from memory.
 constexpr int NORM_VEC = 32;
-void rmsnorm(View2D out, View2D in, View1D weight) {
-  const int R = in.extent(0), D = in.extent(1);
-  Kokkos::parallel_for(
-      "rmsnorm", TeamPol(R, 1, NORM_VEC), KOKKOS_LAMBDA(const TeamMem& team) {
-        const int r = team.league_rank();
-        double ms = 0.0;
-        Kokkos::parallel_reduce(
-            Kokkos::ThreadVectorRange(team, D),
-            [&](int d, double& s) { s += (double) in(r, d) * (double) in(r, d); }, ms);
-        const double inv = 1.0 / Kokkos::sqrt(ms / D + RMSNORM_EPS);
-        Kokkos::parallel_for(Kokkos::ThreadVectorRange(team, D),
-                             [&](int d) { out(r, d) = in(r, d) * inv * weight(d); });
-      });
+KOKKOS_INLINE_FUNCTION void row_stats(const TeamMem& team, const View2D& in, int r, bool ln,
+                                      Net& mu, Net& inv) {
+  const int D = in.extent(1);
+  mu = Net(0);
+  if (ln) {
+    Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(team, D), [&](int d, Net& s) { s += in(r, d); }, mu);
+    mu /= D;
+  }
+  Net v = Net(0);
+  Kokkos::parallel_reduce(
+      Kokkos::ThreadVectorRange(team, D), [&](int d, Net& s) { s += (in(r, d) - mu) * (in(r, d) - mu); }, v);
+  inv = Net(1) / Kokkos::sqrt(v / D + Net(ln ? LAYERNORM_EPS : RMSNORM_EPS));
 }
 
-void layernorm(View2D out, View2D in, View1D weight, View1D bias) {
-  const int R = in.extent(0), D = in.extent(1);
+// out = (in - mu) * inv * weight (+ bias). An empty `bias` means RMSNorm.
+void norm_fwd(View2D out, View2D in, View1D weight, View1D bias) {
+  const bool ln = bias.extent(0) > 0;
   Kokkos::parallel_for(
-      "layernorm", TeamPol(R, 1, NORM_VEC), KOKKOS_LAMBDA(const TeamMem& team) {
+      "norm", TeamPol(in.extent(0), 1, NORM_VEC), KOKKOS_LAMBDA(const TeamMem& team) {
         const int r = team.league_rank();
-        // mean and variance in a single warp reduction: E[x] and E[x^2] together,
-        // var = E[x^2] - mu^2 (one reduction instead of two sequential ones).
-        double sx = 0.0, sx2 = 0.0;
-        Kokkos::parallel_reduce(
-            Kokkos::ThreadVectorRange(team, D),
-            [&](int d, double& a, double& b) {
-              const double v = (double) in(r, d);
-              a += v;
-              b += v * v;
-            },
-            sx, sx2);
-        const double mu = sx / D;
-        const double inv = 1.0 / Kokkos::sqrt(sx2 / D - mu * mu + LAYERNORM_EPS);
-        Kokkos::parallel_for(Kokkos::ThreadVectorRange(team, D), [&](int d) {
-          out(r, d) = (in(r, d) - mu) * inv * weight(d) + bias(d);
+        Net mu, inv;
+        row_stats(team, in, r, ln, mu, inv);
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(team, in.extent(1)), [&](int d) {
+          out(r, d) = (in(r, d) - mu) * inv * weight(d) + (ln ? bias(d) : Net(0));
         });
       });
 }
@@ -361,60 +352,26 @@ void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, Vi
   if (f.wi.extent(0) > 0) linear_bwd(ie_adj, g, f.wi);
 }
 
-void rmsnorm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight) {
-  const int R = in.extent(0), D = in.extent(1);
+// in_adj += d(norm)/d(in) . out_adj. With xhat = (in - mu) * inv and gw = out_adj * weight:
+//   in_adj += inv * (gw - [mean(gw) if LayerNorm] - xhat * mean(gw * xhat)).
+void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln) {
+  const int D = in.extent(1);
   Kokkos::parallel_for(
-      "rmsnorm_bwd", TeamPol(R, 1, NORM_VEC), KOKKOS_LAMBDA(const TeamMem& team) {
+      "norm_bwd", TeamPol(in.extent(0), 1, NORM_VEC), KOKKOS_LAMBDA(const TeamMem& team) {
         const int r = team.league_rank();
-        // sum(in^2) and sum(out_adj*weight*in) are independent -> one warp reduction.
-        double ms = 0.0, s = 0.0;
+        Net mu, inv, sg = Net(0), sgx = Net(0);
+        row_stats(team, in, r, ln, mu, inv);
         Kokkos::parallel_reduce(
             Kokkos::ThreadVectorRange(team, D),
-            [&](int d, double& a, double& b) {
-              const double x = (double) in(r, d);
-              a += x * x;
-              b += (double) out_adj(r, d) * weight(d) * x;
-            },
-            ms, s);
-        const double inv = 1.0 / Kokkos::sqrt(ms / D + RMSNORM_EPS);
-        const double coef = inv * inv * inv / D * s;
-        Kokkos::parallel_for(Kokkos::ThreadVectorRange(team, D), [&](int d) {
-          in_adj(r, d) += inv * out_adj(r, d) * weight(d) - coef * in(r, d);
-        });
-      });
-}
-
-void layernorm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight) {
-  const int R = in.extent(0), D = in.extent(1);
-  Kokkos::parallel_for(
-      "layernorm_bwd", TeamPol(R, 1, NORM_VEC), KOKKOS_LAMBDA(const TeamMem& team) {
-        const int r = team.league_rank();
-        // mean + variance in one reduction (E[x], E[x^2]); then the two gradient
-        // sums sg, sgx in one more -> two warp reductions instead of four.
-        double sx = 0.0, sx2 = 0.0;
-        Kokkos::parallel_reduce(
-            Kokkos::ThreadVectorRange(team, D),
-            [&](int d, double& a, double& b) {
-              const double v = (double) in(r, d);
-              a += v;
-              b += v * v;
-            },
-            sx, sx2);
-        const double mu = sx / D;
-        const double inv = 1.0 / Kokkos::sqrt(sx2 / D - mu * mu + LAYERNORM_EPS);
-        double sg = 0.0, sgx = 0.0;
-        Kokkos::parallel_reduce(
-            Kokkos::ThreadVectorRange(team, D),
-            [&](int d, double& a, double& b) {
-              const double gw = (double) out_adj(r, d) * weight(d);
+            [&](int d, Net& a, Net& b) {
+              const Net gw = out_adj(r, d) * weight(d);
               a += gw;
-              b += gw * ((double) in(r, d) - mu) * inv;
+              b += gw * (in(r, d) - mu) * inv;
             },
             sg, sgx);
+        const Net mg = ln ? sg / D : Net(0), mgx = sgx / D;
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(team, D), [&](int d) {
-          const double gd = out_adj(r, d) * weight(d);
-          const double xhat = (in(r, d) - mu) * inv;
-          in_adj(r, d) += inv * (gd - sg / D - xhat * sgx / D);
+          in_adj(r, d) += inv * (out_adj(r, d) * weight(d) - mg - (in(r, d) - mu) * inv * mgx);
         });
       });
 }
@@ -431,10 +388,9 @@ void feedforward_swiglu_bwd(Workspace& ws, const std::string& key, View2D in_adj
     Kokkos::parallel_for(
         "swiglu_bwd", RangePolicy(0, (R) * (dff)),
         KOKKOS_LAMBDA(int _i) { const int r = _i / (dff), c = _i % (dff);
-          const double v = tmp(r, c), g = tmp(r, dff + c);
-          const double sg = sigmoidd(g);
+          const Net v = tmp(r, c), sg = sigmoidd(tmp(r, dff + c));
           tmp_adj(r, c) = h_adj(r, c) * sg;
-          tmp_adj(r, dff + c) = h_adj(r, c) * v * sg * (1.0 - sg);
+          tmp_adj(r, dff + c) = h_adj(r, c) * v * sg * (Net(1) - sg);
         });
   }
   linear_bwd(in_adj, tmp_adj, w_in);
@@ -1065,19 +1021,14 @@ View2D PetModel::conditioning(const DeviceEdgeData& dev, int N, int NS) {
 // --- architecture-varying components (see pet/model.hpp) ---------------------
 
 void PetModel::norm(View2D out, View2D in, const std::string& key) const {
-  if (h_.normalization == Normalization::LayerNorm)
-    layernorm(out, in, vec(key + ".weight"), vec(key + ".bias"));
-  else
-    rmsnorm(out, in, vec(key + ".weight"));
+  const bool ln = h_.normalization == Normalization::LayerNorm;  // RMSNorm has no bias
+  norm_fwd(out, in, vec(key + ".weight"), ln ? vec(key + ".bias") : View1D());
 }
 
 void PetModel::norm_bwd(View2D in_adj, View2D out_adj, View2D in, const std::string& key) const {
-  // Both backwards take the same arguments: the bias is a pure shift, so it does
-  // not enter the input adjoint.
-  if (h_.normalization == Normalization::LayerNorm)
-    layernorm_bwd(in_adj, out_adj, in, vec(key + ".weight"));
-  else
-    rmsnorm_bwd(in_adj, out_adj, in, vec(key + ".weight"));
+  // The bias is a pure shift, so it does not enter the input adjoint.
+  pet::norm_bwd(in_adj, out_adj, in, vec(key + ".weight"),
+                h_.normalization == Normalization::LayerNorm);
 }
 
 int PetModel::ffn_pre_width(const std::string& wkey) const {
@@ -2265,8 +2216,8 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
           input_edge(k, d) += out_edge(k, d);
         });
     View2D comb_norm = ws_.n2("comb_norm", NM, 2 * D);
-    layernorm(comb_norm, concat, vec("combination_norms." + ls + ".weight"),
-              vec("combination_norms." + ls + ".bias"));
+    norm_fwd(comb_norm, concat, vec("combination_norms." + ls + ".weight"),
+             vec("combination_norms." + ls + ".bias"));
     View2D cph = ws_.n2("cph", NM, 2 * D);
     if (grad) sav_cph[L] = ws_.n2("s_cph_" + ls, NM, 2 * D);
     linear_silu(cph, grad ? sav_cph[L] : View2D(), comb_norm,
@@ -2383,7 +2334,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
     View2D cnrm_adj = ws_.n2("cnrm_adj", NM, 2 * D);
     linear_bwd(cnrm_adj, cph_adj, mat("combination_mlps." + ls + ".0.weight"));
     View2D concat_adj = ws_.n2("concat_adj", NM, 2 * D);
-    layernorm_bwd(concat_adj, cnrm_adj, sav_concat[L], vec("combination_norms." + ls + ".weight"));
+    pet::norm_bwd(concat_adj, cnrm_adj, sav_concat[L], vec("combination_norms." + ls + ".weight"), true);
     // out_edge: its direct term, its own concat slot, and the reversed slot of the
     // edge pointing back at it. The reverse map is an involution, so that edge is
     // reverse(k): a gather in a fixed order, never a (float-atomic) scatter.
