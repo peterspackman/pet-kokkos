@@ -130,6 +130,13 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
                                              RView2D re_vec, RView1D re_dist, int E,
                                              const Hypers& h) {
   using RangePolicy = Kokkos::RangePolicy<ExecSpace>;
+  // One warp per atom for the kernels that walk an atom's raw edges: a thread per
+  // atom left a 1728-atom cell with ~54 warps on an 80-SM GPU, while each walked
+  // ~375 edges. Lanes take the edges; sums and slot positions come from ordered
+  // warp reductions and scans, so the results stay reproducible run to run.
+  using AtomTeams = Kokkos::TeamPolicy<ExecSpace>;
+  using Atom = AtomTeams::member_type;
+  constexpr int kLanes = 32;
   using Kokkos::MDRangePolicy;
   using Kokkos::Rank;
 
@@ -185,28 +192,26 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
   }
   dev.raw_off = roff;
 
-  // Partner of each raw edge: (i,j,shift) <-> (j,i,-shift). The list is full
-  // directed and the keep test is symmetric in i and j, so the partner always
-  // exists; -1 is kept as a guard rather than an expectation.
-  //
-  // Found by scanning atom j's own run rather than through a hash map: the runs are
-  // short (one atom's neighbours within the cutoff), it costs no extra memory, and
-  // it happens once per neighbour build rather than once per use.
+  // Partner of each raw edge: (i,j,shift) <-> (j,i,-shift), through a hash of the
+  // raw list. The list is full directed, so the partner always exists; -1 is kept
+  // as a guard rather than an expectation. (Scanning atom j's run instead cost
+  // ~375 compares per edge on a dense cell.) The keep test below is symmetric in
+  // i and j, so the kept edges' reverse map is read off this one.
   IView1D raw_rev = ws.i1("nef:rawrev", E);
   {
+    const uint32_t need = static_cast<uint32_t>(E > 0 ? 2 * E + 16 : 16);
+    if (edge_map.capacity() < need) edge_map.rehash(need);
+    edge_map.clear();
+    auto key = KOKKOS_LAMBDA(int e, int sign) {
+      return sign > 0 ? detail::pet_pack_key(re_i(e), re_j(e), re_shift(e, 0), re_shift(e, 1), re_shift(e, 2))
+                      : detail::pet_pack_key(re_j(e), re_i(e), -re_shift(e, 0), -re_shift(e, 1), -re_shift(e, 2));
+    };
+    Kokkos::parallel_for(
+        "pet_raw_hash", RangePolicy(0, E), KOKKOS_LAMBDA(int e) { edge_map.insert(key(e, 1), e); });
     Kokkos::parallel_for(
         "pet_raw_reverse", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
-          const int i = re_i(e), j = re_j(e);
-          const int sa = -re_shift(e, 0), sb = -re_shift(e, 1), sc = -re_shift(e, 2);
-          int found = -1;
-          for (int f = roff(j); f < roff(j + 1); ++f) {
-            if (re_j(f) == i && re_shift(f, 0) == sa && re_shift(f, 1) == sb &&
-                re_shift(f, 2) == sc) {
-              found = f;
-              break;
-            }
-          }
-          raw_rev(e) = found;
+          const uint32_t idx = edge_map.find(key(e, -1));
+          raw_rev(e) = edge_map.valid_at(idx) ? edge_map.value_at(idx) : -1;
         });
   }
   dev.raw_reverse = raw_rev;
@@ -233,8 +238,8 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
     // crosses `target` exactly once. [0, r_max] therefore brackets the root from
     // the start and never has to be widened.
     //
-    // One thread per atom over its own contiguous raw-edge range. That is not
-    // just convenient: the per-atom sums accumulate in a fixed order with no
+    // One warp per atom over its own contiguous raw-edge range. That is not
+    // just convenient: the per-atom sums reduce in a fixed order with no
     // atomics, so the root -- and hence which edges survive the keep test below
     // -- is reproducible run to run. A float-atomic reduction here would put
     // last-bit noise directly into a discrete keep/drop decision.
@@ -247,22 +252,25 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
     // solve just to recover dn/dr).
     RView1D ar = ws.r1("nef:adapt_r", N), adn = ws.r1("nef:adapt_dn", N);
     Kokkos::parallel_for(
-        "pet_adapt_solver", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
-          const int e0 = roff(a), e1 = roff(a + 1);
-          double r_lo = 0.0, r_hi = rmax, r = 0.5 * rmax;
-          double n = 0.0, dn = 0.0;
-          for (int it = 0; it < detail::PET_SOLVER_ITERS; ++it) {
-            n = 0.0;
-            dn = 0.0;
-            for (int e = e0; e < e1; ++e) {
-              const double d = re_dist(e);
-              n += detail::dev_bump_cutoff(d, r, width_adaptive);
-              dn += detail::dev_bump_dcutoff_dr(d, r, width_adaptive);
-            }
+        "pet_adapt_solver", AtomTeams(N, 1, kLanes), KOKKOS_LAMBDA(const Atom& t) {
+          const int a = t.league_rank();
+          // n_total(r) and its slope, over this atom's raw edges and the baseline.
+          auto count = [&](double r, double& n, double& dn) {
+            n = dn = 0.0;
+            Kokkos::parallel_reduce(
+                Kokkos::ThreadVectorRange(t, roff(a), roff(a + 1)),
+                [&](int e, double& sn, double& sdn) {
+                  sn += detail::dev_bump_cutoff(re_dist(e), r, width_adaptive);
+                  sdn += detail::dev_bump_dcutoff_dr(re_dist(e), r, width_adaptive);
+                },
+                n, dn);
             const double x = r * inv_rmax;
             n += target * x * x * x;
             dn += 3.0 * target * x * x * inv_rmax;
-
+          };
+          double r_lo = 0.0, r_hi = rmax, r = 0.5 * rmax, n, dn;
+          for (int it = 0; it < detail::PET_SOLVER_ITERS; ++it) {
+            count(r, n, dn);
             const double f = n - target;
             if (f <= 0.0) r_lo = r; else r_hi = r;
             // A Newton step, unless it would leave the bracket -- which happens
@@ -274,30 +282,20 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
           }
           // Re-evaluate at the final r: the loop's n/dn are from the previous
           // iterate, and the implicit-function step below needs both AT the root.
-          n = 0.0;
-          dn = 0.0;
-          for (int e = e0; e < e1; ++e) {
-            const double d = re_dist(e);
-            n += detail::dev_bump_cutoff(d, r, width_adaptive);
-            dn += detail::dev_bump_dcutoff_dr(d, r, width_adaptive);
-          }
-          {
-            const double x = r * inv_rmax;
-            n += target * x * x * x;
-            dn += 3.0 * target * x * x * inv_rmax;
-          }
+          count(r, n, dn);
           const double dn_root = Kokkos::fmax(dn, detail::PET_SOLVER_DN_FLOOR);
           // One trailing implicit-function step. In the converged regime the
           // residual is at float noise and this moves nothing; its purpose is to
           // be the point the BACKWARD differentiates, so gradients reach the
           // distances through the residual instead of through ten iterations.
-          double adapted = r - (n - target) / dn_root;
-          adapted = Kokkos::fmin(Kokkos::fmax(adapted, lo_bound), rmax);
-          acut(a) = adapted;
-          ar(a) = r;
-          // Sign the slope so the backward knows the clamp was active without
-          // recomputing the bound: a clamped cutoff has no gradient.
-          adn(a) = (adapted > lo_bound && adapted < rmax) ? dn_root : 0.0;
+          const double adapted = Kokkos::fmin(Kokkos::fmax(r - (n - target) / dn_root, lo_bound), rmax);
+          Kokkos::single(Kokkos::PerThread(t), [&] {
+            acut(a) = adapted;
+            ar(a) = r;
+            // Sign the slope so the backward knows the clamp was active without
+            // recomputing the bound: a clamped cutoff has no gradient.
+            adn(a) = (adapted > lo_bound && adapted < rmax) ? dn_root : 0.0;
+          });
         });
     dev.adapt_r = ar;
     dev.adapt_dn = adn;
@@ -457,10 +455,6 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
   Kokkos::deep_copy(ExecSpace(), slot, 0);  // accumulator, zeroed explicitly
   IView1D flat_of_edge = ws.i1("nef:flat_edge", E);  // flat NEF index per kept edge (-1 if dropped)
   Kokkos::deep_copy(ExecSpace(), flat_of_edge, -1);
-  // reuse the persistent reverse-matching map: grow capacity if needed, then clear
-  const uint32_t need = static_cast<uint32_t>(E > 0 ? 2 * E + 16 : 16);
-  if (edge_map.capacity() < need) edge_map.rehash(need);
-  edge_map.clear();
 
   {
     auto neigh_species = dev.neigh_species;
@@ -469,46 +463,46 @@ inline DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, i
     auto mask = dev.mask;
     auto pair_cutoff = dev.pair_cutoff;
     auto cutoff_factor = dev.cutoff_factor;
-    // One thread per ATOM, walking its own edges in index order, so slot s is a
-    // function of the edge list alone. This was an atomic_fetch_add over all edges,
-    // which handed out slots in thread-arrival order -- so an atom's neighbours
-    // landed in a different order every run, and since the network is fp32 every
-    // reduction over the neighbour axis (attention softmax, message sums) rounded
-    // differently. That was the single largest source of PET's run-to-run
-    // nondeterminism, ~1000x the residual from the force scatter.
+    // Slot s of atom i is the number of i's kept edges before this one, in edge
+    // order -- an ordered warp scan -- so it is a function of the edge list alone.
+    // This was an atomic_fetch_add over all edges, which handed out slots in
+    // thread-arrival order -- so an atom's neighbours landed in a different order
+    // every run, and since the network is fp32 every reduction over the neighbour
+    // axis (attention softmax, message sums) rounded differently. That was the
+    // single largest source of PET's run-to-run nondeterminism, ~1000x the
+    // residual from the force scatter.
     Kokkos::parallel_for(
-        "pet_scatter", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
-          int s = 0;
-          for (int e = roff(i); e < roff(i + 1); ++e) {
-            if (!keepv(e)) continue;
-            const int j = re_j(e);
-            const int flat = i * M + s;
-            ++s;
-            flat_of_edge(e) = flat;
-            edge_vec(flat, 0) = re_vec(e, 0);
-            edge_vec(flat, 1) = re_vec(e, 1);
-            edge_vec(flat, 2) = re_vec(e, 2);
-            dist(flat) = re_dist(e);
-            neigh_species(flat) = species(j);
-            cutoff_factor(flat) = static_cast<Net>(factorv(e));
-            pair_cutoff(flat) = rcv(e);
-            mask(flat) = 1.0;
-            edge_map.insert(
-                detail::pet_pack_key(i, j, re_shift(e, 0), re_shift(e, 1), re_shift(e, 2)), flat);
-          }
+        "pet_scatter", AtomTeams(N, 1, kLanes), KOKKOS_LAMBDA(const Atom& t) {
+          const int i = t.league_rank();
+          // Zero-based range, offset by hand: Kokkos 5.0.2's CUDA vector scan
+          // ignores a ThreadVectorRange's begin and walks [0, end).
+          const int e0 = roff(i);
+          Kokkos::parallel_scan(
+              Kokkos::ThreadVectorRange(t, roff(i + 1) - e0), [&](int q, int& s, bool final) {
+                const int e = e0 + q;
+                if (final && keepv(e)) {
+                  const int flat = i * M + s;
+                  flat_of_edge(e) = flat;
+                  edge_vec(flat, 0) = re_vec(e, 0);
+                  edge_vec(flat, 1) = re_vec(e, 1);
+                  edge_vec(flat, 2) = re_vec(e, 2);
+                  dist(flat) = re_dist(e);
+                  neigh_species(flat) = species(re_j(e));
+                  cutoff_factor(flat) = static_cast<Net>(factorv(e));
+                  pair_cutoff(flat) = rcv(e);
+                  mask(flat) = 1.0;
+                }
+                s += keepv(e);
+              });
         });
   }
 
-  // ---- reverse-edge index: match (i,j,shift) with (j,i,-shift) ----
+  // ---- reverse-edge index: the kept edge's partner is its raw partner's slot ----
   {
     auto reverse_index = dev.reverse_index;
     Kokkos::parallel_for(
         "pet_reverse", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
-          if (!keepv(e)) return;
-          const uint64_t rkey = detail::pet_pack_key(re_j(e), re_i(e), -re_shift(e, 0),
-                                                     -re_shift(e, 1), -re_shift(e, 2));
-          const uint32_t idx = edge_map.find(rkey);
-          reverse_index(flat_of_edge(e)) = edge_map.valid_at(idx) ? edge_map.value_at(idx) : -1;
+          if (keepv(e)) reverse_index(flat_of_edge(e)) = raw_rev(e) >= 0 ? flat_of_edge(raw_rev(e)) : -1;
         });
   }
 

@@ -21,6 +21,43 @@ KOKKOS_INLINE_FUNCTION int floor_div(int a, int n) {
 }
 KOKKOS_INLINE_FUNCTION int floor_mod(int a, int n) { return a - floor_div(a, n) * n; }
 
+// The cell-list search for one atom, shared by the count and fill passes so the
+// two cannot disagree about which candidates are edges.
+struct CellSearch {
+  IView1D sid, abin, goff, bstart, batom;
+  IView2D gnc, gnr;
+  RView2D posw, scell;
+  double cutoff2;
+
+  // hits(bin_start, n_members, shift) for each of atom gi's candidate bins,
+  // where `shift` is that bin's lattice image.
+  template <class F>
+  KOKKOS_INLINE_FUNCTION void visit(int gi, F&& hits) const {
+    const int b = sid(gi);
+    const int nca = gnc(b, 0), ncb = gnc(b, 1), ncc = gnc(b, 2);
+    const int nra = gnr(b, 0), nrb = gnr(b, 1), nrc = gnr(b, 2);
+    const int loc = abin(gi) - goff(b);  // this atom's own bin, from the flat index
+    const int ca = loc / (ncb * ncc), cb = (loc / ncc) % ncb, cc = loc % ncc;
+    for (int da = -nra; da <= nra; ++da)
+      for (int db = -nrb; db <= nrb; ++db)
+        for (int dc = -nrc; dc <= nrc; ++dc) {
+          // Fold the target bin back into the box; the quotient is the image.
+          const int ta = ca + da, tb = cb + db, tc = cc + dc;
+          const int sh[3] = {floor_div(ta, nca), floor_div(tb, ncb), floor_div(tc, ncc)};
+          const int bin = goff(b) + (floor_mod(ta, nca) * ncb + floor_mod(tb, ncb)) * ncc + floor_mod(tc, ncc);
+          hits(bstart(bin), bstart(bin + 1) - bstart(bin), sh);
+        }
+  }
+  // v <- the vector from gi to candidate j's image, v[3] <- its square; true if an edge.
+  KOKKOS_INLINE_FUNCTION bool edge(int gi, int j, const int* sh, double* v) const {
+    const int b = sid(gi);
+    for (int d = 0; d < 3; ++d)  // in this order: the image offset first, then the atom
+      v[d] = posw(j, d) + (sh[0] * scell(b, d) + sh[1] * scell(b, 3 + d) + sh[2] * scell(b, 6 + d) - posw(gi, d));
+    v[3] = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    return v[3] >= 1e-24 && v[3] <= cutoff2;
+  }
+};
+
 }  // namespace
 
 DeviceSearch& device_search() {
@@ -133,91 +170,55 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
       });
   IView1D fill = ws.i1("cl_fill", nbins);
   Kokkos::deep_copy(ExecSpace(), fill, 0);  // atomic accumulator
-  IView1D batom = ws.i1("cl_batom", Ntot);
+  IView1D bunsorted = ws.i1("cl_batom_fill", Ntot), batom = ws.i1("cl_batom", Ntot);
   Kokkos::parallel_for(
       "cl_fill", RangePolicy(0, Ntot), KOKKOS_LAMBDA(int gi) {
         const int c = abin(gi);
-        batom(bstart(c) + Kokkos::atomic_fetch_add(&fill(c), 1)) = gi;
+        bunsorted(bstart(c) + Kokkos::atomic_fetch_add(&fill(c), 1)) = gi;
       });
   // The fill above used an atomic counter, so membership order is thread-arrival
-  // order and differs run to run. Sort each bin by atom index: bins hold a
-  // handful of atoms, so an insertion sort per bin is cheap, and without it the
-  // neighbour list -- and therefore the energy's last bits -- would not be
-  // reproducible. See the header.
+  // order and differs run to run. Put each bin in atom-index order -- without it
+  // the neighbour list, and therefore the energy's last bits, would not be
+  // reproducible (see the header). One warp per bin, each lane placing its atoms
+  // at their rank among the bin's: a big cell at a long cutoff has only a few
+  // bins of hundreds of atoms, and a sequential sort per bin was a long chain.
   Kokkos::parallel_for(
-      "cl_sortbins", RangePolicy(0, nbins), KOKKOS_LAMBDA(int c) {
-        const int lo = bstart(c), hi = bstart(c + 1);
-        for (int a = lo + 1; a < hi; ++a) {
-          const int v = batom(a);
-          int k = a - 1;
-          while (k >= lo && batom(k) > v) {
-            batom(k + 1) = batom(k);
-            --k;
-          }
-          batom(k + 1) = v;
-        }
+      "cl_sortbins", Kokkos::TeamPolicy<ExecSpace>(nbins, 1, 32),
+      KOKKOS_LAMBDA(const Kokkos::TeamPolicy<ExecSpace>::member_type& t) {
+        const int lo = bstart(t.league_rank()), n = bstart(t.league_rank() + 1) - lo;
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, n), [&](int q) {
+          const int a = bunsorted(lo + q);
+          int rank = 0;
+          for (int p = 0; p < n; ++p) rank += bunsorted(lo + p) < a;
+          batom(lo + rank) = a;
+        });
       });
 
   // ---- count, scan, fill ---------------------------------------------------
-  // The search body, run twice: once counting, once writing. A lambda would be
-  // cleaner but cannot be shared between two kernels without giving up the
-  // compile-time `write` branch, and the count pass must not pay for the stores.
+  // One warp per atom: its lanes take the members of each candidate bin. (A
+  // thread per atom left a 1728-atom cell with ~54 warps on the whole GPU, each
+  // walking ~27 bins.) The fill pass places each hit with an ordered warp scan,
+  // so the edge list comes out in exactly the order a sequential walk would give
+  // -- bins in fixed order, members sorted by atom index.
+  using Teams = Kokkos::TeamPolicy<ExecSpace>;
+  using Team = Teams::member_type;
   IView1D ecnt = ws.i1("cl_ecnt", Ntot);
   IView1D eoff = ws.i1("cl_eoff", Ntot + 1);
-
-#define PET_CL_SEARCH(WRITE)                                                                  \
-  const int b = sid(gi);                                                                      \
-  const double xi = posw(gi, 0), yi = posw(gi, 1), zi = posw(gi, 2);                          \
-  const int nca = gnc(b, 0), ncb = gnc(b, 1), ncc = gnc(b, 2);                                \
-  const int nra = gnr(b, 0), nrb = gnr(b, 1), nrc = gnr(b, 2);                                \
-  /* This atom's own bin, recovered from the flat index. */                                   \
-  const int loc = abin(gi) - goff(b);                                                         \
-  const int ca = loc / (ncb * ncc), cb = (loc / ncc) % ncb, cc = loc % ncc;                    \
-  int e = WRITE ? eoff(gi) : 0;                                                               \
-  for (int da = -nra; da <= nra; ++da)                                                        \
-    for (int db = -nrb; db <= nrb; ++db)                                                      \
-      for (int dc = -nrc; dc <= nrc; ++dc) {                                                  \
-        /* Fold the target bin back into the box; the quotient is the image. */               \
-        const int ta = ca + da, tb = cb + db, tc = cc + dc;                                   \
-        const int sa = floor_div(ta, nca), sb = floor_div(tb, ncb), sc = floor_div(tc, ncc);  \
-        const int wa = floor_mod(ta, nca), wb = floor_mod(tb, ncb), wc = floor_mod(tc, ncc);  \
-        const int bin = goff(b) + (wa * ncb + wb) * ncc + wc;                                 \
-        const double shx = sa * scell(b, 0) + sb * scell(b, 3) + sc * scell(b, 6) - xi;       \
-        const double shy = sa * scell(b, 1) + sb * scell(b, 4) + sc * scell(b, 7) - yi;       \
-        const double shz = sa * scell(b, 2) + sb * scell(b, 5) + sc * scell(b, 8) - zi;       \
-        for (int k = bstart(bin); k < bstart(bin + 1); ++k) {                                 \
-          const int j = batom(k);                                                             \
-          const double vx = posw(j, 0) + shx, vy = posw(j, 1) + shy, vz = posw(j, 2) + shz;   \
-          const double d2 = vx * vx + vy * vy + vz * vz;                                      \
-          if (d2 < 1e-24 || d2 > cutoff2) continue;                                           \
-          if (WRITE) {                                                                        \
-            re_i(e) = gi;                                                                     \
-            re_j(e) = j;                                                                      \
-            re_shift(e, 0) = sa;                                                               \
-            re_shift(e, 1) = sb;                                                               \
-            re_shift(e, 2) = sc;                                                               \
-            re_vec(e, 0) = vx;                                                                \
-            re_vec(e, 1) = vy;                                                                \
-            re_vec(e, 2) = vz;                                                                \
-            re_dist(e) = Kokkos::sqrt(d2);                                                    \
-          }                                                                                   \
-          ++e;                                                                                \
-        }                                                                                     \
-      }
-
-  {
-    // Unused in the counting pass, but the macro names them.
-    IView1D re_i, re_j;
-    IView2D re_shift;
-    RView2D re_vec;
-    RView1D re_dist;
-    (void) re_i; (void) re_j; (void) re_shift; (void) re_vec; (void) re_dist;
-    Kokkos::parallel_for(
-        "cl_ecount", RangePolicy(0, Ntot), KOKKOS_LAMBDA(int gi) {
-          PET_CL_SEARCH(false)
-          ecnt(gi) = e;
+  const CellSearch cs{sid, abin, goff, bstart, batom, gnc, gnr, posw, scell, cutoff2};
+  Kokkos::parallel_for(
+      "cl_ecount", Teams(Ntot, 1, 32), KOKKOS_LAMBDA(const Team& t) {
+        const int gi = t.league_rank();
+        int e = 0;
+        cs.visit(gi, [&](int k0, int nk, const int* sh) {
+          int found = 0;
+          Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(t, nk), [&](int q, int& c) {
+            double v[4];
+            c += cs.edge(gi, batom(k0 + q), sh, v);
+          }, found);
+          e += found;
         });
-  }
+        Kokkos::single(Kokkos::PerThread(t), [&] { ecnt(gi) = e; });
+      });
   Kokkos::parallel_scan(
       "cl_escan", RangePolicy(0, Ntot), KOKKOS_LAMBDA(int gi, int& upd, bool final) {
         if (final) eoff(gi) = upd;
@@ -245,11 +246,28 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
   // corrupts a live buffer. Silent either way.
   IView1D wrote = ws.i1("cl_wrote", Ntot);
   Kokkos::parallel_for(
-      "cl_efill", RangePolicy(0, Ntot), KOKKOS_LAMBDA(int gi) {
-        PET_CL_SEARCH(true)
-        wrote(gi) = e - eoff(gi);
+      "cl_efill", Teams(Ntot, 1, 32), KOKKOS_LAMBDA(const Team& t) {
+        const int gi = t.league_rank();
+        int e = eoff(gi);
+        cs.visit(gi, [&](int k0, int nk, const int* sh) {
+          int found = 0;
+          Kokkos::parallel_scan(Kokkos::ThreadVectorRange(t, nk), [&](int q, int& pos, bool final) {
+            const int j = batom(k0 + q);
+            double v[4];
+            const bool hit = cs.edge(gi, j, sh, v);
+            if (final && hit) {
+              const int w = e + pos;
+              re_i(w) = gi;
+              re_j(w) = j;
+              for (int d = 0; d < 3; ++d) re_shift(w, d) = sh[d], re_vec(w, d) = v[d];
+              re_dist(w) = Kokkos::sqrt(v[3]);
+            }
+            pos += hit;
+          }, found);
+          e += found;
+        });
+        Kokkos::single(Kokkos::PerThread(t), [&] { wrote(gi) = e - eoff(gi); });
       });
-#undef PET_CL_SEARCH
   {
     int mismatch = 0;
     Kokkos::parallel_reduce(
