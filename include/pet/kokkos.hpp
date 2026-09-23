@@ -91,6 +91,53 @@ class Workspace {
   I8View2D i8(const std::string& k, int r, int c) { return get2<I8View2D, int8_t>(i8_, k, r, c); }
   IView1D i1(const std::string& k, int n) { return get1<IView1D, int>(i1_, k, n); }
 
+  // Temporaries whose lifetime is a C++ scope. tmp() hands out a pooled buffer
+  // that no open Scope holds -- the smallest that fits, else the largest free one
+  // regrown -- and a Scope gives back everything handed out since it opened.
+  //
+  // Keying buffers by name holds each name's buffer for the whole evaluation, so
+  // forward temporaries and backward temporaries -- never live at the same time
+  // -- each cost their own memory, as did every layer's copy of a per-layer
+  // label. With lexical lifetimes they share: on pet-omat-l the named working
+  // set was ~50 [edges x d_pet] buffers. The same call sequence gets the same
+  // buffers, so this is deterministic; steady state allocates nothing.
+  //
+  // Use it only for values that die with the enclosing Scope. A saved activation,
+  // or anything peek2() retrieves, keeps a name.
+  class Scope {
+   public:
+    explicit Scope(Workspace& w) : ws_(w), mark_(w.held_.size()) {}
+    ~Scope() {
+      for (; ws_.held_.size() > mark_; ws_.held_.pop_back()) ws_.busy_[ws_.held_.back()] = false;
+    }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+   private:
+    Workspace& ws_;
+    std::size_t mark_;
+  };
+  View2D tmp(int r, int c) {
+    const std::size_t need = std::size_t(r) * std::size_t(c);
+    int fit = -1, grow = -1;
+    for (int i = 0; i < (int) tmp_.size(); ++i) {
+      if (busy_[i]) continue;
+      const std::size_t cap = tmp_[i].extent(0);
+      if (cap >= need && (fit < 0 || cap < tmp_[fit].extent(0))) fit = i;
+      if (cap < need && (grow < 0 || cap > tmp_[grow].extent(0))) grow = i;
+    }
+    if (fit < 0) {
+      fit = grow >= 0 ? grow : (int) tmp_.size();
+      if (grow < 0) tmp_.emplace_back(), busy_.push_back(false);
+      tmp_[fit] = View1D();  // free before growing, so the old and new never coexist
+      tmp_[fit] = View1D("ws:tmp", need);
+    }
+    busy_[fit] = true;
+    held_.push_back(fit);
+    View2D v(tmp_[fit].data(), r, c);
+    if (zero_) Kokkos::deep_copy(ExecSpace(), v, Net(0));
+    return v;
+  }
   // Capacity-keyed 2-D scratch: reuse whenever the buffer holds enough ELEMENTS,
   // whatever shape they were last used in. i2()/i8() above reuse only when the
   // column count matches exactly, because they hand back a row prefix and a row
@@ -104,20 +151,6 @@ class Workspace {
   //
   // Reshaping is safe here because the view is unmanaged over a contiguous
   // buffer: any [r,c] with r*c <= capacity is a valid LayoutRight view of it.
-  // Shared scratch for a buffer whose life is one layer's forward or backward.
-  //
-  // n2() keys by label, and PET's labels carry the layer they belong to, so a
-  // per-layer temporary is held for the whole evaluation once per layer -- G*A
-  // copies of something only one layer ever uses at a time. On a 512-atom cell
-  // with pet-mad-m that was ~4.3 GiB of an 11 GiB pool. Giving those buffers one
-  // shape-independent key collapses each family to a single buffer.
-  //
-  // Use this ONLY for a buffer no later layer reads back. Anything peek2() or a
-  // backward pass retrieves is a saved activation, not scratch, and must keep
-  // its per-layer key.
-  View2D n2_any(const std::string& k, int r, int c) {
-    return get2_any<View2D, View1D, Net>(n2cap_, k, r, c);
-  }
   IView2D i2_any(const std::string& k, int r, int c) {
     return get2_any<IView2D, IView1D, int>(i2cap_, k, r, c);
   }
@@ -154,7 +187,7 @@ class Workspace {
     for (const auto& kv : i2_) b += kv.second.span() * sizeof(int);
     for (const auto& kv : i1_) b += kv.second.span() * sizeof(int);
     for (const auto& kv : i8_) b += kv.second.span() * sizeof(int8_t);
-    for (const auto& kv : n2cap_) b += kv.second.span() * sizeof(Net);
+    for (const auto& v : tmp_) b += v.span() * sizeof(Net);
     for (const auto& kv : i2cap_) b += kv.second.span() * sizeof(int);
     for (const auto& kv : i8cap_) b += kv.second.span() * sizeof(int8_t);
     return b;
@@ -176,7 +209,7 @@ class Workspace {
     add(i2_, sizeof(int));
     add(i1_, sizeof(int));
     add(i8_, sizeof(int8_t));
-    add(n2cap_, sizeof(Net));
+    for (const auto& t : tmp_) v.emplace_back("ws:tmp", t.span() * sizeof(Net));
     add(i2cap_, sizeof(int));
     add(i8cap_, sizeof(int8_t));
     std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -239,7 +272,9 @@ class Workspace {
   std::unordered_map<std::string, IView2D> i2_;
   std::unordered_map<std::string, IView1D> i1_;
   std::unordered_map<std::string, I8View2D> i8_;
-  std::unordered_map<std::string, View1D> n2cap_;
+  std::vector<View1D> tmp_;          // tmp() pool
+  std::vector<bool> busy_;           // held by an open Scope
+  std::vector<std::size_t> held_;    // tmp_ indices, in hand-out order
   std::unordered_map<std::string, IView1D> i2cap_;
   std::unordered_map<std::string, I8View1D> i8cap_;
   std::unordered_map<std::string, View2D> cur2_;  // current logical n2 view per key (for peek2)

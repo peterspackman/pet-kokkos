@@ -143,6 +143,16 @@ struct CompressFold {
   WeightRef wi;  // [D,D] the input_edge block; empty at layer 0, where it is in `tab`
 };
 
+// What one GNN layer of the feedforward featurizer saves for its backward.
+// Workspace keys carry `tag`: the layer index normally, or one shared tag when
+// the backward re-runs each layer's forward (Recompute::Layers), so that only
+// one layer's worth is ever held.
+struct LayerSaves {
+  std::string tag;
+  View2D cpre, concat, cph;                                              // per layer
+  std::vector<View2D> tokens, qkv, node_new, tmp_center, eps, tmp_edge;  // per attention block
+};
+
 class PetModel {
  public:
   explicit PetModel(const Checkpoint& ckpt);
@@ -228,6 +238,17 @@ class PetModel {
   EnergyResult compute(const DeviceEdgeData& dev, std::vector<double>* host_forces,
                        RView2D* dev_forces, RView1D* dev_per_atom = nullptr,
                        RView2D* dev_virial = nullptr);
+
+  // One GNN layer of the feedforward featurizer. Forward: node is re-pointed at
+  // the layer's output and input_edge is updated in place; `sav` null saves
+  // nothing, and `save_wide` says whether qkv and the edge MLP's pre-activation
+  // are kept (see Recompute). Backward: node_adj / input_edge_adj arrive as the
+  // adjoints of the layer's outputs and leave as those of its inputs; the
+  // geometry and attention-bias adjoints accumulate. Public for nvcc, as above.
+  void ff_layer(const DeviceEdgeData& dev, int L, View2D& node, View2D input_edge, View2D cond,
+                LayerSaves* sav, bool save_wide);
+  void ff_layer_bwd(const DeviceEdgeData& dev, int L, const LayerSaves& sav, bool kept_wide,
+                    View2D node_adj, View2D input_edge_adj, View2D edge_in4_adj, View2D cf_seq_adj);
 
   // Per-atom charge/spin conditioning features, or an empty View when the model
   // is not conditioned. Computed once per evaluation and added to the node

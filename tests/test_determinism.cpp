@@ -17,6 +17,7 @@
 // since a tensor-core GEMM is its own source of run-to-run variation.
 #include <catch2/catch_test_macros.hpp>
 
+#include <memory>
 #include <vector>
 
 #include "pet/calculator.hpp"
@@ -187,21 +188,25 @@ TEST_CASE("a reused Calculator gives the same batched answer every time",
 }
 
 TEST_CASE("recomputing activations in the backward changes nothing", "[model][determinism]") {
-  // Recompute::Always rebuilds qkv and the edge MLP's pre-activation from the
-  // saved norm inputs with the same kernels on the same data, so the answer must
-  // be bit-identical to keeping them -- anything else means the rebuild is not
-  // the forward it claims to be.
+  // Every recompute tier re-runs the same kernels on the same data, so the answer
+  // must be bit-identical to keeping everything -- anything else means a rebuild
+  // is not the forward it claims to be.
   for (const auto& model : golden_models()) {
     const auto found = find_model(model);
     if (!found) continue;
-    pet::Options keep, rebuild;
-    keep.recompute = pet::Recompute::Never;
-    rebuild.recompute = pet::Recompute::Always;
-    pet::Calculator a(found->first, found->second, keep), b(found->first, found->second, rebuild);
+    auto calc = [&](pet::Recompute r) {
+      pet::Options o;
+      o.recompute = r;
+      return std::make_unique<pet::Calculator>(found->first, found->second, o);
+    };
+    auto keep = calc(pet::Recompute::Never), wide = calc(pet::Recompute::Wide),
+         layers = calc(pet::Recompute::Layers);
     for (const auto& path : golden_paths(model)) {
       const Golden g = load_golden(path);
       DYNAMIC_SECTION(model << " / " << g.name) {
-        require_bit_identical(a.compute(g.system, true), b.compute(g.system, true), "recompute");
+        const pet::Results ref = keep->compute(g.system, true);
+        require_bit_identical(ref, wide->compute(g.system, true), "Recompute::Wide");
+        require_bit_identical(ref, layers->compute(g.system, true), "Recompute::Layers");
       }
     }
   }

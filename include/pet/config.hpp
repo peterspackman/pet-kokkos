@@ -21,10 +21,12 @@ enum class CutoffFunction { Bump, Cosine };
 // from Grid to Solver -- so a checkpoint that does not say which it used is one
 // trained before the choice existed, i.e. Grid.
 enum class AdaptiveCutoffMethod { Grid, Solver };
-// Whether the backward recomputes the widest saved activations (attention qkv and
-// the edge MLP's pre-activation) instead of keeping them from the forward. Auto
-// recomputes only when keeping them would exceed the memory budget.
-enum class Recompute { Auto, Always, Never };
+// How much of the forward the backward recomputes rather than keeps, cheapest in
+// time first: Never; Wide -- the two widest saved activations (attention qkv and
+// the edge MLP's pre-activation), each one norm and one GEMM from a saved input;
+// Layers -- keep only each GNN layer's inputs and re-run one layer's forward at a
+// time (about one extra forward pass). Auto picks the first that fits the budget.
+enum class Recompute { Auto, Never, Wide, Layers };
 
 struct Hypers {
   int d_pet = 128;            // edge/transformer model dim

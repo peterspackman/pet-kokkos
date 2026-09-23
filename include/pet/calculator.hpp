@@ -78,11 +78,11 @@ struct Options {
   // Device memory a batch may occupy, in bytes. 0 queries the device.
   std::size_t memory_budget_bytes = 0;
 
-  // Recompute the two widest saved activations in the backward rather than keep
-  // them: ~40% less memory for a force evaluation, for ~10% more GEMM work. Auto
-  // does it only when keeping them would not fit the memory budget above -- for
-  // the large models that is the difference between running and spilling to host
-  // memory (pet-omat-l at 1728 atoms: 12 s -> under 1 s on a 16 GiB card).
+  // How much of the forward the backward recomputes instead of keeping (see
+  // pet::Recompute). Auto keeps everything that fits the memory budget above and
+  // steps down only when it must -- for the large models that is the difference
+  // between running and spilling to host memory (pet-omat-l at 1728 atoms: 12 s
+  // -> 0.6 s on a 16 GiB card).
   Recompute recompute = Recompute::Auto;
 
   // Hard cap on atoms per batch, ahead of the memory estimate. 0 = derive it.
