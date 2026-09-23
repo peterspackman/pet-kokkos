@@ -11,10 +11,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <cstring>
 #include <fstream>
-#include <iostream>
 #include <map>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -153,72 +152,67 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
   return true;
 }
 
+// The model's properties as (key, JSON value) pairs, for --info in either form.
+std::vector<std::pair<std::string, std::string>> model_fields(const Args& a, const pet::Calculator& calc) {
+  const pet::Hypers& h = calc.hypers();
+  auto str = [](const char* v) { return std::string("\"") + v + "\""; };
+  auto num = [](double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%g", v);
+    return std::string(buf);
+  };
+  auto flag = [](bool v) { return std::string(v ? "true" : "false"); };
+  using pet::FeaturizerType, pet::TransformerType, pet::Normalization, pet::Activation;
+  return {
+      {"model", str(a.model_spec.c_str())},
+      {"featurizer", str(h.featurizer_type == FeaturizerType::Residual ? "residual" : "feedforward")},
+      {"transformer", str(h.transformer_type == TransformerType::PreLN ? "PreLN" : "PostLN")},
+      {"normalization", str(h.normalization == Normalization::RMSNorm ? "RMSNorm" : "LayerNorm")},
+      {"activation", str(h.activation == Activation::SwiGLU ? "SwiGLU" : "SiLU")},
+      {"cutoff_function", str(h.cutoff_function == pet::CutoffFunction::Bump ? "Bump" : "Cosine")},
+      {"cutoff", num(h.cutoff)},
+      {"cutoff_width", num(h.cutoff_width)},
+      {"cutoff_width_adaptive", num(h.cutoff_width_adaptive)},
+      {"num_neighbors_adaptive", num(h.num_neighbors_adaptive)},
+      {"adaptive_cutoff_method",
+       str(h.adaptive_cutoff_method == pet::AdaptiveCutoffMethod::Solver ? "solver" : "grid")},
+      {"d_pet", num(h.d_pet)},
+      {"d_node", num(h.d_node)},
+      {"d_head", num(h.d_head)},
+      {"d_feedforward", num(h.d_feedforward)},
+      {"num_heads", num(h.num_heads)},
+      {"num_gnn_layers", num(h.num_gnn_layers)},
+      {"num_attention_layers", num(h.num_attention_layers)},
+      {"num_readout_layers", num(h.num_readout_layers)},
+      {"vesin", flag(pet::vesin_available())},
+      {"system_conditioning", flag(h.system_conditioning)},
+      {"max_charge", num(h.max_charge)},
+      {"max_spin_multiplicity", num(h.max_spin_multiplicity)},
+      {"n_species", num((double) calc.atomic_types().size())},
+  };
+}
+
 void print_model_info(const Args& a, const pet::Calculator& calc) {
-  const pet::Hypers& h = calc.hypers();
-  std::printf("model            : %s\n", a.model_spec.c_str());
-  std::printf("cutoff           : %g %s\n", h.cutoff, calc.length_unit().c_str());
-  std::printf("energy unit      : %s\n", calc.energy_unit().c_str());
-  std::printf("featurizer       : %s\n",
-              h.featurizer_type == pet::FeaturizerType::Residual ? "residual" : "feedforward");
-  std::printf("transformer      : %s\n",
-              h.transformer_type == pet::TransformerType::PreLN ? "PreLN" : "PostLN");
-  std::printf("normalization    : %s\n",
-              h.normalization == pet::Normalization::RMSNorm ? "RMSNorm" : "LayerNorm");
-  std::printf("activation       : %s\n",
-              h.activation == pet::Activation::SwiGLU ? "SwiGLU" : "SiLU");
-  std::printf("cutoff function  : %s%s\n",
-              h.cutoff_function == pet::CutoffFunction::Bump ? "Bump" : "Cosine",
-              h.adaptive() ? " (adaptive)" : "");
-  std::printf("dims             : d_pet=%d d_node=%d d_ff=%d heads=%d\n", h.d_pet, h.d_node,
-              h.d_feedforward, h.num_heads);
-  std::printf("layers           : %d GNN x %d attention, %d readout\n", h.num_gnn_layers,
-              h.num_attention_layers, h.num_readout_layers);
-  std::printf("species          : %zu (Z =", calc.atomic_types().size());
+  const auto fields = model_fields(a, calc);
+  if (a.json) {
+    std::printf("{\n");
+    for (std::size_t i = 0; i < fields.size(); ++i)
+      std::printf("  \"%s\": %s%s\n", fields[i].first.c_str(), fields[i].second.c_str(),
+                  i + 1 < fields.size() ? "," : "");
+    std::printf("}\n");
+    return;
+  }
+  for (auto [k, v] : fields) {
+    if (v.front() == '"') v = v.substr(1, v.size() - 2);
+    std::printf("%-24s %s\n", k.c_str(), v.c_str());
+  }
+  std::printf("%-24s", "species (Z)");
   for (int z : calc.atomic_types()) std::printf(" %d", z);
-  std::puts(")");
+  std::puts("");
 }
 
-// The model's architecture, as JSON. A sweep over many checkpoints wants to
-// report what each one IS alongside whether it worked, and parsing the human
-// table for that would be silly.
-void print_model_info_json(const Args& a, const pet::Calculator& calc) {
-  const pet::Hypers& h = calc.hypers();
-  std::printf("{\n");
-  std::printf("  \"model\": \"%s\",\n", a.model_spec.c_str());
-  std::printf("  \"featurizer\": \"%s\",\n",
-              h.featurizer_type == pet::FeaturizerType::Residual ? "residual" : "feedforward");
-  std::printf("  \"transformer\": \"%s\",\n",
-              h.transformer_type == pet::TransformerType::PreLN ? "PreLN" : "PostLN");
-  std::printf("  \"normalization\": \"%s\",\n",
-              h.normalization == pet::Normalization::RMSNorm ? "RMSNorm" : "LayerNorm");
-  std::printf("  \"activation\": \"%s\",\n",
-              h.activation == pet::Activation::SwiGLU ? "SwiGLU" : "SiLU");
-  std::printf("  \"cutoff_function\": \"%s\",\n",
-              h.cutoff_function == pet::CutoffFunction::Bump ? "Bump" : "Cosine");
-  std::printf("  \"cutoff\": %g,\n", h.cutoff);
-  std::printf("  \"cutoff_width\": %g,\n", h.cutoff_width);
-  std::printf("  \"cutoff_width_adaptive\": %g,\n", h.cutoff_width_adaptive);
-  std::printf("  \"num_neighbors_adaptive\": %g,\n", h.num_neighbors_adaptive);
-  std::printf("  \"adaptive_cutoff_method\": \"%s\",\n",
-              h.adaptive_cutoff_method == pet::AdaptiveCutoffMethod::Solver ? "solver" : "grid");
-  std::printf("  \"d_pet\": %d,\n  \"d_node\": %d,\n  \"d_head\": %d,\n", h.d_pet, h.d_node,
-              h.d_head);
-  std::printf("  \"d_feedforward\": %d,\n  \"num_heads\": %d,\n", h.d_feedforward, h.num_heads);
-  std::printf("  \"num_gnn_layers\": %d,\n  \"num_attention_layers\": %d,\n",
-              h.num_gnn_layers, h.num_attention_layers);
-  std::printf("  \"num_readout_layers\": %d,\n", h.num_readout_layers);
-  std::printf("  \"vesin\": %s,\n", pet::vesin_available() ? "true" : "false");
-  std::printf("  \"system_conditioning\": %s,\n", h.system_conditioning ? "true" : "false");
-  std::printf("  \"max_charge\": %d,\n  \"max_spin_multiplicity\": %d,\n", h.max_charge,
-              h.max_spin_multiplicity);
-  std::printf("  \"n_species\": %zu\n}\n", calc.atomic_types().size());
-}
-
-// Results as JSON, for a caller that has to compare numbers rather than read
-// them. Hand-rolled because the library does not otherwise need a JSON writer on
-// the output side, and the shape here is fixed and flat. Full precision: this
-// exists to be diffed against a reference, so a printf default of 6 significant
-// figures would throw away exactly what it is for.
+// Results as JSON, at full precision: this is what gets diffed against a
+// reference.
 void print_json(const Args& a, const pet::Calculator& calc,
                 const std::vector<pet::System>& frames, const pet::Results& r,
                 double best_seconds) {
@@ -285,10 +279,8 @@ void print_json(const Args& a, const pet::Calculator& calc,
   std::printf("  ]\n}\n");
 }
 
-// The whole program, in a scope of its own. Everything that owns a Kokkos::View
-// is destroyed when this returns -- which has to happen BEFORE
-// Kokkos::finalize(), and is the reason this is a function rather than the body
-// of main with early returns in it.
+// Everything owning a View is destroyed when this returns, before
+// Kokkos::finalize.
 int run(const Args& a) {
   pet::Options opts;
   opts.device_neighbors = !a.host_neighbors;
@@ -297,17 +289,12 @@ int run(const Args& a) {
   pet::Calculator calc(a.model_spec, opts);
 
   if (a.info_only) {
-    if (a.json)
-      print_model_info_json(a, calc);
-    else
-      print_model_info(a, calc);
+    print_model_info(a, calc);
     return 0;
   }
 
   std::vector<pet::System> frames = pet::read_extxyz(a.structure_path);
-  // Applied to every frame. A model without system_conditioning ignores them,
-  // so setting them on one is a no-op rather than an error -- but warn, because
-  // silently ignoring an electronic state the user asked for is worse.
+  // A model without system_conditioning ignores them: warn, don't fail.
   if (a.charge != 0 || a.spin != 1) {
     if (!calc.hypers().system_conditioning)
       std::fprintf(stderr,
@@ -323,8 +310,7 @@ int run(const Args& a) {
     return 2;
   }
 
-  // Reject an unsupported element here rather than deep inside the neighbour
-  // build, where the message would name a species index nobody can decode.
+  // Here, where the message can name the element.
   for (std::size_t f = 0; f < frames.size(); ++f)
     for (int z : frames[f].atomic_numbers)
       if (!calc.supports(z)) {
@@ -397,12 +383,8 @@ int run(const Args& a) {
   if (a.report_memory) {
     const std::size_t pool = calc.workspace_bytes();
     std::printf("\ndevice scratch pool: %.2f GiB\n", double(pool) / (1024.0 * 1024.0 * 1024.0));
-    // Grouped by label family, not by individual buffer. Almost every buffer in
-    // a PET evaluation is named for the layer that allocated it ("emlpb_2_0"),
-    // so a flat list is hundreds of near-identical rows and the shape of the
-    // problem -- one buffer per layer, times the layer count -- is invisible.
-    // Collapsing the digits shows it directly: a family holding G*A copies of a
-    // temporary that only one layer uses at a time is the thing worth fixing.
+    // Grouped by label with the layer numbers collapsed ("emlpb_*_*"), so one
+    // buffer per layer shows as one row with a count.
     const auto rows = calc.workspace_breakdown();
     std::map<std::string, std::pair<std::size_t, int>> fam;
     for (const auto& [label, bytes] : rows) {
@@ -457,8 +439,7 @@ int run(const Args& a) {
 int main(int argc, char** argv) {
   Args args;
   int rc = 0;
-  // Argument parsing happens before Kokkos comes up: --help and --models should
-  // not pay for a device context, and a usage error should not need one either.
+  // Before Kokkos: --help and a usage error need no device.
   if (!parse_args(argc, argv, args, rc)) return rc;
 
   Kokkos::initialize(argc, argv);
