@@ -53,7 +53,7 @@ endif()
 # active Kokkos backend; on host it uses a portable Kokkos fallback.
 if(PET_BACKEND STREQUAL "cuda")
     find_package(CUDAToolkit REQUIRED)
-    target_link_libraries(pet_kokkos PUBLIC CUDA::cublas)
+    target_link_libraries(pet_kokkos PUBLIC CUDA::cublas CUDA::cublasLt)
     message(STATUS "pet_kokkos: GEMM via cuBLAS")
 elseif(PET_BACKEND STREQUAL "hip")
     find_package(rocblas REQUIRED)

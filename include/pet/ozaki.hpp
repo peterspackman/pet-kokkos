@@ -172,7 +172,7 @@ OzakiSplit ozaki_split_weight(const View2D& src, int n_slices, bool transposed =
 // linear()/linear_bwd() without threading a Workspace through the ~80 call sites
 // that use them.
 void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View2D& B, Net beta,
-                const View2D& C, const OzakiSplit* bsplit);
+                const View2D& C, const OzakiSplit* bsplit, const View1D& bias = {});
 
 // Bytes the Ozaki scratch pool is currently holding. A caller sizing a batch has
 // to count this alongside the model's own workspace.

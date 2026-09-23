@@ -336,13 +336,10 @@ bool igemm_shape_supported(int m, int n, int k, cublasOperation_t ob, const int8
 }  // namespace
 #endif
 
-void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View2D& B, Net beta,
-                const View2D& C, const OzakiSplit* bsplit) {
+namespace {
+void gemm_ozaki_nobias(char transA, char transB, Net alpha, const View2D& A, const View2D& B,
+                       Net beta, const View2D& C, const OzakiSplit* bsplit) {
   const OzakiConfig& cfg = ozaki_config();
-  if (!ozaki_active()) {
-    gemm(transA, transB, alpha, A, B, beta, C);
-    return;
-  }
   Workspace& ws = ozaki_ws();
   const std::string key = "oz";
 
@@ -441,8 +438,18 @@ void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View
         });
   }
 #else
+  (void) cfg;
+  (void) bsplit;
   gemm(transA, transB, alpha, A, B, beta, C);
 #endif
+}
+}  // namespace
+
+void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View2D& B, Net beta,
+                const View2D& C, const OzakiSplit* bsplit, const View1D& bias) {
+  if (!ozaki_active()) return gemm(transA, transB, alpha, A, B, beta, C, bias);
+  gemm_ozaki_nobias(transA, transB, alpha, A, B, beta, C, bsplit);
+  if (bias.extent(0) > 0) add_bias(C, bias);
 }
 
 }  // namespace pet

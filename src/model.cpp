@@ -27,31 +27,24 @@ constexpr int VBINS = 256;  // virial-accumulator bins (cut atomic contention)
 // forward helpers
 // ----------------------------------------------------------------------------
 
-// out(R,Dout) = in(R,Din) @ W(Dout,Din)^T + b(Dout)
+// out(R,Dout) = in(R,Din) @ W(Dout,Din)^T + b(Dout). gemm_ozaki falls through
+// to the vendor GEMM unless the Ozaki path is both asked for and available, and
+// either way the bias rides in the GEMM (its epilogue, where the library has one).
 void linear(View2D out, View2D in, WeightRef W, View1D b) {
-  // gemm_ozaki falls through to the vendor GEMM unless the Ozaki path is both
-  // asked for and available, so every call site gets it for free and none of
-  // them has to know.
-  gemm_ozaki('N', 'T', (Net)1.0, in, W.v, (Net)0.0, out, W.for_orientation(true));
-  const int R = out.extent(0), Dout = out.extent(1);
-  Kokkos::parallel_for(
-      "bias", RangePolicy(0, (R) * (Dout)),
-      KOKKOS_LAMBDA(int _i) { const int r = _i / (Dout), o = _i % (Dout); out(r, o) += b(o); });
+  gemm_ozaki('N', 'T', (Net)1.0, in, W.v, (Net)0.0, out, W.for_orientation(true), b);
 }
 
-// Fused linear + bias + (optional save of pre-activation) + SiLU. Replaces the
-// linear / copy_into / silu_inplace triple (3 elementwise passes) with the gemm
-// plus a single fused epilogue kernel. `sav` (when save) receives the pre-SiLU
-// value the analytic backward needs; pass an empty View when !save.
+// linear + SiLU, saving the pre-activation into `sav` when `save` (the analytic
+// backward needs it); pass an empty View when !save.
 void linear_silu(View2D out, View2D sav, View2D in, WeightRef W, View1D b, bool save) {
-  gemm_ozaki('N', 'T', (Net)1.0, in, W.v, (Net)0.0, out, W.for_orientation(true));
-  const int R = out.extent(0), Dout = out.extent(1);
+  linear(out, in, W, b);
+  const int n = out.extent(0) * out.extent(1);
+  View1D o1(out.data(), n), s1(save ? sav.data() : nullptr, save ? n : 0);
   Kokkos::parallel_for(
-      "linear_silu", RangePolicy(0, (R) * (Dout)),
-      KOKKOS_LAMBDA(int _i) { const int r = _i / (Dout), o = _i % (Dout);
-        const Net z = out(r, o) + b(o);
-        if (save) sav(r, o) = z;
-        out(r, o) = silud(z);
+      "silu", RangePolicy(0, n), KOKKOS_LAMBDA(int i) {
+        const Net z = o1(i);
+        if (save) s1(i) = z;
+        o1(i) = silud(z);
       });
 }
 
@@ -213,7 +206,8 @@ void attention_impl(Workspace& ws, const std::string& key, View2D attn_out, View
                     View2D cf_seq, WeightRef w_out, View1D b_out, int N, int S, int num_heads,
                     int head_dim, double temperature, bool save) {
   const int D = num_heads * head_dim, H = num_heads;
-  View2D merged = ws.n2(key + ":merged", N * S, D);
+  // Saved for the backward only when `save`; otherwise one-layer scratch.
+  View2D merged = save ? ws.n2(key + ":merged", N * S, D) : ws.n2_any("scratch:merged", N * S, D);
   View2D sml = save ? ws.n2(key + ":ml", N * H * S, 2) : View2D();
   const double scale = 1.0 / (Kokkos::sqrt((double) head_dim) * temperature);
   constexpr int CAP = HD > 0 ? HD : kMaxHeadDim;
@@ -441,8 +435,8 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, const std::string
   linear_bwd(merged_adj, ao_adj, w_out);  // d(merged) = ao_adj @ w_out
   View2D qkv_adj = ws.n2_any("scratch:qkvadj", R, 3 * D);  // each element written by exactly one thread
   // softmax math in Net precision (expf/logf): much faster than fp64 on consumer GPUs.
-  View2D stats = ws.n2(key + ":stats", N * H * S, 3);  // per-query (m, 1/l, dot_do_out)
-  View2D cfh = ws.n2(key + ":cfh", N * S, H);          // per-(key, head) cutoff-adjoint partial
+  View2D stats = ws.n2_any("scratch:stats", N * H * S, 3);  // per-query (m, 1/l, dot_do_out)
+  View2D cfh = ws.n2_any("scratch:cfh", N * S, H);          // per-(key, head) cutoff-adjoint partial
   View2D merged_saved = ws.peek2(fwd_key + ":merged");  // forward out_sq (no recompute)
   View2D sml = ws.peek2(fwd_key + ":ml");               // forward per-query (m, 1/l)
   const Net sc = (Net) (1.0 / (Kokkos::sqrt((double) head_dim) * temperature));
@@ -1736,7 +1730,8 @@ EnergyResult PetModel::compute_residual(const DeviceEdgeData& dev, std::vector<d
       norm(tok_a, s1, tl + ".norm_attention");
 
       // feedforward: w_out(silu(w_in(tok_a)))
-      sav_mlppre[L][a] = ws_.n2("rs_mlppre_" + as, N * S, ffn_pre_width(tl + ".mlp"));
+      const int pw = ffn_pre_width(tl + ".mlp");
+      sav_mlppre[L][a] = grad ? ws_.n2("rs_mlppre_" + as, N * S, pw) : ws_.n2_any("scratch:ffpre", N * S, pw);
       // s2 receives ff, then += tok_a in place -> the norm-mlp input.
       View2D s2 = grad ? (sav_s2[L][a] = ws_.n2("rs_s2_" + as, N * S, D))
                        : ws_.n2("re_ff", N * S, D);
@@ -2111,6 +2106,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   // PetModel::readout is the same call for both featurizers.
   std::vector<View2D> sav_nh0(1), sav_nh1(1), sav_eh0(1), sav_eh1(1), sav_epred(1);
 
+  int blk = 0;  // running (GNN layer, attention layer) block index
   for (int L = 0; L < G; ++L) {
     const std::string g = "gnn_layers." + std::to_string(L);
     const std::string ls = std::to_string(L);  // per-layer workspace-key suffix
@@ -2169,6 +2165,10 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
       // Distinct workspace keys per (GNN layer, attention layer): two buffers
       // that are simultaneously live must never share a key.
       const std::string as = ls + "_" + std::to_string(a);
+      // Block outputs only need to outlive the NEXT block (the backward reads the
+      // saved s_* copies), so they alternate between two buffers across the
+      // whole (GNN layer, attention layer) sequence instead of one per block.
+      const std::string pp = std::to_string(blk++ % 2);
 
       // central token contraction
       View2D input_node = ws_.n2("input_node", N, D);
@@ -2199,7 +2199,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
                 h_.attention_temperature, grad);
 
       View2D out_node128 = ws_.n2("out_node128", N, D);
-      View2D edge_attn = ws_.n2("out_edge_" + as, NM, D);
+      View2D edge_attn = ws_.n2_any("scratch:edge_attn", NM, D);
       Kokkos::parallel_for(
           "split_no", RangePolicy(0, (N * S) * (D)),
           KOKKOS_LAMBDA(int _i) { const int row = _i / (D), d = _i % (D);
@@ -2212,7 +2212,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
       View2D node_exp = ws_.n2("node_exp", N, Dn);
       linear(node_exp, out_node128, mat(tl + ".center_expansion.weight"),
              vec(tl + ".center_expansion.bias"));
-      View2D node_next = ws_.n2("node_new_" + as, N, Dn);  // carried to the next block
+      View2D node_next = ws_.n2("node_new_" + pp, N, Dn);  // carried to the next block
       // residual = node_cur + node_exp is the norm input the backward needs. When
       // grad, write it straight into the save buffer; the final
       // node_next = residual + node_ff is a separate add, so no copy_into snapshot
@@ -2224,7 +2224,8 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
           KOKKOS_LAMBDA(int _i) { const int n = _i / (Dn), d = _i % (Dn); node_res(n, d) = node_cur(n, d) + node_exp(n, d); });
       View2D node_norm = ws_.n2("node_norm", N, Dn);
       norm(node_norm, node_res, tl + ".norm_center_features");
-      View2D tmp_center = ws_.n2("tmp_center_" + as, N, ffn_pre_width(tl + ".center_mlp"));
+      const int cw = ffn_pre_width(tl + ".center_mlp"), ew = ffn_pre_width(tl + ".mlp");
+      View2D tmp_center = grad ? ws_.n2("tmp_center_" + as, N, cw) : ws_.n2_any("scratch:ffpre", N, cw);
       View2D node_ff = ws_.n2("node_ff", N, Dn);
       feedforward("cmlp_" + as, node_ff, node_norm, tl + ".center_mlp", tmp_center, grad);
       if (grad) sav_tmp_center[L][a] = tmp_center;
@@ -2242,11 +2243,11 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
           KOKKOS_LAMBDA(int _i) { const int k = _i / (D), d = _i % (D); eps(k, d) = edge_attn(k, d) + edge_cur(k, d); });
       View2D edge_norm = ws_.n2("edge_norm", NM, D);
       norm(edge_norm, eps, tl + ".norm_mlp");
-      View2D tmp_edge = ws_.n2("tmp_edge_" + as, NM, ffn_pre_width(tl + ".mlp"));
+      View2D tmp_edge = grad ? ws_.n2("tmp_edge_" + as, NM, ew) : ws_.n2_any("scratch:ffpre", NM, ew);
       View2D edge_ff = ws_.n2("edge_ff", NM, D);
       feedforward("emlp_" + as, edge_ff, edge_norm, tl + ".mlp", tmp_edge, grad);
       if (grad) sav_tmp_edge[L][a] = tmp_edge;
-      View2D edge_next = ws_.n2("edge_out_" + as, NM, D);
+      View2D edge_next = ws_.n2("edge_out_" + pp, NM, D);
       Kokkos::parallel_for(
           "eres2", RangePolicy(0, (NM) * (D)),
           KOKKOS_LAMBDA(int _i) { const int k = _i / (D), d = _i % (D); edge_next(k, d) = eps(k, d) + edge_ff(k, d); });
@@ -2447,7 +2448,9 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
     // they are the adjoints of `et` and of the node features entering the GNN
     // layer, which is what the featurizer backward below consumes.
     View2D et_adj = ws_.n2("et_adj", NM, D);
-    View2D node_in_adj = ws_.n2("node_in_adj_" + ls, N, Dn);  // carried to prev GNN layer
+    // Carried to the previous GNN layer, which reads it as node_adj while writing
+    // its own: two buffers alternating by layer parity, not one per layer.
+    View2D node_in_adj = ws_.n2("node_in_adj_" + std::to_string(L % 2), N, Dn);
 
     for (int a = A - 1; a >= 0; --a) {
       const std::string tl = g + ".trans.layers." + std::to_string(a);
