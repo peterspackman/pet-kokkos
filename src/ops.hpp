@@ -41,12 +41,21 @@ void copy(View2D a, View2D b);
 void norm_fwd(View2D out, View2D in, View1D weight, View1D bias);
 void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool layernorm, bool acc);
 
-// out = w_out(v * sigmoid(g)) onto beta * out, where [v | g] = w_in(in) is left
-// in `pre`, which the backward reads.
+// out = w_out(v * sigmoid(g)) onto beta * out, where pre = w_in(in) holds v and
+// g interleaved (v_j, g_j at 2j, 2j+1: w_in's rows are reordered at load so the
+// pair meets in one GEMM thread). The backward reads pre.
 void swiglu(Workspace& ws, View2D out, View2D in, const WeightRef& w_in, View1D b_in,
             const WeightRef& w_out, View1D b_out, View2D pre, Net beta);
+// Its first half: pre = w_in(in), and h = v * sigmoid(g) unless h is empty. A
+// recompute of pre must come through here, to run the forward's own GEMM.
+void swiglu_in(View2D pre, View2D h, View2D in, const WeightRef& w_in, View1D b_in);
 void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const WeightRef& w_in,
                 const WeightRef& w_out, Net beta);
+
+// The same with the GEMM and the elementwise step fused (fused_gemm.cpp), h
+// optional; false when that cannot run here.
+bool swiglu_in_fused(View2D pre, View2D h, View2D in, const View2D& w, View1D b);
+bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2D pre);
 
 // out = silu(pre), pre = compress.0 of one GNN layer through its CompressFold.
 // `sav`, unless empty, receives pre.

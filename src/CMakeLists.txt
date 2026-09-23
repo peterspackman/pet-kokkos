@@ -10,6 +10,7 @@
 #   checkpoint.cpp   the model JSON and safetensors weights
 #   neighbors.cpp    the host neighbour list and adaptive cutoff
 #   device_neighbors.cpp  the same on the device
+#   fused_gemm.cpp   GEMMs with their elementwise neighbours fused (CUTLASS)
 
 add_library(pet_kokkos STATIC
     model.cpp
@@ -27,6 +28,7 @@ add_library(pet_kokkos STATIC
     io/extxyz.cpp
     ozaki.cpp
     vesin_neighbors.cpp
+    fused_gemm.cpp
 )
 add_library(pet::kokkos ALIAS pet_kokkos)
 
@@ -54,6 +56,13 @@ elseif(PET_PRECISION STREQUAL "fp64")
     target_compile_definitions(pet_kokkos PUBLIC PET_KOKKOS_FP64)
 elseif(NOT PET_PRECISION STREQUAL "mixed")
     message(FATAL_ERROR "PET_PRECISION must be one of: mixed, fp32, fp64")
+endif()
+
+# --- CUTLASS (optional) ------------------------------------------------------
+# PRIVATE: only fused_gemm.cpp sees it.
+if(PET_HAVE_CUTLASS)
+    target_include_directories(pet_kokkos SYSTEM PRIVATE ${cutlass_SOURCE_DIR}/include)
+    target_compile_definitions(pet_kokkos PRIVATE PET_HAVE_CUTLASS)
 endif()
 
 # --- vesin (optional) --------------------------------------------------------

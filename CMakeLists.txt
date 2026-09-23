@@ -50,6 +50,8 @@ option(PET_BUILD_METATOMIC_PLUGIN
 # fails the configure if it is missing; OFF never looks.
 set(PET_WITH_VESIN "AUTO" CACHE STRING "Use vesin for neighbour lists: AUTO | ON | OFF")
 set_property(CACHE PET_WITH_VESIN PROPERTY STRINGS AUTO ON OFF)
+set(PET_WITH_CUTLASS "AUTO" CACHE STRING "Fused GEMM kernels on CUTLASS (CUDA only): AUTO | ON | OFF")
+set_property(CACHE PET_WITH_CUTLASS PROPERTY STRINGS AUTO ON OFF)
 
 # Tune for the building machine's CPU. A real win on the host kernels, but it
 # bakes THIS machine's instruction set into the objects: turn it off when the
@@ -138,6 +140,26 @@ if(NOT TARGET nlohmann_json::nlohmann_json)
         GITHUB_REPOSITORY nlohmann/json
         OPTIONS "JSON_BuildTests OFF"
     )
+endif()
+
+# --- CUTLASS (optional, CUDA) -----------------------------------------------
+# Header-only: its fp32 GEMM main loop carries the fused kernels in
+# src/fused_gemm.cpp. Without it those operations run unfused.
+
+set(PET_HAVE_CUTLASS OFF)
+if(PET_BACKEND STREQUAL "cuda" AND NOT PET_WITH_CUTLASS STREQUAL "OFF")
+    CPMAddPackage(
+        NAME cutlass
+        GITHUB_REPOSITORY NVIDIA/cutlass
+        GIT_TAG v4.8.0
+        DOWNLOAD_ONLY YES
+    )
+    if(cutlass_ADDED)
+        set(PET_HAVE_CUTLASS ON)
+        message(STATUS "pet-kokkos: fused GEMMs on CUTLASS from ${cutlass_SOURCE_DIR}")
+    elseif(PET_WITH_CUTLASS STREQUAL "ON")
+        message(FATAL_ERROR "pet-kokkos: PET_WITH_CUTLASS=ON but CUTLASS could not be fetched")
+    endif()
 endif()
 
 # --- vesin (optional) --------------------------------------------------------

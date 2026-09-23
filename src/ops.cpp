@@ -124,17 +124,23 @@ void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln, 
 
 // ---- SwiGLU -------------------------------------------------------------------
 
+void swiglu_in(View2D pre, View2D h, View2D in, const WeightRef& w_in, View1D b_in) {
+  if (!w_in.split && swiglu_in_fused(pre, h, in, w_in.v, b_in)) return;
+  linear(pre, in, w_in, b_in);
+  if (!h.data()) return;
+  const int F = h.extent(1);
+  Kokkos::parallel_for(
+      "swiglu", RangePolicy(0, h.extent(0) * F), KOKKOS_LAMBDA(int i) {
+        const int r = i / F, c = i % F;
+        h(r, c) = pre(r, 2 * c) * sigmoid(pre(r, 2 * c + 1));
+      });
+}
+
 void swiglu(Workspace& ws, View2D out, View2D in, const WeightRef& w_in, View1D b_in,
             const WeightRef& w_out, View1D b_out, View2D pre, Net beta) {
-  const int R = in.extent(0), F = pre.extent(1) / 2;
-  linear(pre, in, w_in, b_in);
   Workspace::Scope scope(ws);
-  View2D h = ws.tmp(R, F);
-  Kokkos::parallel_for(
-      "swiglu", RangePolicy(0, R * F), KOKKOS_LAMBDA(int i) {
-        const int r = i / F, c = i % F;
-        h(r, c) = pre(r, c) * sigmoid(pre(r, F + c));
-      });
+  View2D h = ws.tmp(in.extent(0), pre.extent(1) / 2);
+  swiglu_in(pre, h, in, w_in, b_in);
   linear(out, h, w_out, b_out, beta);
 }
 
@@ -142,15 +148,18 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
                 const WeightRef& w_out, Net beta) {
   const int R = out_adj.extent(0), F = pre.extent(1) / 2;
   Workspace::Scope scope(ws);
-  View2D h_adj = ws.tmp(R, F), pre_adj = ws.tmp(R, 2 * F);
-  linear_bwd(h_adj, out_adj, w_out, 0);
-  Kokkos::parallel_for(
-      "swiglu_bwd", RangePolicy(0, R * F), KOKKOS_LAMBDA(int i) {
-        const int r = i / F, c = i % F;
-        const Net v = pre(r, c), sg = sigmoid(pre(r, F + c));
-        pre_adj(r, c) = h_adj(r, c) * sg;
-        pre_adj(r, F + c) = h_adj(r, c) * v * sg * (Net(1) - sg);
-      });
+  View2D pre_adj = ws.tmp(R, 2 * F);
+  if (w_out.split || !swiglu_bwd_fused(pre_adj, out_adj, w_out.v, pre)) {
+    View2D h_adj = ws.tmp(R, F);
+    linear_bwd(h_adj, out_adj, w_out, 0);
+    Kokkos::parallel_for(
+        "swiglu_bwd", RangePolicy(0, R * F), KOKKOS_LAMBDA(int i) {
+          const int r = i / F, c = i % F;
+          const Net v = pre(r, 2 * c), sg = sigmoid(pre(r, 2 * c + 1));
+          pre_adj(r, 2 * c) = h_adj(r, c) * sg;
+          pre_adj(r, 2 * c + 1) = h_adj(r, c) * v * sg * (Net(1) - sg);
+        });
+  }
   linear_bwd(in_adj, pre_adj, w_in, beta);
 }
 

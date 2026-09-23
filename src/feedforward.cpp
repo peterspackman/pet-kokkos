@@ -138,12 +138,14 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
   const int D = h_.d_pet, Dn = h_.d_node, A = h_.num_attention_layers;
   const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
   auto off = pk.off, rev = pk.reverse;
-  // lin(norm(in)): a wide activation the forward did not keep.
-  auto rebuild = [&](View2D in, const std::string& norm_key, const std::string& lin) {
+  // lin(norm(in)): a wide activation the forward did not keep, by the forward's
+  // own route.
+  auto rebuild = [&](View2D in, const std::string& norm_key, const std::string& lin, bool swiglu_pre) {
     View2D x = ws_.tmp(in.extent(0), in.extent(1));
     norm(x, in, norm_key);
     View2D out = ws_.tmp(in.extent(0), mat(lin + ".weight").extent(0));
-    linear(out, x, mat(lin + ".weight"), vec(lin + ".bias"));
+    if (swiglu_pre) swiglu_in(out, {}, x, mat(lin + ".weight"), vec(lin + ".bias"));
+    else linear(out, x, mat(lin + ".weight"), vec(lin + ".bias"));
     return out;
   };
   Workspace::Scope layer_scope(ws_);
@@ -173,7 +175,7 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
       Workspace::Scope scope(ws_);
       View2D enorm_adj = ws_.tmp(E, D), cnorm_adj = ws_.tmp(N, Dn);
       feedforward_bwd(enorm_adj, edge_adj, tl + ".mlp",
-                      kept_wide ? sav.tmp_edge[a] : rebuild(sav.eps[a], tl + ".norm_mlp", tl + ".mlp.w_in"), 0);
+                      kept_wide ? sav.tmp_edge[a] : rebuild(sav.eps[a], tl + ".norm_mlp", tl + ".mlp.w_in", true), 0);
       norm_bwd(edge_adj, enorm_adj, sav.eps[a], tl + ".norm_mlp");
       feedforward_bwd(cnorm_adj, node_adj, tl + ".center_mlp", sav.tmp_center[a], 0);
       norm_bwd(node_adj, cnorm_adj, sav.node_new[a], tl + ".norm_center_features");
@@ -193,7 +195,7 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
             attn_out_adj(row, d) = row % S == 0 ? out_node_adj(n, d) : k < off(n + 1) ? edge_adj(k, d) : Net(0);
           });
       attention_bwd(ws_, key, attn_in_adj, cf_seq_adj, attn_out_adj,
-                    kept_wide ? sav.qkv[a] : rebuild(sav.tokens[a], tl + ".norm_attention", tl + ".attention.input_linear"),
+                    kept_wide ? sav.qkv[a] : rebuild(sav.tokens[a], tl + ".norm_attention", tl + ".attention.input_linear", false),
                     dev.cf_seq, mat(tl + ".attention.input_linear.weight"),
                     mat(tl + ".attention.output_linear.weight"), N, S, h_.num_heads, h_.head_dim,
                     h_.attention_temperature, 0);

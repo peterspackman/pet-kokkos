@@ -41,6 +41,7 @@ void PetModel::load_all(const Checkpoint& ckpt) {
   const bool ff = h_.featurizer_type == FeaturizerType::FeedForward;
   const bool ln = h_.normalization == Normalization::LayerNorm;
   const bool expanded = h_.expanded_node();
+  const bool swiglu = h_.activation == Activation::SwiGLU;
 
   auto put_mat = [&](const std::string& n, int rows, int cols, const double* d) {
     View2D v(n, rows, cols);
@@ -64,6 +65,20 @@ void PetModel::load_all(const Checkpoint& ckpt) {
   };
   auto load_vec = [&](const std::string& n) { put_vec(n, st.at(n).numel(), st.at(n).data.data()); };
   auto load_linear = [&](const std::string& p) { load_mat(p + ".weight"), load_vec(p + ".bias"); };
+  // A SwiGLU w_in's [v | g] output rows, interleaved to (v_j, g_j): see swiglu.
+  auto load_swiglu_in = [&](const std::string& p) {
+    const Tensor &W = st.at(p + ".weight"), &b = st.at(p + ".bias");
+    const int F = W.dim(0) / 2, K = W.dim(1);
+    std::vector<double> w(W.data.size()), bi(b.data.size());
+    for (int j = 0; j < 2 * F; ++j) {
+      const int src = j % 2 ? F + j / 2 : j / 2;
+      std::copy_n(&W.data[std::size_t(src) * K], K, &w[std::size_t(j) * K]);
+      bi[j] = b.data[src];
+    }
+    put_mat(p + ".weight", 2 * F, K, w.data());
+    put_vec(p + ".bias", 2 * F, bi.data());
+  };
+  auto load_mlp_in = [&](const std::string& p) { swiglu ? load_swiglu_in(p) : load_linear(p); };
   auto load_norm = [&](const std::string& p) {  // RMSNorm has no bias
     load_vec(p + ".weight");
     if (ln) load_vec(p + ".bias");
@@ -106,13 +121,13 @@ void PetModel::load_all(const Checkpoint& ckpt) {
       load_linear(tl + ".attention.output_linear");
       load_norm(tl + ".norm_attention");
       load_norm(tl + ".norm_mlp");
-      load_linear(tl + ".mlp.w_in");
+      load_mlp_in(tl + ".mlp.w_in");
       load_linear(tl + ".mlp.w_out");
       if (expanded) {  // otherwise metatrain makes these the identity
         load_linear(tl + ".center_contraction");
         load_linear(tl + ".center_expansion");
         load_norm(tl + ".norm_center_features");
-        load_linear(tl + ".center_mlp.w_in");
+        load_mlp_in(tl + ".center_mlp.w_in");
         load_linear(tl + ".center_mlp.w_out");
       }
     }
