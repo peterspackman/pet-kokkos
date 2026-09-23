@@ -7,10 +7,14 @@
 #   residual.cpp     the residual featurizer
 #   forces.cpp       edge gradients -> forces and virial, adaptive cutoff
 #   model.cpp        loading, upload, packing, readout, compute()
+#   neighbors.cpp    the host neighbour list and adaptive cutoff
+#   device_neighbors.cpp  the same on the device
 
 add_library(pet_kokkos STATIC
     model.cpp
     ops.cpp
+    neighbors.cpp
+    device_neighbors.cpp
     attention.cpp
     feedforward.cpp
     residual.cpp

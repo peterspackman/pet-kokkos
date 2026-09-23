@@ -1,3 +1,4 @@
+// The device cell list: see device_cell_list.hpp.
 #include "pet/device_cell_list.hpp"
 
 #include <Kokkos_Core.hpp>
@@ -152,10 +153,7 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
         abin(gi) = goff(b) + (ijk[0] * gnc(b, 1) + ijk[1]) * gnc(b, 2) + ijk[2];
       });
 
-  // Counting sort of atoms by bin.
-  // Zeroed explicitly: atomic accumulators must not depend on the pool's
-  // zeroing policy, which a caller elsewhere may have turned off. See the note
-  // in PetModel::energy_forces_batch.
+  // Counting sort of atoms by bin (the counters zeroed here, not by the pool).
   IView1D bcnt = ws.i1("cl_bcnt", nbins);
   Kokkos::deep_copy(ExecSpace(), bcnt, 0);
   IView1D bstart = ws.i1("cl_bstart", nbins + 1);
@@ -176,12 +174,9 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
         const int c = abin(gi);
         bunsorted(bstart(c) + Kokkos::atomic_fetch_add(&fill(c), 1)) = gi;
       });
-  // The fill above used an atomic counter, so membership order is thread-arrival
-  // order and differs run to run. Put each bin in atom-index order -- without it
-  // the neighbour list, and therefore the energy's last bits, would not be
-  // reproducible (see the header). One warp per bin, each lane placing its atoms
-  // at their rank among the bin's: a big cell at a long cutoff has only a few
-  // bins of hundreds of atoms, and a sequential sort per bin was a long chain.
+  // The atomic fill leaves each bin in thread-arrival order; put it in atom
+  // order. One warp per bin, each lane placing its atoms at their rank: a big
+  // cell at a long cutoff has a few bins of hundreds of atoms.
   Kokkos::parallel_for(
       "cl_sortbins", Kokkos::TeamPolicy<ExecSpace>(nbins, 1, 32),
       KOKKOS_LAMBDA(const Kokkos::TeamPolicy<ExecSpace>::member_type& t) {
@@ -195,11 +190,9 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
       });
 
   // ---- count, scan, fill ---------------------------------------------------
-  // One warp per atom: its lanes take the members of each candidate bin. (A
-  // thread per atom left a 1728-atom cell with ~54 warps on the whole GPU, each
-  // walking ~27 bins.) The fill pass places each hit with an ordered warp scan,
-  // so the edge list comes out in exactly the order a sequential walk would give
-  // -- bins in fixed order, members sorted by atom index.
+  // One warp per atom, its lanes on the members of each candidate bin. The fill
+  // places each hit with an ordered warp scan, so the list comes out in the order
+  // a sequential walk would give: bins in fixed order, members by atom index.
   using Teams = Kokkos::TeamPolicy<ExecSpace>;
   using Team = Teams::member_type;
   IView1D ecnt = ws.i1("cl_ecnt", Ntot);
@@ -233,17 +226,10 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
   IView2D re_shift = ws.i2("pet_re_shift", E > 0 ? E : 1, 3);
   RView2D re_vec = ws.r2("pet_re_vec", E > 0 ? E : 1, 3);
   RView1D re_dist = ws.r1("pet_re_dist", E > 0 ? E : 1);
-  // The fill records how many edges it actually wrote, and that must equal what
-  // the count pass promised.
-  //
-  // This is not paranoia. The two passes are separate instantiations of the same
-  // search, and nvcc is free to contract `vx*vx + vy*vy + vz*vz` into FMAs
-  // differently in each -- the store-free count pass has different register
-  // pressure. An edge sitting exactly on the cutoff can then be counted by one
-  // pass and not the other, and the fill walks past the region the scan reserved
-  // for that atom, into the next atom's edges. On a freshly allocated buffer
-  // that overrun lands in slack and nothing happens; once the pool is warm it
-  // corrupts a live buffer. Silent either way.
+  // The fill must write exactly what the count promised. The two passes are
+  // separate kernels, and nvcc may contract the distance differently in each, so
+  // an edge exactly at the cutoff could be counted by one and not the other --
+  // and the fill would overrun into the next atom's edges. Checked, not assumed.
   IView1D wrote = ws.i1("cl_wrote", Ntot);
   Kokkos::parallel_for(
       "cl_efill", Teams(Ntot, 1, 32), KOKKOS_LAMBDA(const Team& t) {

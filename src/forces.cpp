@@ -8,6 +8,8 @@
 // fallback, for a raw edge list without per-atom ranges, says so.
 #include "ops.hpp"
 
+#include "pet/cutoff.hpp"
+
 #include <stdexcept>
 
 namespace pet {
@@ -16,8 +18,8 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
-// The smooth cutoff factors and their derivatives in the distance. The
-// transcendentals are in float, exactly as the neighbour builders evaluate them.
+// The smooth cutoff factors' derivatives in the distance, in float like the
+// factors themselves (pet/cutoff.hpp).
 KOKKOS_INLINE_FUNCTION double bump_ddist(double d, double rc, double w) {
   const float x = (float) ((d - (rc - w)) / w);
   if (x <= 0.0f || x >= 1.0f) return 0.0;
@@ -33,12 +35,6 @@ KOKKOS_INLINE_FUNCTION double cosine_ddist(double d, double rc, double w) {
 }
 KOKKOS_INLINE_FUNCTION double cutoff_ddist(double d, double rc, double w, bool bump) {
   return bump ? bump_ddist(d, rc, w) : cosine_ddist(d, rc, w);
-}
-KOKKOS_INLINE_FUNCTION double bump_value(double d, double rc, double w) {
-  const float x = (float) ((d - (rc - w)) / w);
-  if (x <= 0.0f) return 1.0;
-  if (x >= 1.0f) return 0.0;
-  return 0.5 * (1.0 + (double) Kokkos::tanh(1.0f / Kokkos::tan((float) kPi * x)));
 }
 
 // Forces and a per-atom virial from per-edge gradients g = dE/dv. The edge list
@@ -120,7 +116,7 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
       Kokkos::deep_copy(ExecSpace(), eff, 0.0);
       Kokkos::parallel_for(
           "ad_eff", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
-            for (int p = 0; p < P; ++p) Kokkos::atomic_add(&eff(center(e), p), bump_value(dist(e), probes(p), width));
+            for (int p = 0; p < P; ++p) Kokkos::atomic_add(&eff(center(e), p), detail::dev_bump_cutoff(dist(e), probes(p), width));
           });
     }
     RView2D diff = ws.r2("ad:diff", N, P), grad = ws.r2("ad:grad", N, P), gsign = ws.r2("ad:gsign", N, P),
