@@ -1,17 +1,14 @@
-// The high-level entry point: load a PET model once, evaluate structures
-// against it many times.
+// The high-level entry point: load a PET model once, evaluate structures with it
+// many times.
 //
-// Everything here speaks the model's own units -- positions and cells in
-// Angstrom, energies in eV, forces in eV/Angstrom -- and returns the virial as
-// the SYMMETRIC tensor W = V*sigma in Voigt order [xx, yy, zz, xy, xz, yz].
-// See the note on `Results::virial` before consuming it; a strain-DOF optimizer
-// usually wants the off-diagonals doubled, and that conversion belongs at the
-// consumer's seam, not here.
+// Units are the model's: Angstrom, eV, eV/A. The virial is the symmetric
+// W = V * stress, in Voigt order [xx, yy, zz, xy, xz, yz]; a strain-DOF optimizer
+// usually wants the off-diagonals doubled (dE/d(eps)), which is the consumer's
+// to do.
 //
-// Kokkos must be initialized before a Calculator is constructed and must stay
-// initialized for its lifetime. The library never calls Kokkos::initialize or
-// Kokkos::finalize: an application owns that, and a library that guesses gets it
-// wrong exactly once, in someone else's main().
+// Kokkos must be initialized before a Calculator is made and stay so while it
+// lives. The library never initializes or finalizes Kokkos: that belongs to the
+// application.
 #pragma once
 
 #include <cstddef>
@@ -28,191 +25,117 @@
 
 namespace pet {
 
-// Knobs that select a code path or describe the machine. Anything that changes
-// the ANSWER is off by default and has to be asked for.
+// Anything that changes the answer beyond rounding is off by default.
 struct Options {
-  // Build the neighbour list on the device (the default, and the fast path) or
-  // on the host. Both produce the same edge set in the same per-atom order; the
-  // arithmetic is issued differently, so results differ by a few fp32 ulps
-  // (measured ~3e-8 relative on the energy). Anything larger than that is a
-  // bug, not a setting -- which is why this switch exists at all, and what
-  // tests/test_device_vs_host.cpp holds it to.
+  // Build neighbour lists on the device. Host and device lists hold the same
+  // edges in the same order, so they agree to a few fp32 ulps (~3e-8 relative);
+  // tests/test_device_vs_host.cpp holds them to it.
   bool device_neighbors = true;
 
-  // Reuse the Verlet topology cache across calls. Worth it only for a caller
-  // stepping the same atoms (a relaxer, an MD driver); a one-shot evaluation
-  // pays the rebuild either way. On the round that builds the cache the result
-  // matches the uncached path to double round-off; once reused after the
-  // geometry moves it matches to a few fp32 ulps, because the cache states
-  // periodic images in unwrapped coordinates and the uncached search in wrapped
-  // ones. See NefCache in device_geometry.hpp for why that trade is the right
-  // one.
+  // Keep a Verlet cache of the neighbour topology across calls, for a caller
+  // stepping the same atoms (MD, a relaxation). See NefCache.
   bool cache_neighbors = false;
 
-  // Allow TF32 tensor-core GEMMs on NVIDIA. Faster (~15% on an RTX 4080, more
-  // on A100/H100), and it CHANGES THE ANSWER -- by ~0.1 meV/atom and a few
-  // meV/A -- so it stays off unless asked for and must be off for anything
-  // compared against a reference or checked for determinism.
-  //
-  // PROCESS-GLOBAL despite living here: cuBLAS fixes a handle's math mode when
-  // the handle is created, and there is one handle per process. A Calculator
-  // applies this at construction (early enough), but a second Calculator asking
-  // for something different will not change it. pet::set_tf32 in gemm.hpp is
-  // the direct control, and PET_TF32=1 sets the initial value.
+  // TF32 tensor-core GEMMs: faster (~15% on an RTX 4080, more on A100/H100),
+  // and ~0.1 meV/atom and a few meV/A off -- so never for a reference
+  // comparison or a determinism check. Process-global (see gemm.hpp).
   bool allow_tf32 = false;
 
-  // Which host neighbour search to use. The built-in one is an O(N^2 x images)
-  // brute force; vesin's is an O(N) cell list, and on a 1728-atom supercell the
-  // difference is ~450 ms against ~14 ms -- 95% of that evaluation's runtime.
-  //
-  // Only meaningful when the library was built with vesin (PET_WITH_VESIN);
-  // without it this falls back to the built-in search rather than failing, and
-  // `vesin_available()` says which you will get.
-  //
-  // The two do NOT produce the same edge ORDER -- the built-in search walks
-  // images in a fixed nested loop, vesin's list is sorted canonically by
-  // (i, j, shift) -- so results differ in the last bits, the same way the host
-  // and device builders already do. Both are individually reproducible.
+  // The host neighbour search: vesin's cell list, or the built-in O(N^2) one.
+  // Without vesin in the build, the built-in one either way. They agree on the
+  // edges, not on their order, so results differ in the last bits.
   enum class Neighbors { Builtin, Vesin };
   Neighbors neighbors = Neighbors::Vesin;
 
-  // Device memory a batch may occupy, in bytes. 0 queries the device.
+  // Device memory an evaluation may use, in bytes; 0 asks the device.
   std::size_t memory_budget_bytes = 0;
 
   // How much of the forward the backward recomputes instead of keeping (see
-  // pet::Recompute). Auto keeps everything that fits the memory budget above and
-  // steps down only when it must -- for the large models that is the difference
-  // between running and spilling to host memory (pet-omat-l at 1728 atoms: 12 s
-  // -> 0.6 s on a 16 GiB card).
+  // pet::Recompute). Auto keeps everything that fits memory_budget_bytes.
   Recompute recompute = Recompute::Auto;
 
-  // Replay a repeated evaluation -- same shapes, same buffers, as in a stepping
-  // loop -- as one CUDA graph launch instead of ~160 separate ones. Bit-identical
-  // to running it eagerly; the first evaluation of a shape runs eagerly and the
-  // second records. CUDA only; PET_GRAPHS=0 in the environment turns it off.
+  // Replay a repeated evaluation (same shapes and buffers, as in a stepping
+  // loop) as one CUDA graph: bit-identical, much faster for small structures.
+  // CUDA only; PET_GRAPHS=0 turns it off.
   bool graphs = true;
 
-  // Hard cap on atoms per batch, ahead of the memory estimate. 0 = derive it.
+  // A cap on atoms per batch ahead of the memory estimate; 0 = none.
   int max_batch_atoms = 0;
 };
 
-// Energy, forces and virial for one or more structures, in model units.
+// Energy, forces and virial for B structures of Ntot atoms in all.
 struct Results {
-  std::vector<double> energy;           // [B] total energy, eV
-  std::vector<double> per_atom_energy;  // [Ntot] eV (single-structure path only)
-  std::vector<double> forces;           // [Ntot*3] eV/Angstrom, F = -dE/dx
-  // [B*6] Voigt [xx, yy, zz, xy, xz, yz], eV. The SYMMETRIC virial
-  // W = V*sigma -- the physical stress times the volume. A strain-DOF optimizer
-  // typically wants dE/d(eps), whose off-diagonals are W_xy + W_yx = 2*W_xy;
-  // apply that factor at your own seam.
-  std::vector<double> virial;
-  std::vector<int> struct_id;  // [Ntot] owning structure per atom
-  std::vector<int> n_atoms;    // [B] atom count per structure (force-array offsets)
+  std::vector<double> energy;           // [B] eV
+  std::vector<double> per_atom_energy;  // [Ntot] eV
+  std::vector<double> forces;           // [Ntot*3] eV/A, F = -dE/dx
+  std::vector<double> virial;           // [B*6] eV, the symmetric W, Voigt order
+  std::vector<int> struct_id;           // [Ntot] each atom's structure
+  std::vector<int> n_atoms;             // [B]
 };
 
-// True when this build can use vesin for the host neighbour search. When false,
-// Options::neighbors is ignored and the built-in search is always used.
+// Whether the build can use vesin for the host neighbour search.
 bool vesin_available();
 
-// Directories searched for a NAMED model, highest priority first:
-//   1. $PET_MODEL_DIR (':'-separated) -- the knob for batch jobs
-//   2. ./models and .                 -- a self-contained run directory
-//   3. $XDG_DATA_HOME/pet/models, else ~/.local/share/pet/models
-//   4. the build-time source tree's models/ (developer convenience)
-// A directory matches only if it holds BOTH halves of the pair.
+// Where a named model is looked for, in order: $PET_MODEL_DIR (':'-separated),
+// ./models and ., $XDG_DATA_HOME/pet/models (else ~/.local/share/pet/models),
+// and this source tree's models/. A directory counts only if it holds both
+// <name>.json and <name>.safetensors.
 std::vector<std::string> model_search_dirs();
 
-// Resolve a model spec to a metadata-JSON + weights path pair. `spec` may be a
-// canonical model name ("pet-mad-xs"), or a filesystem path prefix
-// (<spec>.json + <spec>.safetensors). Empty resolves the default model.
-// Throws, listing every directory tried, when a named model is not found.
+// A model name ("pet-mad-xs") or a path prefix to <spec>.json and
+// <spec>.safetensors, to the two paths; empty is the default model. Throws,
+// listing where it looked, if a named model is not found.
 void resolve_model(const std::string& spec, std::string& json_out, std::string& weights_out);
 
-// Loads a PET model once (the safetensors parse and the device upload are the
-// expensive part) and evaluates structures against it. Reuse one Calculator
-// across many calls: it carries the persistent scratch pools that make a
-// stepping loop free of per-round device allocation.
-// Estimated raw (pre-adaptive-cutoff) edge count above which a single structure
-// is evaluated on the device neighbour path rather than the host one. The host
-// path's cost is its single-threaded work over the raw list -- the adaptive
-// cutoff, the NEF packing -- so this is the quantity that decides, not the atom
-// count: a 216-atom diamond cell at an 8 A cutoff has ~80k raw edges and took
-// 18.5 ms on the host path against ~6 ms on the device, while a 12-atom molecule
-// (132) is faster on the host. Measured crossover on a 4080 SUPER lies between
-// a 64-atom (24k: host 6.6 ms, device 7.3 ms) and that 216-atom cell.
+// A single structure goes to the device neighbour path when its raw edge count
+// (every pair within the cutoff) is estimated above this. The host path's cost
+// is its single-threaded work over that list: a 216-atom diamond cell at 8 A
+// (~80k raw edges) is 3x faster on the device, a 64-atom one (~24k) slightly
+// faster on the host.
 constexpr double kDeviceSingleMinRawEdges = 5e4;
 
+// A loaded model. Reuse one across calls: it holds the scratch pools, caches and
+// recorded graphs that make a stepping loop cheap.
 class Calculator {
  public:
-  // Resolve `spec` through the search path above; empty = the default model.
+  // Resolve `spec` as above; empty = the default model.
   explicit Calculator(const std::string& spec = "", Options opts = {});
-  // Explicit file pair, no searching.
   Calculator(const std::string& model_json, const std::string& model_weights, Options opts = {});
   ~Calculator();
-
   Calculator(Calculator&&) noexcept;
   Calculator& operator=(Calculator&&) noexcept;
   Calculator(const Calculator&) = delete;
   Calculator& operator=(const Calculator&) = delete;
 
-  // Evaluate one structure. Always takes the host neighbour-list path -- it is
-  // what the goldens validate, it returns the virial directly, and it is the
-  // only path that fills per_atom_energy.
+  // One structure, on the host or device neighbour path by size
+  // (kDeviceSingleMinRawEdges).
   Results compute(const System& system, bool compute_forces = true) const;
-
-  // Evaluate many (typically small) structures in ONE pass: each structure's
-  // NEF is built and the lot concatenated, so B small cells use a GPU as well
-  // as one big cell does. PET's network is per-atom/per-edge and edges never
-  // cross a structure boundary, so the per-atom energies and forces are
-  // identical to evaluating each structure alone -- bit-identical, in fact, on
-  // the host neighbour path (tests/test_determinism.cpp).
-  //
-  // A single-element vector delegates to the overload above, which means it
-  // takes the HOST neighbour path whatever Options::device_neighbors says, and
-  // fills per_atom_energy. That is deliberate -- one structure is not worth a
-  // device NEF build -- but it does mean the two entry points differ in the last
-  // bits for B == 1 (see the host/device comparison in
-  // tests/test_device_vs_host.cpp for the size of that: ~3e-8 relative).
+  // Several structures as one evaluation. Edges never cross structures, so each
+  // gets the answer it would alone (to the bit on the host path). One structure
+  // goes to the overload above.
   Results compute(const std::vector<System>& systems, bool compute_forces = true) const;
-
-  // Fully device-resident evaluation: `geom` is already-populated staging (see
-  // device_geometry.hpp) and the result stays in device Views. This is the path
-  // for a caller that owns its geometry on the device and never wants a host
-  // round-trip. Honours Options::cache_neighbors.
+  // From geometry already on the device (see stage), results left there.
   BatchResult compute_device(const DeviceGeom& geom, bool compute_forces = true) const;
-
-  // Staging Views sized for Ntot atoms in B structures, drawn from this
-  // Calculator's persistent pool. Fill them, then call compute_device.
+  // Device staging for n_atoms_total atoms in n_struct structures, from this
+  // Calculator's pool: fill it, then compute_device.
   DeviceGeom stage(int n_atoms_total, int n_struct) const;
 
-  // --- model properties ---
   const Hypers& hypers() const;
   double cutoff() const;
-  // Atomic numbers the model supports, ascending.
-  const std::vector<int>& atomic_types() const;
+  const std::vector<int>& atomic_types() const;  // supported atomic numbers, ascending
   bool supports(int atomic_number) const;
   const std::string& length_unit() const;
   const std::string& energy_unit() const;
-  // The output scaler fitted with this model. Not needed to evaluate anything --
-  // it is applied internally -- but it is the sharpest single fingerprint of
-  // WHICH checkpoint is loaded, which a golden uses to refuse a model it was not
-  // generated from.
+  // Applied internally; exposed as a fingerprint of which checkpoint is loaded.
   double energy_scale() const;
 
-  // Atoms per batch this model can afford right now. Two ceilings bind and the
-  // smaller wins: device MEMORY (the backward's saved activations are linear in
-  // EDGE SLOTS, atoms x neighbours, not in atoms) and THROUGHPUT (cost per round
-  // stops being flat well before memory runs out). Both need the neighbour count
-  // M, which is a property of the structures rather than the model, so the first
-  // call returns a measured per-featurizer floor and every call after it adapts.
-  // Ask per chunk, not once.
+  // Atoms per batch the device can afford: the smaller of what memory allows
+  // (the backward's saves scale with atoms x neighbours) and where throughput
+  // stops improving. The neighbour count is known only once something has been
+  // evaluated, so ask per chunk.
   int recommended_batch_atoms() const;
 
-  // Device scratch the evaluator is holding, and where it went. The pool is
-  // grow-only and keyed by label, so the breakdown attributes every byte to the
-  // buffer that asked for it -- which is the only practical way to find out why
-  // a large model in fp64 does not fit. Both are zero until something has been
-  // evaluated.
+  // Device scratch held, and what holds it.
   std::size_t workspace_bytes() const;
   std::vector<std::pair<std::string, std::size_t>> workspace_breakdown() const;
 
@@ -220,8 +143,6 @@ class Calculator {
   const Options& options() const;
 
  private:
-  // The device batch evaluation, shared by the multi-structure overload and by
-  // the single-structure one when the structure is large enough to prefer it.
   Results compute_batch(const std::vector<System>& systems, bool compute_forces) const;
 
   struct Impl;
