@@ -2087,6 +2087,17 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   // PetModel::readout is the same call for both featurizers.
   std::vector<View2D> sav_nh0(1), sav_nh1(1), sav_eh0(1), sav_eh1(1), sav_epred(1);
 
+  // Keep qkv [N*S, 3D] and the edge MLP's pre-activation [NM, 2*dff] for the
+  // backward, or rebuild them there? They are the widest saved activations, and
+  // each is one norm and one GEMM away from one that is saved anyway (tokens, eps).
+  // Estimated from the shapes: what the forward would save, per block and per layer.
+  const std::size_t NSz = std::size_t(N) * S, NMz = NM;
+  const std::size_t saved = sizeof(Net) * G *
+      (A * (NSz * 5 * D + NMz * (ffn_pre_width("gnn_layers.0.trans.layers.0.mlp") + D)) + NMz * 5 * D);
+  const bool keep = recompute_ == Recompute::Never ||
+                    (recompute_ == Recompute::Auto && (mem_budget_ == 0 || saved <= mem_budget_));
+  const bool save_wide = grad && keep;
+
   int blk = 0;  // running (GNN layer, attention layer) block index
   for (int L = 0; L < G; ++L) {
     const std::string g = "gnn_layers." + std::to_string(L);
@@ -2139,8 +2150,8 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
 
       View2D attn_in = ws_.n2("attn_in", N * S, D);
       norm(attn_in, tokens, tl + ".norm_attention");
-      View2D qkv = grad ? (sav_qkv[L][a] = ws_.n2("s_qkv_" + as, N * S, 3 * D))
-                        : ws_.n2("qkv", N * S, 3 * D);
+      View2D qkv = save_wide ? (sav_qkv[L][a] = ws_.n2("s_qkv_" + as, N * S, 3 * D))
+                             : ws_.n2_any("scratch:qkv", N * S, 3 * D);
       linear(qkv, attn_in, mat(tl + ".attention.input_linear.weight"),
              vec(tl + ".attention.input_linear.bias"));
       View2D attn_out = ws_.n2("attn_out", N * S, D);
@@ -2186,9 +2197,9 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
 
       View2D edge_norm = ws_.n2("edge_norm", NM, D);
       norm(edge_norm, eps, tl + ".norm_mlp");
-      View2D tmp_edge = grad ? ws_.n2("tmp_edge_" + as, NM, ew) : ws_.n2_any("scratch:ffpre", NM, ew);
+      View2D tmp_edge = save_wide ? (sav_tmp_edge[L][a] = ws_.n2("tmp_edge_" + as, NM, ew))
+                                  : ws_.n2_any("scratch:ffpre", NM, ew);
       feedforward("emlp_" + as, edge_next, edge_norm, tl + ".mlp", tmp_edge, grad, 1);
-      if (grad) sav_tmp_edge[L][a] = tmp_edge;
 
       node_cur = node_next;
       edge_cur = edge_next;
@@ -2322,6 +2333,14 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   // each step below turns them, in place, into the adjoints of its inputs --
   // every residual connection is then just "leave the value where it is".
   View2D edge_adj = ws_.n2("edge_adj", NM, D);
+  // Rebuild `lin(norm(in))` into scratch: a wide activation the forward did not keep.
+  auto rebuild = [&](View2D in, const std::string& nkey, const std::string& lin, const std::string& key) {
+    View2D x = ws_.n2_any("scratch:renorm", in.extent(0), in.extent(1));
+    norm(x, in, nkey);
+    View2D out = ws_.n2_any(key, in.extent(0), mat(lin + ".weight").extent(0));
+    linear(out, x, mat(lin + ".weight"), vec(lin + ".bias"));
+    return out;
+  };
   for (int L = G - 1; L >= 0; --L) {
     const std::string g = "gnn_layers." + std::to_string(L);
     const std::string ls = std::to_string(L);
@@ -2352,7 +2371,9 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
       // edge_out = eps + mlp(norm(eps)) and node_out = node_res + mlp(norm(node_res)):
       // afterwards edge_adj / node_adj hold the adjoints of eps / node_res.
       View2D enrm_adj = ws_.n2("enrm_adj", NM, D);
-      feedforward_bwd("emlpb_" + as, enrm_adj, edge_adj, tl + ".mlp", sav_tmp_edge[L][a]);
+      feedforward_bwd("emlpb_" + as, enrm_adj, edge_adj, tl + ".mlp",
+                      keep ? sav_tmp_edge[L][a]
+                           : rebuild(sav_eps[L][a], tl + ".norm_mlp", tl + ".mlp.w_in", "scratch:ffpre"));
       norm_bwd(edge_adj, enrm_adj, sav_eps[L][a], tl + ".norm_mlp");
       View2D ncn_adj = ws_.n2("ncn_adj", N, Dn);
       feedforward_bwd("cmlpb_" + as, ncn_adj, node_adj, tl + ".center_mlp", sav_tmp_center[L][a]);
@@ -2374,7 +2395,10 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
 
       View2D attn_in_adj = ws_.n2("attn_in_adj", N * S, D);
       attention_bwd(ws_, "attnb_" + as, "attn_" + as, attn_in_adj, cf_seq_adj, ao_adj,
-                    sav_qkv[L][a], d_cf_seq, mat(tl + ".attention.input_linear.weight"),
+                    keep ? sav_qkv[L][a]
+                         : rebuild(sav_tokens[L][a], tl + ".norm_attention",
+                                   tl + ".attention.input_linear", "scratch:qkv"),
+                    d_cf_seq, mat(tl + ".attention.input_linear.weight"),
                     mat(tl + ".attention.output_linear.weight"), N, S, h_.num_heads, h_.head_dim,
                     h_.attention_temperature);
       View2D tokens_adj = ws_.n2("tokens_adj", N * S, D);

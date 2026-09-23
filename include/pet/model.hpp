@@ -203,6 +203,10 @@ class PetModel {
 
   const Hypers& hypers() const { return h_; }
 
+  // Memory the saved activations may take before Recompute::Auto starts
+  // recomputing instead (0 = unlimited), and the policy itself.
+  void set_memory_policy(std::size_t budget_bytes, Recompute r) { mem_budget_ = budget_bytes, recompute_ = r; }
+
   // Adaptive-cutoff probe grid: constant given the hypers, so it is precomputed
   // once in the constructor and reused (the NEF builder and the backward both
   // consume it, avoiding a per-step allocation + host->device copy).
@@ -251,6 +255,8 @@ class PetModel {
   RView1D probes_;                   // adaptive-cutoff probe grid (constant, precomputed)
   int n_probes_ = 0;
   Workspace ws_;                     // persistent scratch buffers reused per compute()
+  std::size_t mem_budget_ = 0;       // see set_memory_policy
+  Recompute recompute_ = Recompute::Auto;
 
   std::unordered_map<std::string, View2D> mat_;  // matrices / embedding tables
   std::unordered_map<std::string, View1D> vec_;  // biases / norm weights

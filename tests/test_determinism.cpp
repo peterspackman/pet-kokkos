@@ -185,3 +185,24 @@ TEST_CASE("a reused Calculator gives the same batched answer every time",
     }
   }
 }
+
+TEST_CASE("recomputing activations in the backward changes nothing", "[model][determinism]") {
+  // Recompute::Always rebuilds qkv and the edge MLP's pre-activation from the
+  // saved norm inputs with the same kernels on the same data, so the answer must
+  // be bit-identical to keeping them -- anything else means the rebuild is not
+  // the forward it claims to be.
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    pet::Options keep, rebuild;
+    keep.recompute = pet::Recompute::Never;
+    rebuild.recompute = pet::Recompute::Always;
+    pet::Calculator a(found->first, found->second, keep), b(found->first, found->second, rebuild);
+    for (const auto& path : golden_paths(model)) {
+      const Golden g = load_golden(path);
+      DYNAMIC_SECTION(model << " / " << g.name) {
+        require_bit_identical(a.compute(g.system, true), b.compute(g.system, true), "recompute");
+      }
+    }
+  }
+}
