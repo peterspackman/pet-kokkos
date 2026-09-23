@@ -130,6 +130,19 @@ struct WeightRef {
   std::size_t extent(int d) const { return v.extent(d); }
 };
 
+// compress.0 of one GNN layer with everything that is not a learned activation
+// folded in at load time (PetModel::load_all). Its input is [edge_emb | nb_emb |
+// input_edge]: edge_emb = edge_embedder(v, |v|) is linear in the geometry, and
+// nb_emb -- or, at layer 0, input_edge -- is a pure species lookup, so compress.0
+// applied to them is a [D,4] matrix and a per-species table. Only input_edge at
+// layers > 0 is a real activation, and only it needs a GEMM.
+struct CompressFold {
+  View2D wx;     // [D,4] the edge_emb block times edge_embedder: geometry straight in
+  View1D b;      // [D]   compress.0's bias plus that block times edge_embedder's bias
+  View2D tab;    // [n_species, D] the species-only block, pre-multiplied
+  WeightRef wi;  // [D,D] the input_edge block; empty at layer 0, where it is in `tab`
+};
+
 class PetModel {
  public:
   explicit PetModel(const Checkpoint& ckpt);
@@ -292,6 +305,7 @@ class PetModel {
   // gathers -- keeps compiling unchanged.
   WeightRef mat(const std::string& name) const;
   const View1D& vec(const std::string& name) const;
+  CompressFold compress_fold(int layer) const;
 
   // --- architecture-varying components, resolved from the loaded hypers -------
   //
@@ -311,8 +325,9 @@ class PetModel {
   // backward reads: [R, 2*dff] for SwiGLU, whose w_in emits an interleaved
   // value/gate pair, or [R, dff] for a plain SiLU. Its width comes from the loaded
   // w_in, so the caller does not need to know which activation is in play.
+  // beta = 1 accumulates onto `out` (a residual) instead of overwriting it.
   void feedforward(const std::string& key, View2D out, View2D in, const std::string& wkey,
-                   View2D pre, bool save);
+                   View2D pre, bool save, Net beta = 0);
   void feedforward_bwd(const std::string& key, View2D in_adj, View2D out_adj,
                        const std::string& wkey, View2D pre);
   // Width of `pre` for a given w_in — 2*dff or dff, per the activation.
