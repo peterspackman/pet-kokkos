@@ -1,13 +1,8 @@
-// Finite-difference validation of the analytic forces and virial against the
-// model's OWN energy. No reference implementation is involved: if F != -dE/dx
-// for the energy this very model returns, the backward disagrees with the
-// forward, and no golden can tell you that.
-//
-// The network runs in fp32 under the default mixed precision, so the energy
-// carries a quantization floor that swamps a naive h=1e-6 difference. We
-// therefore sweep h and take the best: a correct backward shows the classic V
-// shape (truncation error ~h^2 falling, then noise ~eps/h rising) with a clear
-// minimum; a wrong backward shows a floor that never drops.
+// The analytic forces and virial against finite differences of the model's own
+// energy: the backward must be the forward's derivative, which no golden can
+// check. The fp32 energy has a quantization floor, so h is swept: a correct
+// backward shows the V (h^2 truncation falling, eps/h noise rising), a wrong one
+// a floor.
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -22,21 +17,15 @@ using namespace pet_test;
 
 namespace {
 
-// Deformation matrix (row-major) for a Voigt strain: def = I + E, with
-//   E = [[e0, e3, e4],
-//        [e3, e1, e5],
-//        [e4, e5, e2]]
-// The shear components go into BOTH off-diagonal slots. That choice is what
-// sets the factor below: differentiating with respect to a parameter that
-// appears twice gives dE/de3 = dE/dE_xy + dE/dE_yx = 2 * W_xy, and W_xy is what
-// Results::virial[3] holds (the symmetric virial W = V*sigma).
+// The deformation I + E for a Voigt strain, E = [[e0 e3 e4] [e3 e1 e5] [e4 e5 e2]].
+// A shear sits in both off-diagonal slots, so dE/de3 = 2 W_xy.
 std::array<double, 9> strain_to_def(const std::array<double, 6>& e) {
   return {1.0 + e[0], e[3],       e[4],
           e[3],       1.0 + e[1], e[5],
           e[4],       e[5],       1.0 + e[2]};
 }
 
-// Voigt component v: 1 for the diagonals, 2 for the shears. See above.
+// 1 for a diagonal, 2 for a shear.
 constexpr double voigt_multiplicity(int v) { return v < 3 ? 1.0 : 2.0; }
 
 pet::System strained(const pet::System& s0, int v, double h) {
@@ -50,7 +39,7 @@ pet::System strained(const pet::System& s0, int v, double h) {
       st.positions[static_cast<std::size_t>(i) * 3 + r] =
           d[r * 3 + 0] * p[0] + d[r * 3 + 1] * p[1] + d[r * 3 + 2] * p[2];
   }
-  // Cell ROWS are lattice vectors, and each transforms like a position.
+  // Lattice vectors (rows) transform like positions.
   for (int a = 0; a < 3; ++a) {
     const double row[3] = {s0.cell[a * 3 + 0], s0.cell[a * 3 + 1], s0.cell[a * 3 + 2]};
     for (int r = 0; r < 3; ++r)
@@ -61,11 +50,8 @@ pet::System strained(const pet::System& s0, int v, double h) {
 
 constexpr double kSteps[] = {1e-2, 5e-3, 2e-3, 1e-3, 5e-4, 2e-4};
 
-// A conservative backward differenced against an fp32 forward should land well
-// inside 1e-3 relative. But on a near-equilibrium structure the forces ARE the
-// noise floor, so a relative test on them is meaningless -- hence
-// relative-OR-absolute, with the absolute floor set by what the fp32 energy
-// quantization can possibly resolve over the smallest useful step.
+// Relative or absolute: near equilibrium the forces are themselves the noise
+// floor, and the absolute floor is what the fp32 energy can resolve.
 constexpr double kRelTol = 1e-3;
 constexpr double kForceAbsTol = 3e-3;   // eV/Angstrom
 constexpr double kVirialAbsTol = 3e-2;  // eV
@@ -109,12 +95,8 @@ TEST_CASE("analytic forces match -dE/dx by finite difference", "[model][fd]") {
             best = err_h;
             best_h = h;
           }
-          // The sweep exists to find the step where truncation and round-off
-          // balance, which is only worth searching for when the check has not
-          // already passed. Stopping at the first step that agrees keeps the
-          // failure diagnostic (a genuine mismatch still tries every step and
-          // reports the best one) and makes the passing case -- every run where
-          // nothing is broken -- up to six times cheaper.
+          // Stop at the first step that agrees; a real mismatch still tries every step
+          // and reports the best.
           if (best / std::max(max_f, 1e-30) < kRelTol || best < kForceAbsTol) break;
         }
         const double rel = best / std::max(max_f, 1e-30);

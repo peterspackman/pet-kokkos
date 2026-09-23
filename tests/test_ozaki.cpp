@@ -1,14 +1,7 @@
-// The Ozaki slice-GEMM, on its own, against the vendor fp64 GEMM.
-//
-// Deliberately not a model test. The int8 path has failure modes -- cuBLAS
-// layout constraints, a normalisation applied along the wrong axis, a slice
-// count too small for the dynamic range -- that a golden would report as "the
-// energy is a bit off" and nothing more. Here the reference is exact
-// (cuBLAS DGEMM on the same matrices) and the failure says which.
-//
-// These run only where the Ozaki path is actually available (a CUDA build in
-// fp64 precision); elsewhere gemm_ozaki falls back to the native GEMM and the
-// comparison would be tautological, so the tests skip with a warning.
+// The Ozaki GEMM against DGEMM on the same matrices, so a failure (a layout,
+// the wrong normalisation axis, too few slices) says which rather than showing
+// as a slightly-off energy. Only where the path is live (CUDA, fp64); skipped
+// elsewhere.
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -23,9 +16,7 @@
 
 namespace {
 
-// Fill with random values spanning `decades` orders of magnitude, so the split's
-// per-row normalisation has something to do. A uniform [-1, 1] fill would pass
-// even with the scaling removed entirely.
+// Values across `decades` orders of magnitude, so the per-row scaling matters.
 void fill_random(const pet::View2D& v, unsigned seed, double decades) {
   auto h = Kokkos::create_mirror_view(v);
   std::mt19937 rng(seed);
@@ -60,10 +51,8 @@ struct Case {
   char ta, tb;
 };
 
-// The Ozaki configuration is process-global, so a test that leaves it switched
-// on changes every test that runs after it -- including, in the same binary, the
-// golden and determinism suites. Restoring it on scope exit rather than at the
-// end of the test body means an early CHECK failure cannot leak it.
+// The configuration is process-global: restore it on scope exit, so a failed
+// CHECK cannot leave it on for later tests.
 struct ConfigGuard {
   pet::OzakiConfig saved = pet::ozaki_config();
   ~ConfigGuard() { pet::ozaki_config() = saved; }
@@ -82,9 +71,7 @@ TEST_CASE("the Ozaki GEMM reproduces DGEMM as slices increase", "[ozaki]") {
     return;
   }
 
-  // Shapes taken from the network: a tall-skinny activation matrix against a
-  // square-ish weight, in both the transposed (linear) and untransposed
-  // (linear_bwd) orientations the three GEMM call sites use.
+  // Network shapes: tall activations against a square weight, both orientations.
   const std::vector<Case> cases = {
       {4096, 256, 768, 'N', 'T'},   // linear: in @ W^T, qkv projection
       {4096, 256, 256, 'N', 'N'},   // linear_bwd: out_adj @ W
@@ -104,9 +91,7 @@ TEST_CASE("the Ozaki GEMM reproduces DGEMM as slices increase", "[ozaki]") {
 
       pet::gemm(c.ta, c.tb, (pet::Net) 1.0, A, B, (pet::Net) 0.0, Cref);
 
-      // More slices must mean less error, monotonically, and the full count must
-      // land at fp64 round-off. A scheme that is subtly wrong tends to plateau
-      // early instead -- the extra slices carry bits that never arrive.
+      // Error falls with every slice; a subtly wrong scheme plateaus early.
       double prev = 1e30;
       for (int s : {2, 4, 6, 8}) {
         guard.use(s);
@@ -118,8 +103,7 @@ TEST_CASE("the Ozaki GEMM reproduces DGEMM as slices increase", "[ozaki]") {
         CHECK(err < prev);
         prev = err;
       }
-      // 8 slices of 7 bits is 56 bits, past fp64's 53, so what is left is the
-      // reference's own rounding rather than the scheme's truncation.
+      // 56 bits > 53: what remains is the reference's rounding.
       CHECK(prev < 1e-14);
       guard.native();
     }
@@ -127,11 +111,8 @@ TEST_CASE("the Ozaki GEMM reproduces DGEMM as slices increase", "[ozaki]") {
 }
 
 TEST_CASE("a pre-split weight gives the same answer as splitting in place", "[ozaki]") {
-  // The point of the whole exercise: PET's GEMMs all have a constant weight, so
-  // its decomposition is computed once at load. That shortcut is only sound if
-  // the result is identical to splitting it on every call -- and the weight uses
-  // a matrix-wide scale where an activation uses per-row, so this is not a
-  // tautology.
+  // A weight split once at load (matrix-wide scale) must match splitting per call
+  // (per-row scale) to fp64 round-off; not to the bit, as the scales differ.
   if (!pet::ozaki_available()) {
     WARN("Ozaki path unavailable in this build; skipping");
     return;
@@ -156,9 +137,6 @@ TEST_CASE("a pre-split weight gives the same answer as splitting in place", "[oz
 
   const double d = max_rel_diff(C2, C1);
   INFO("pre-split vs in-place: max relative difference " << d);
-  // Not bit-identical: the in-place path splits W per row, the pre-split one
-  // matrix-wide, so they spend their mantissa differently. Both are within fp64
-  // round-off of the true product, which is the claim that matters.
   CHECK(d < 1e-13);
 
   pet::View2D Cref("Cref", m, n);
@@ -169,11 +147,8 @@ TEST_CASE("a pre-split weight gives the same answer as splitting in place", "[oz
 }
 
 TEST_CASE("beta accumulates rather than overwriting", "[ozaki]") {
-  // linear_bwd calls the GEMM with beta = 1 to accumulate into an existing
-  // adjoint. The Ozaki path folds its slice grid into C over several passes, so
-  // beta has to be applied exactly once, on the first -- getting that wrong
-  // multiplies the incoming adjoint by the number of shifts, which is the kind
-  // of error that produces plausible-looking wrong forces.
+  // linear_bwd accumulates with beta = 1; the slice grid is folded into C over
+  // several passes, so beta must apply exactly once.
   if (!pet::ozaki_available()) {
     WARN("Ozaki path unavailable in this build; skipping");
     return;
@@ -197,9 +172,7 @@ TEST_CASE("beta accumulates rather than overwriting", "[ozaki]") {
 }
 
 TEST_CASE("Ozaki against DGEMM: throughput", "[ozaki][!benchmark]") {
-  // Reports rather than asserts. The number that matters is the ratio against
-  // DGEMM at the same shape, because that is the trade being offered: fp64
-  // accuracy, but through int8 tensor cores instead of the fp64 pipes.
+  // Reported, not asserted: the time against DGEMM at the same shape.
   if (!pet::ozaki_available()) {
     WARN("Ozaki path unavailable in this build; skipping");
     return;

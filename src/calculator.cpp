@@ -99,14 +99,11 @@ std::vector<std::string> model_search_dirs() {
     if (!d.empty()) dirs.push_back(std::move(d));
   };
 
-  if (const char* e = std::getenv("PET_MODEL_DIR")) {
-    const std::string s(e);
-    for (std::size_t p = 0; p <= s.size();) {
-      const std::size_t q = s.find(':', p);
-      add(s.substr(p, (q == std::string::npos ? s.size() : q) - p));
-      if (q == std::string::npos) break;
-      p = q + 1;
-    }
+  const char* e = std::getenv("PET_MODEL_DIR");
+  const std::string env = e ? e : "";
+  for (std::size_t p = 0, q; p <= env.size(); p = q + 1) {
+    q = std::min(env.find(':', p), env.size());
+    add(env.substr(p, q - p));
   }
   add("models");
   add(".");

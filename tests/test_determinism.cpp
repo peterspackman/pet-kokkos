@@ -1,20 +1,8 @@
-// Bit-exact reproducibility, run to run.
-//
-// This is not a nicety. A relaxation is a chaotic map: last-bit force noise
-// grows into multi-kJ/mol differences in relaxed energies and reshuffled
-// rankings. Getting here meant removing float atomics from every reduction the
-// energy depends on -- neighbour slots assigned by a per-atom walk in edge-list
-// order rather than by atomic_fetch_add in thread-arrival order (by far the
-// largest source); per-edge force gradients GATHERED per atom via the
-// reverse-edge map instead of scattered with two atomics per edge;
-// per-structure energy and virial as ordered segmented sums; the attention
-// backward's cutoff adjoint summed over heads in index order in a single
-// thread.
-//
-// It needs no golden: it compares the model against itself. Any change that
-// reintroduces an order-dependent reduction fails here and nowhere else, which
-// is exactly why it has to stay in CI -- and why it must run with TF32 off,
-// since a tensor-core GEMM is its own source of run-to-run variation.
+// Bit-exact reproducibility, run to run. A relaxation is chaotic: last-bit
+// force noise becomes different relaxed structures. So no float atomics feed the
+// energy: neighbour slots follow the edge list, force gradients are gathered per
+// atom, and per-structure sums are ordered. The model is compared against
+// itself, with TF32 off.
 #include <catch2/catch_test_macros.hpp>
 
 #include <memory>
@@ -28,8 +16,7 @@ using namespace pet_test;
 
 namespace {
 
-// Every evaluation of the same geometry must agree to the BIT, not to a
-// tolerance. A tolerance here would pass the very bug this test exists to catch.
+// To the bit: a tolerance would pass the bug this exists to catch.
 void require_bit_identical(const pet::Results& a, const pet::Results& b, const char* what) {
   INFO(what);
   REQUIRE(a.energy.size() == b.energy.size());
@@ -55,9 +42,7 @@ TEST_CASE("repeated evaluation is bit-identical", "[model][determinism]") {
       continue;
     }
     pet::Calculator calc(found->first, found->second);
-    // The GLOBAL, not the Options field: TF32 is a property of the process's
-    // cuBLAS handle, so checking the field would pass while a stray PET_TF32=1
-    // in the environment quietly made this test meaningless.
+    // The process-global setting, which PET_TF32=1 could have turned on.
     REQUIRE_FALSE(pet::tf32_enabled());
 
     for (const auto& path : golden_paths(model)) {
@@ -73,22 +58,10 @@ TEST_CASE("repeated evaluation is bit-identical", "[model][determinism]") {
 
 TEST_CASE("a batch gives each structure the same answer as evaluating it alone",
           "[model][determinism]") {
-  // PET's network is per-atom and per-edge, and edges never cross a structure
-  // boundary, so concatenating structures into one NEF must not change any
-  // per-atom energy or force. Padding slots carry cutoff_factor = 0, so the
-  // attention softmax skips them and the real neighbour slots keep their order.
-  //
-  // The batch runs on the HOST neighbour path here, because the single-structure
-  // entry point always does: comparing a device-built batch against a host-built
-  // single would measure the two builders against each other rather than the
-  // concatenation, and that comparison has its own test
-  // (test_device_vs_host.cpp).
-  //
-  // Not bit equality. Concatenation pads every row to the batch-wide M and the
-  // energy reduction becomes an ordered segmented sum over each structure's
-  // atom range instead of a whole-array sum, so the fp32 network sees a
-  // different summation order. The bound is relative to the largest force in
-  // the structure: an absolute one says nothing without knowing that scale.
+  // Edges never cross structures, so batching must not change any atom's energy
+  // or force. Both sides run on the host neighbour path (these structures are
+  // small), so this tests the concatenation, not the builders. Not to the bit:
+  // the batch pads to its own M and sums per segment, a different fp32 order.
   for (const auto& model : golden_models()) {
     const auto found = find_model(model);
     if (!found) continue;
@@ -133,18 +106,8 @@ TEST_CASE("a batch gives each structure the same answer as evaluating it alone",
 
 TEST_CASE("a reused Calculator gives the same batched answer every time",
           "[model][determinism]") {
-  // The batched path keeps per-structure counters in the pooled workspace, and
-  // those are atomic accumulators: if one is not zeroed between calls it carries
-  // the previous call's count. That is not hypothetical -- energy_forces_batch's
-  // segmentation counter relied on the pool's zeroing policy, which compute()
-  // turns OFF for the forward and only back on for the backward. An energy-only
-  // batch never runs a backward, so the policy stayed off and the second call
-  // put every atom in structure 0: the first structure got the whole batch's
-  // energy and the rest got nothing.
-  //
-  // Correct on the first call and silently wrong on the second is exactly the
-  // shape no single-shot test can see, so this one evaluates repeatedly, with
-  // and without forces, and demands the answer not move.
+  // Repeated evaluation, with and without forces, must not move: a counter left
+  // unzeroed between calls once put every atom of the second call in structure 0.
   for (const auto& model : golden_models()) {
     const auto found = find_model(model);
     if (!found) continue;
@@ -163,10 +126,7 @@ TEST_CASE("a reused Calculator gives the same batched answer every time",
         INFO(what);
         const pet::Results first = calc.compute(systems, forces);
         REQUIRE(first.energy.size() == systems.size());
-        // Every structure must have a sane per-atom energy. The failure this
-        // guards against gave structure 0 the sum of the whole batch and the
-        // others zero, which a same-vs-same comparison alone would miss if the
-        // very first call were already wrong.
+        // Catches that failure even if the first call already had it.
         for (std::size_t b = 0; b < systems.size(); ++b) {
           const double per_atom = first.energy[b] / std::max(1, systems[b].n_atoms);
           INFO("structure " << b << ": " << per_atom << " eV/atom");
@@ -188,9 +148,7 @@ TEST_CASE("a reused Calculator gives the same batched answer every time",
 }
 
 TEST_CASE("recomputing activations in the backward changes nothing", "[model][determinism]") {
-  // Every recompute tier re-runs the same kernels on the same data, so the answer
-  // must be bit-identical to keeping everything -- anything else means a rebuild
-  // is not the forward it claims to be.
+  // Every recompute tier re-runs the same kernels on the same data: bit-identical.
   for (const auto& model : golden_models()) {
     const auto found = find_model(model);
     if (!found) continue;
@@ -213,8 +171,7 @@ TEST_CASE("recomputing activations in the backward changes nothing", "[model][de
 }
 
 TEST_CASE("a replayed CUDA graph gives the eager answer", "[model][determinism]") {
-  // The first evaluation of a shape runs eagerly, the second records a graph and
-  // the rest replay it; all of them must equal an evaluation that never uses one.
+  // Eager, recording and replaying evaluations all equal one without graphs.
   for (const auto& model : golden_models()) {
     const auto found = find_model(model);
     if (!found) continue;

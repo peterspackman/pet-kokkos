@@ -1,23 +1,18 @@
-// Shared test helpers: locating models and loading golden references.
-//
-// Model weights are not in this repository (see README.md), so every test that
-// needs one has to be able to SKIP rather than fail when it is absent. A fresh
-// clone must produce a green test run; "green except the model tests, which
-// cannot run here" is what that means in practice, and it is reported as skips
-// so the difference is visible.
+// Shared test helpers: finding models and loading golden references. Weights
+// are not in the repository, so a test without its model skips, visibly.
 #pragma once
 
 #include <nlohmann/json.hpp>
 
-#include <array>
-#include <cstdlib>
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <cmath>
+#include <map>
 #include <optional>
 #include <stdexcept>
-#include <map>
 #include <string>
 #include <vector>
 
@@ -26,14 +21,23 @@
 
 namespace pet_test {
 
-// The larger of a running worst case and a new deviation, where NaN wins. Every
-// tolerance check accumulates a maximum, and std::max(m, NaN) returns m -- so a
-// result that had gone entirely NaN passed every one of them. (Found by poisoning
-// the workspace: forces were all NaN and the goldens stayed green.)
+// A running maximum in which NaN wins: std::max(m, NaN) is m, which lets an
+// all-NaN result pass every tolerance.
 inline double worst(double m, double x) { return (std::isnan(x) || x > m) ? x : m; }
 
-// Directory holding the golden reference structures, baked in at configure time.
 inline const char* golden_dir() { return PET_TEST_GOLDEN_DIR; }
+
+// The ':'-separated entries of an environment variable.
+inline std::vector<std::string> env_list(const char* name) {
+  const char* e = std::getenv(name);
+  const std::string s = e ? e : "";
+  std::vector<std::string> out;
+  for (std::size_t p = 0, q; p <= s.size(); p = q + 1) {
+    q = std::min(s.find(':', p), s.size());
+    if (q > p) out.push_back(s.substr(p, q - p));
+  }
+  return out;
+}
 
 // Resolve a named model, or nullopt when it is not installed on this machine.
 inline std::optional<std::pair<std::string, std::string>> find_model(const std::string& name) {
@@ -46,9 +50,7 @@ inline std::optional<std::pair<std::string, std::string>> find_model(const std::
   }
 }
 
-// A golden reference: the structure plus what metatrain's own evaluation of it
-// produced. Energies eV, positions Angstrom, forces eV/Angstrom, stress
-// eV/Angstrom^3.
+// A structure and metatrain's evaluation of it: eV, Angstrom, eV/A, eV/A^3.
 struct Golden {
   std::string model;
   std::string name;
@@ -56,9 +58,7 @@ struct Golden {
   bool periodic = false;
   double total_energy = 0.0;
   double volume = 0.0;
-  // The energy scale of the model this golden was generated from, when it
-  // recorded one. Used to refuse a mismatched model -- see require_matching_model.
-  std::optional<double> model_energy_scale;
+  std::optional<double> model_energy_scale;  // see require_matching_model
   std::vector<double> per_atom_energies;   // [N]
   std::vector<double> forces;              // [N*3]
   std::optional<std::array<double, 9>> stress;  // row-major 3x3, if periodic
@@ -86,7 +86,7 @@ inline Golden load_golden(const std::string& path) {
   for (const auto& p : g.at("positions"))
     for (int c = 0; c < 3; ++c) out.system.positions.push_back(p[c].get<double>());
 
-  // Golden cells store lattice vectors as ROWS, which is what pet::System wants.
+  // Lattice vectors as rows, like pet::System.
   int r = 0;
   for (const auto& row : g.at("cell")) {
     for (int c = 0; c < 3; ++c) out.system.cell[r * 3 + c] = row[c].get<double>();
@@ -113,36 +113,17 @@ inline Golden load_golden(const std::string& path) {
   return out;
 }
 
-// Directories scanned for goldens: the shipped ones, plus anything in
-// $PET_TEST_GOLDEN_EXTRA (':'-separated). The extra path exists because a model
-// whose weights cannot be redistributed still needs its goldens run somewhere --
-// generate them next to the weights and point this at the directory.
+// The shipped goldens, plus $PET_TEST_GOLDEN_EXTRA: goldens for a model whose
+// weights cannot be redistributed live next to those weights.
 inline std::vector<std::string> golden_dirs() {
   std::vector<std::string> dirs{golden_dir()};
-  if (const char* e = std::getenv("PET_TEST_GOLDEN_EXTRA")) {
-    const std::string s(e);
-    for (std::size_t p = 0; p <= s.size();) {
-      const std::size_t q = s.find(':', p);
-      std::string d = s.substr(p, (q == std::string::npos ? s.size() : q) - p);
-      if (!d.empty()) dirs.push_back(std::move(d));
-      if (q == std::string::npos) break;
-      p = q + 1;
-    }
-  }
+  for (auto& d : env_list("PET_TEST_GOLDEN_EXTRA")) dirs.push_back(d);
   return dirs;
 }
 
-// Refuse to compare a golden against a model it was not generated from.
-//
-// Model NAMES are not unique across time: `pet-mad-xs` means one checkpoint to
-// the goldens shipped here and a different one on HuggingFace today (different
-// weights, different cutoff width, grid vs solver). Both legitimately answer to
-// that name, so whichever directory comes first on the search path wins -- and
-// the symptom is a golden failing by 0.14 eV with no hint that it is comparing
-// two different models.
-//
-// energy_scale is the fingerprint: a per-model fitted constant, recorded in the
-// golden's model_metadata, and different for any two distinct checkpoints.
+// Refuse a golden made from a different checkpoint of the same name (pet-mad-xs
+// here and on HuggingFace today differ). energy_scale, a fitted constant, is the
+// fingerprint.
 inline void require_matching_model(const Golden& g, const pet::Calculator& calc) {
   if (!g.model_energy_scale) return;  // an older golden with no fingerprint
   const double want = *g.model_energy_scale, got = calc.energy_scale();
@@ -169,57 +150,25 @@ inline std::vector<std::string> golden_paths(const std::string& model) {
   return out;
 }
 
-// The models the goldens cover. Kept here so a new architecture lands as one
-// entry plus its goldens, not as an edit to every test. Extra names can be added
-// at run time through $PET_TEST_MODELS (':'-separated), which is how a model
-// that cannot be committed still gets exercised -- see golden_dirs().
+// The models the goldens cover, plus $PET_TEST_MODELS:
+//   pet-mad-xs       the 2026.1 checkpoint, grid adaptive cutoff
+//   pbe0-pet         residual featurizer: PostLN, LayerNorm, SiLU, cosine cutoff
+//   pet-mad-xs-v1.6  solver adaptive cutoff (tools/convert_pet.py --model
+//                    pet-mad-xs --out models/pet-mad-xs-v1.6)
+//   pet-attn2        synthetic, two attention layers, as every published model
+//                    from size m up has (tools/make_multilayer_checkpoint.py)
 inline const std::vector<std::string>& golden_models() {
   static const std::vector<std::string> m = [] {
-    // pet-mad-xs   -- 2026.1-era checkpoint, adaptive_cutoff_method = grid
-    // pbe0-pet     -- residual featurizer, PostLN, LayerNorm, SiLU, fixed cosine cutoff
-    // pet-mad-xs-v1.6 -- current release, adaptive_cutoff_method = solver. Its
-    //                 goldens are shipped; reproduce the model itself with
-    //                 "uv run tools/convert_pet.py --model pet-mad-xs
-    //                  --out models/pet-mad-xs-v1.6".
-    // pet-attn2  -- synthetic, num_attention_layers = 2 (see its goldens' notes,
-    //               and tools/make_multilayer_checkpoint.py). Synthetic only
-    //               because it is small enough to ship: A > 1 is the norm, not
-    //               the exception -- every published model from size m upward is
-    //               A = 2, and the XLs are A = 3. The small checkpoints that
-    //               happen to be A = 1 are the unrepresentative ones, which is
-    //               exactly why this case exists.
     std::vector<std::string> v{"pet-mad-xs", "pbe0-pet", "pet-mad-xs-v1.6", "pet-attn2"};
-    if (const char* e = std::getenv("PET_TEST_MODELS")) {
-      const std::string s(e);
-      for (std::size_t p = 0; p <= s.size();) {
-        const std::size_t q = s.find(':', p);
-        std::string n = s.substr(p, (q == std::string::npos ? s.size() : q) - p);
-        if (!n.empty()) v.push_back(std::move(n));
-        if (q == std::string::npos) break;
-        p = q + 1;
-      }
-    }
+    for (auto& n : env_list("PET_TEST_MODELS")) v.push_back(n);
     return v;
   }();
   return m;
 }
 
-// One Calculator per model, shared by every test case that wants default
-// options.
-//
-// Building a Calculator reads and parses a safetensors file and uploads every
-// weight to the device. Four test cases loop over the golden models, so each
-// model was being built about five times per run for no benefit: a Calculator is
-// immutable once constructed, and these cases only ever read from it.
-//
-// Only DEFAULT options are shared. A test that needs its own Options -- the
-// host/device comparisons, the cached-neighbour and TF32 cases -- must keep
-// constructing its own, or one test's settings would silently become another's.
-//
-// The cache is leaked deliberately. Calculators hold Kokkos Views, and a
-// function-local static is destroyed during static destruction, which runs after
-// Kokkos::finalize(); Kokkos rejects a View freed at that point. The process is
-// ending anyway.
+// One default-options Calculator per model, shared across test cases (loading
+// is the slow part). A test needing other Options builds its own. Leaked: freed
+// at static destruction, the Views would outlive Kokkos.
 inline pet::Calculator* shared_calculator(const std::string& model) {
   static auto* cache = new std::map<std::string, pet::Calculator*>();
   const auto it = cache->find(model);

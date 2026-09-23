@@ -48,9 +48,7 @@ TEST_CASE("a non-periodic frame reads back", "[io]") {
 }
 
 TEST_CASE("a Lattice= entry is read as rows and implies periodicity", "[io]") {
-  // System::cell stores lattice vectors as ROWS, and so does extxyz's Lattice=,
-  // so this is a straight copy -- but getting it transposed would go unnoticed
-  // on a cubic cell, hence the deliberately non-cubic one here.
+  // Non-cubic, so a transposed cell would show.
   std::istringstream in(
       "1\n"
       "Lattice=\"1 2 3 4 5 6 7 8 9\" Properties=species:S:1:pos:R:3\n"
@@ -78,9 +76,7 @@ TEST_CASE("an explicit pbc= entry overrides the lattice default", "[io]") {
 }
 
 TEST_CASE("multiple frames and extra columns", "[io]") {
-  // Columns past x/y/z (forces here) are ignored rather than rejected: a file
-  // that already carries a reference calculation is exactly what you want to
-  // evaluate against.
+  // Further columns (forces here) are ignored, not rejected.
   std::istringstream in(
       "2\n"
       "Properties=species:S:1:pos:R:3:forces:R:3\n"

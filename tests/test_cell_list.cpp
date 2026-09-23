@@ -1,18 +1,8 @@
-// The device cell list against the brute-force search it replaces.
-//
-// These compare the two device searches through a whole evaluation, because the
-// raw edge list is internal to build_nef_device and the thing that actually
-// matters is that the energy and forces come out the same. The edge SET has to
-// be identical; the ORDER legitimately differs (bins and shifts versus images
-// and atoms), so the comparison is to fp32 noise, exactly as for the host and
-// device builders.
-//
-// The cases are chosen for the ways a cell list goes wrong rather than for
-// realism: a box narrower than the cutoff (where the grid collapses to one bin
-// and the search has to reach several images), a two-bin box (where the same bin
-// is reached twice with different shifts), a strongly skewed cell (where the
-// interplanar spacing is much smaller than the lattice vector length), and a
-// batch mixing sizes.
+// The device cell list against the brute-force search, through whole
+// evaluations: the same edges in a different order, so equal to fp32 noise.
+// Cases are the ways a cell list goes wrong: a box narrower than the cutoff
+// (one bin, several images), two bins (one bin reached with two shifts), a
+// skewed cell (spacing well below the vector length), a mixed batch.
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
@@ -34,9 +24,7 @@ pet::System diamond(int n, double a, double shear = 0.0) {
                              {.25, .25, .25}, {.25, .75, .75}, {.75, .25, .75}, {.75, .75, .25}};
   const double L = n * a;
   s.pbc = {true, true, true};
-  // Row-major, lattice vectors as rows. The shear tilts c toward a, which
-  // shrinks the interplanar spacing without changing any vector's length --
-  // precisely the case a grid sized from |c| rather than the spacing gets wrong.
+  // Tilting c toward a shrinks the interplanar spacing but no vector's length.
   s.cell = {L, 0, 0, 0, L, 0, shear * L, 0, L};
   for (int i = 0; i < n; ++i)
     for (int j = 0; j < n; ++j)
@@ -88,10 +76,7 @@ TEST_CASE("the device cell list agrees with the brute-force search", "[model][ce
   setups.push_back({"two bins per axis", {diamond(3, 3.567)}});
   // 5x5x5 is comfortably multi-bin, the regime the grid is actually for.
   setups.push_back({"many bins", {diamond(5, 3.567)}});
-  // Sheared, so the interplanar spacing is well below the vector length. Sized
-  // to be genuinely multi-bin: at 4x4x4 the spacing is still under two cutoffs
-  // and the grid collapses to one bin, which would make this a duplicate of the
-  // narrow-box case rather than a test of the skew.
+  // Sheared, and big enough to stay multi-bin (4x4x4 would collapse to one bin).
   setups.push_back({"strongly skewed cell", {diamond(6, 3.567, 0.5)}});
   // A batch of different sizes, which exercises the per-structure grid offsets.
   setups.push_back({"mixed batch", {diamond(2, 3.567), diamond(4, 3.567), diamond(3, 3.567)}});
@@ -103,9 +88,8 @@ TEST_CASE("the device cell list agrees with the brute-force search", "[model][ce
     DYNAMIC_SECTION(s.name) {
       auto run = [&](pet::DeviceSearch mode) {
         guard.use(mode);
-        // A vector of two or more goes through the device batch path, which is
-        // what build_nef_device serves; a single structure takes the host path
-        // and would not exercise this at all.
+        // Two or more structures take the device batch path this tests; a small
+        // single one would go to the host.
         std::vector<pet::System> sys = s.systems;
         if (sys.size() == 1) sys.push_back(sys[0]);
         return calc.compute(sys, /*compute_forces=*/true);
@@ -125,9 +109,7 @@ TEST_CASE("the device cell list agrees with the brute-force search", "[model][ce
       const double dw = max_abs_diff(brute.virial, cells.virial);
       INFO("dE = " << de << " (scale " << escale << "), dF = " << df << " (scale " << fscale
                    << "), dW = " << dw);
-      // A missing or duplicated edge moves the energy far more than this. The
-      // bound is the fp32 network's own resolution, which is all the difference
-      // in edge ordering can produce.
+      // A missing or duplicated edge moves the energy far more than this.
       CHECK(de <= 1e-5 * std::max(escale, 1.0));
       CHECK(df <= 1e-5 * std::max(fscale, 1.0));
       CHECK(dw <= 1e-5 * std::max(escale, 1.0));
@@ -136,9 +118,7 @@ TEST_CASE("the device cell list agrees with the brute-force search", "[model][ce
 }
 
 TEST_CASE("the cell list is reproducible run to run", "[model][cells][determinism]") {
-  // Bin membership is filled with an atomic counter, so without the per-bin sort
-  // the neighbour order -- and the energy's last bits -- would vary between runs.
-  // This is the test that the sort is doing its job.
+  // Bins fill through an atomic counter; the per-bin sort makes it deterministic.
   const auto found = find_model("pet-mad-xs");
   if (!found) {
     WARN("model 'pet-mad-xs' is not installed; skipping");

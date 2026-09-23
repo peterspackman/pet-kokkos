@@ -1,9 +1,5 @@
-// Neighbour-list construction, independent of any model.
-//
-// These need no weights, so they run on a fresh clone. They cover the
-// preprocessing that reproduces metatrain's structures.py / adaptive_cutoff.py:
-// periodic image enumeration, NEF packing, the reverse-edge map, and the
-// adaptive cutoff.
+// Neighbour lists, adaptive cutoff and packing, with no model: metatrain's
+// structures.py and adaptive_cutoff.py. They run on a fresh clone.
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
@@ -77,9 +73,8 @@ TEST_CASE("a simple cubic lattice has the coordination number it should", "[neig
 }
 
 TEST_CASE("padding slots are masked and carry a zero cutoff factor", "[neighbors]") {
-  // Two atoms with very different environments in one cell, so the NEF has to
-  // pad. The padding must be invisible to the network: mask 0 and, critically,
-  // cutoff_factor 0, which is what makes the attention softmax skip it.
+  // Two very different environments, so the list pads. Padding must have mask 0
+  // and cutoff factor 0, which is what the attention skips.
   pet::System s;
   s.n_atoms = 3;
   s.pbc = {false, false, false};
@@ -105,10 +100,8 @@ TEST_CASE("padding slots are masked and carry a zero cutoff factor", "[neighbors
 }
 
 TEST_CASE("the reverse-edge map points both ways", "[neighbors]") {
-  // The backward GATHERS per-edge force gradients through this map instead of
-  // scattering them with atomics, so a wrong entry is a wrong force -- and a
-  // silently non-deterministic one if it were absent. Every real edge must have
-  // a partner, and following the map twice must return to where it started.
+  // The backward gathers force gradients through this map, so a wrong entry is a
+  // wrong force. Every real edge has a partner, and the map is an involution.
   const pet::System s = simple_cubic(3, 2.0);
   const pet::Hypers h = fixed_cutoff_hypers(2.5);
   const pet::EdgeData ed = pet::build_edge_data(s, h, identity_species());
@@ -157,9 +150,8 @@ TEST_CASE("the cutoff function is smooth and vanishes at the cutoff", "[neighbor
 }
 
 TEST_CASE("the adaptive cutoff tracks the target neighbour count", "[neighbors]") {
-  // A sparse structure and a dense one, with the same hypers. The adaptive
-  // scheme exists so both see roughly num_neighbors_adaptive neighbours, which
-  // a fixed cutoff cannot do.
+  // A sparse and a dense structure should both see about num_neighbors_adaptive
+  // neighbours, which no fixed cutoff can do.
   pet::Hypers h = fixed_cutoff_hypers(7.5);
   h.num_neighbors_adaptive = 8.0;
   REQUIRE(h.adaptive());
@@ -176,9 +168,8 @@ TEST_CASE("the adaptive cutoff tracks the target neighbour count", "[neighbors]"
 
   const double d = mean_neigh(dense), sp = mean_neigh(sparse);
   INFO("dense mean neighbours " << d << ", sparse " << sp);
-  // Not exact -- the scheme targets a SMOOTHED count, and the hard count within
-  // the chosen radius sits near it rather than on it. The point is that the two
-  // land in the same ballpark where a fixed 7.5 A cutoff would differ several-fold.
+  // Near, not on: the target is a smoothed count. A fixed 7.5 A cutoff would
+  // differ several-fold.
   CHECK(d > 4.0);
   CHECK(d < 20.0);
   CHECK(sp > 4.0);
@@ -186,8 +177,7 @@ TEST_CASE("the adaptive cutoff tracks the target neighbour count", "[neighbors]"
 }
 
 TEST_CASE("an isolated molecule is not wrapped into a phantom cell", "[neighbors]") {
-  // A non-periodic system has no cell, and enumerating images of one would tear
-  // the molecule apart. The distances must be the plain Cartesian ones.
+  // No cell, no images: plain Cartesian distances.
   pet::System s;
   s.n_atoms = 3;
   s.pbc = {false, false, false};
@@ -204,10 +194,8 @@ TEST_CASE("an isolated molecule is not wrapped into a phantom cell", "[neighbors
 }
 
 TEST_CASE("concatenating edge data preserves every structure's edges", "[neighbors]") {
-  // The batched path concatenates per-structure NEFs into one global index
-  // space. Atom-index references (reverse_index, raw_center/raw_neigh) are
-  // re-encoded in the combined M, and getting that wrong silently mixes
-  // structures together.
+  // Batching re-encodes atom references (reverse map, raw edges) in the combined
+  // index space; a mistake mixes structures.
   const auto species = identity_species();
   const pet::Hypers h = fixed_cutoff_hypers(2.5);
   const pet::EdgeData a = pet::build_edge_data(simple_cubic(2, 2.0), h, species);
@@ -242,17 +230,10 @@ TEST_CASE("concatenating edge data preserves every structure's edges", "[neighbo
 }
 
 TEST_CASE("the solver's root actually solves its own equation", "[neighbors]") {
-  // A self-consistency check that needs no reference implementation and no
-  // model: at the root the solver reports, the smoothed neighbour count
-  //     n_total(r) = sum_j bump(d_j, r, w) + target * (r / r_max)^3
-  // must equal `target`. If the Newton-bisection loop has not converged, or the
-  // bracket is wrong, or the derivative disagrees with the function it is
-  // supposed to differentiate, this fails -- and it localises the failure to the
-  // solver rather than to an energy several thousand FLOPs later.
-  //
-  // Driven through build_edge_data rather than the internals, so it also checks
-  // that the root reaches EdgeData at all: the backward reads it from there, and
-  // a path that drops it has no gradient.
+  // At the solver's root the smoothed count
+  //     n_total(r) = sum_j bump(d_j, r, w) + target (r / r_max)^3
+  // equals the target. Through build_edge_data, so the root must reach EdgeData,
+  // where the backward reads it.
   const pet::System s = simple_cubic(4, 2.3);
   pet::Hypers h = fixed_cutoff_hypers(7.5);
   h.cutoff_width_adaptive = 1.0;
@@ -263,8 +244,7 @@ TEST_CASE("the solver's root actually solves its own equation", "[neighbors]") {
   REQUIRE(static_cast<int>(ed.adapt_r.size()) == s.n_atoms);
   REQUIRE(static_cast<int>(ed.adapt_dn.size()) == s.n_atoms);
 
-  // The raw list is the full set within the search cutoff -- what the solver
-  // sums over, including edges the adaptive mask later drops.
+  // The raw list: everything within the search cutoff, as the solver sums.
   std::vector<std::vector<double>> dist_of(s.n_atoms);
   for (int e = 0; e < ed.n_raw; ++e) dist_of[ed.raw_center[e]].push_back(ed.raw_dist[e]);
 
@@ -280,16 +260,13 @@ TEST_CASE("the solver's root actually solves its own equation", "[neighbors]") {
     INFO("atom " << i << ": r = " << r << ", n_total(r) = " << n << ", target = "
                  << h.num_neighbors_adaptive);
     CHECK_THAT(n, WithinAbs(h.num_neighbors_adaptive, 1e-6));
-    // A converged root is interior, so its slope is live rather than zeroed by
-    // the clamp -- an all-clamped result would pass the line above vacuously.
+    // Interior, so its slope is live; all-clamped would pass the line above.
     CHECK(ed.adapt_dn[i] > 0.0);
   }
 }
 
 TEST_CASE("grid and solver choose different cutoffs", "[neighbors]") {
-  // They are two different schemes, not two spellings of one. If this ever
-  // passes trivially, the method switch has stopped switching anything -- which
-  // is the failure mode that silently returns the wrong model's energies.
+  // Two schemes, not two spellings: if these agree, the switch does nothing.
   const pet::System s = simple_cubic(4, 2.3);
   pet::Hypers grid = fixed_cutoff_hypers(7.5);
   grid.cutoff_width_adaptive = 1.0;
@@ -311,10 +288,8 @@ TEST_CASE("grid and solver choose different cutoffs", "[neighbors]") {
 }
 
 TEST_CASE("the solver's derivative matches its own cutoff function", "[neighbors]") {
-  // bump_dcutoff_dr must be the derivative of bump_cutoff, not of the exact
-  // mathematical bump -- the solver root-finds on the former, so a mismatch
-  // makes Newton converge to the wrong place (or not at all). Central
-  // differences in r at a spread of distances across the taper.
+  // bump_dcutoff_dr is the derivative of bump_cutoff as computed, not of the ideal
+  // bump, or Newton converges to the wrong place. Central differences in r.
   const double rc = 5.0, w = 1.0, hstep = 1e-6;
   for (double d = rc - w - 0.2; d <= rc + 0.2; d += 0.05) {
     const double num = (pet::detail::bump_cutoff(d, rc + hstep, w) -
@@ -327,14 +302,8 @@ TEST_CASE("the solver's derivative matches its own cutoff function", "[neighbors
 }
 
 TEST_CASE("the vesin and built-in neighbour searches find the same edges", "[neighbors]") {
-  // Not a tolerance comparison: these are integer pair lists, and they must
-  // contain exactly the same set of (i, j, shift) triples. Either search finding
-  // an edge the other misses is a bug in one of them, and the shipped goldens
-  // would only show it as a slightly wrong energy.
-  //
-  // The ORDER legitimately differs -- the built-in search walks images in a
-  // fixed nested loop, the vesin wrapper sorts canonically -- so the sets are
-  // compared, not the sequences.
+  // The same set of (i, j, shift) triples, exactly. Not the same order: the
+  // built-in search walks images in a loop, vesin's is sorted.
   if (!pet::vesin_available()) {
     WARN("built without vesin; skipping the neighbour-backend comparison");
     return;
@@ -347,8 +316,8 @@ TEST_CASE("the vesin and built-in neighbour searches find the same edges", "[nei
   };
   std::vector<Setup> setups;
   setups.push_back({"cubic 4x4x4, rc 5.0", simple_cubic(4, 2.3), 5.0});
-  // A cutoff larger than the box, so the search must reach several images out --
-  // the case a cell list gets wrong if its grid or its shift bookkeeping is off.
+  // A cutoff larger than the box: several images out, where a cell list's shift
+  // bookkeeping goes wrong.
   setups.push_back({"cubic 2x2x2, rc 7.5 (many images)", simple_cubic(2, 2.3), 7.5});
   {
     pet::System mol;
