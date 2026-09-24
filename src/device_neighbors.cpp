@@ -133,13 +133,8 @@ RView2D grid_cutoffs(Workspace& ws, const Hypers& h, int N, IView1D roff, RView1
 
 }  // namespace
 
-DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_high, RView1D probes,
-                                      int P, int N, IView1D species, IView1D re_i, IView1D re_j,
-                                      IView2D re_shift, RView2D re_vec, RView1D re_dist, int E,
-                                      const Hypers& h) {
-  const bool adaptive = h.adaptive(), bump = h.cutoff_function == CutoffFunction::Bump;
-  const double width = h.cutoff_width, cutoff = h.cutoff;
-  DeviceEdgeData dev;
+void edge_topology(Workspace& ws, EdgeMap& edge_map, DeviceEdgeData& dev, int N, IView1D species, IView1D re_i,
+                   IView1D re_j, IView2D re_shift, RView2D re_vec, RView1D re_dist, int E) {
   dev.n_atoms = N;
   dev.n_raw = E;
   dev.species = species;
@@ -210,6 +205,17 @@ DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_h
   } else {
     dev.orphan_off = IView1D(), dev.orphan_edge = IView1D();
   }
+}
+
+void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D probes, int P, int& m_high,
+                   int m_fixed, IView1D overflow) {
+  const bool adaptive = h.adaptive(), bump = h.cutoff_function == CutoffFunction::Bump;
+  const double width = h.cutoff_width, cutoff = h.cutoff;
+  const int N = dev.n_atoms, E = dev.n_raw;
+  auto roff = dev.raw_off, raw_rev = dev.raw_reverse, re_i = dev.raw_center, re_j = dev.raw_neigh;
+  auto re_dist = dev.raw_dist;
+  auto re_vec = dev.raw_vec;
+  auto species = dev.species;
 
   // The adaptive cutoff of each atom. Both schemes taper the neighbour count with
   // the bump, whatever the model's own cutoff function, as metatrain does.
@@ -236,14 +242,27 @@ DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_h
           Kokkos::atomic_inc(&count(re_i(e)));
         }
       });
-  int M = 0;
-  Kokkos::parallel_reduce(
-      "pet_maxM", RangePolicy(0, N), KOKKOS_LAMBDA(int a, int& m) { m = count(a) > m ? count(a) : m; },
-      Kokkos::Max<int>(M));
-  Kokkos::parallel_reduce(
-      "pet_nkept", RangePolicy(0, N), KOKKOS_LAMBDA(int a, int& c) { c += count(a); }, dev.n_edges);
-  M = std::max(M, 1);
-  if (m_high > 0) M = m_high = std::max(M, m_high);
+  // M: this geometry's largest count, or a stepping loop's fixed capacity -- then
+  // every slot is an edge row (padding is zero-weight), so the shapes do not
+  // change between its neighbour-list rebuilds, and an atom past it raises
+  // `overflow` for the caller to grow M and redo.
+  int M = m_fixed;
+  if (m_fixed > 0) {
+    dev.n_edges = N * M, dev.padded = true;
+    Kokkos::parallel_for(
+        "pet_overflow", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
+          if (count(a) > m_fixed) overflow(0) = 1;
+        });
+  } else {
+    Kokkos::parallel_reduce(
+        "pet_maxM", RangePolicy(0, N), KOKKOS_LAMBDA(int a, int& m) { m = count(a) > m ? count(a) : m; },
+        Kokkos::Max<int>(M));
+    Kokkos::parallel_reduce(
+        "pet_nkept", RangePolicy(0, N), KOKKOS_LAMBDA(int a, int& c) { c += count(a); }, dev.n_edges);
+    M = std::max(M, 1);
+    if (m_high > 0) M = m_high = std::max(M, m_high);
+    dev.padded = false;
+  }
   const int S = M + 1, NM = N * M;
   dev.max_neighbors = M;
 
@@ -267,7 +286,7 @@ DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_h
         // ignores a ThreadVectorRange's begin and walks [0, end).
         Kokkos::parallel_scan(Kokkos::ThreadVectorRange(t, roff(i + 1) - e0), [&](int q, int& s, bool final) {
           const int e = e0 + q;
-          if (final && keep(e)) {
+          if (final && keep(e) && s < M) {
             const int f = flat(e) = i * M + s;
             for (int c = 0; c < 3; ++c) edge_vec(f, c) = re_vec(e, c);
             dist(f) = re_dist(e);
@@ -281,7 +300,7 @@ DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_h
       });
   Kokkos::parallel_for(
       "pet_reverse", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
-        if (keep(e)) reverse(flat(e)) = raw_rev(e) >= 0 ? flat(raw_rev(e)) : -1;
+        if (flat(e) >= 0) reverse(flat(e)) = raw_rev(e) >= 0 ? flat(raw_rev(e)) : -1;
       });
   // The attention bias source: 1 for the central token, then the factors.
   Kokkos::parallel_for(
@@ -289,6 +308,15 @@ DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_h
         const int n = i / S, s = i % S;
         cf_seq(n, s) = s == 0 ? static_cast<Net>(1.0) : cut(n * M + s - 1);
       });
+}
+
+DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_high, RView1D probes,
+                                      int P, int N, IView1D species, IView1D re_i, IView1D re_j,
+                                      IView2D re_shift, RView2D re_vec, RView1D re_dist, int E,
+                                      const Hypers& h) {
+  DeviceEdgeData dev;
+  edge_topology(ws, edge_map, dev, N, species, re_i, re_j, re_shift, re_vec, re_dist, E);
+  edge_geometry(ws, dev, h, probes, P, m_high, 0, IView1D());
   return dev;
 }
 

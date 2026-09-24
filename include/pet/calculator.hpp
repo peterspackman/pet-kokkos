@@ -63,6 +63,12 @@ struct Options {
 
   // A cap on atoms per batch ahead of the memory estimate; 0 = none.
   int max_batch_atoms = 0;
+
+  // compute_step: size every step between neighbour-list rebuilds to one fixed
+  // capacity, so each replays one CUDA graph. It pads every atom to the largest
+  // neighbour count plus a margin, which costs more than replay saves wherever
+  // measured (64-atom crystal: equal; 648-atom water: 32.6 vs 27.5 ms/step).
+  bool md_fixed_shapes = false;
 };
 
 // Energy, forces and virial for B structures of Ntot atoms in all.
@@ -136,7 +142,18 @@ class Calculator {
   // Ghosts must reach ghost_cutoff() past the owned atoms, and every atom within
   // ghost_cutoff() - cutoff() must have its full neighbour list.
   // Edge gradients cost a copy of every edge back to the host: off when unused.
+  // It replaces any list set_neighbors holds.
   Results compute_edges(const EdgeListView& edges, bool compute_forces = true, bool edge_gradients = true) const;
+
+  // The same for an MD engine stepping one list: set_neighbors when the engine
+  // rebuilds it, then compute_step every step with the atoms' positions in the
+  // same order (and the cell, if the list has shifts). The list crosses to the
+  // device once per rebuild; a step moves positions and results. Pairs that
+  // drift past the cutoff weigh nothing; pairs past the list's own reach are the
+  // engine's to rebuild for, as with any Verlet list. See md_fixed_shapes.
+  void set_neighbors(const EdgeListView& list);
+  Results compute_step(const double* positions, const double* cell = nullptr, bool compute_forces = true,
+                       bool edge_gradients = false) const;
   // How far past its owned atoms an engine must supply ghosts: one cutoff per
   // message-passing layer, and one more for an adaptive cutoff, which needs each
   // of those atoms' complete neighbourhoods.
@@ -166,6 +183,7 @@ class Calculator {
 
  private:
   Results compute_batch(const std::vector<System>& systems, bool compute_forces) const;
+  Results session_results(const DeviceEdgeData& dev, bool compute_forces, bool edge_gradients) const;
 
   struct Impl;
   std::unique_ptr<Impl> impl_;

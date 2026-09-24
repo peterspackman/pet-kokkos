@@ -296,87 +296,106 @@ DeviceEdgeData build_device_batch(const std::vector<System>& systems, const Hype
                           cache);
 }
 
-DeviceEdgeData build_from_edges(const EdgeListView& v, const Hypers& h,
-                                const std::vector<int>& species_to_index, const RView1D& probes, int P,
-                                Workspace& ws, EdgeMap& edge_map, int& m_high, IView1D& input) {
+void EdgeSession::set(const EdgeListView& v, const std::vector<int>& species_to_index) {
   const int N = v.n_atoms, L = N > 0 ? v.offsets[N] : 0;
-  using HostI = Kokkos::View<const int*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>;
-  using HostR = Kokkos::View<const double**, Kokkos::LayoutRight, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>;
+  if (N > detail::PET_KEY_ATOM_MAX) throw std::runtime_error("pet: too many atoms for the edge key");
   std::vector<int> sp(N);
   for (int i = 0; i < N; ++i) {
     const int Z = v.atomic_numbers[i];
     sp[i] = (Z >= 0 && Z < (int) species_to_index.size()) ? species_to_index[Z] : -1;
     if (sp[i] < 0) throw std::runtime_error("pet: unsupported atomic number " + std::to_string(Z));
   }
-  IView1D species = ws.i1("el_species", N), off = ws.i1("el_off", N + 1), nbr = ws.i1("el_nbr", L);
-  RView2D pos = ws.r2("el_pos", N, 3), vin = ws.r2("el_vec", v.vectors ? L : 0, 3);
-  IView2D sin = ws.i2("el_shift", v.shifts ? L : 0, 3);
-  Kokkos::deep_copy(species, HostI(sp.data(), N));
-  Kokkos::deep_copy(off, HostI(v.offsets, N + 1));
-  if (L) Kokkos::deep_copy(nbr, HostI(v.neighbors, L));
-  if (N) Kokkos::deep_copy(pos, HostR(v.positions, N, 3));
-  if (v.vectors && L) Kokkos::deep_copy(vin, HostR(v.vectors, L, 3));
-  if (v.shifts && L)
-    Kokkos::deep_copy(sin, Kokkos::View<const int**, Kokkos::LayoutRight, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(v.shifts, L, 3));
-  if (v.shifts && !v.vectors && !v.cell) throw std::runtime_error("pet: an edge list with shifts needs vectors or a cell");
-  double hc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
-  if (v.cell) std::copy(v.cell, v.cell + 9, hc);
-
-  // The engine's edges within the cutoff, in its order: count, scan, fill.
-  const bool given = v.vectors != nullptr, shifted = v.shifts != nullptr;
-  const double rc2 = h.cutoff * h.cutoff;
-  const double h0 = hc[0], h1 = hc[1], h2 = hc[2], h3 = hc[3], h4 = hc[4], h5 = hc[5], h6 = hc[6], h7 = hc[7],
-               h8 = hc[8];
-  auto edge = KOKKOS_LAMBDA(int i, int e, double* x) {
-    if (given) {
-      for (int c = 0; c < 3; ++c) x[c] = vin(e, c);
-    } else {
-      const int a = shifted ? sin(e, 0) : 0, b = shifted ? sin(e, 1) : 0, d = shifted ? sin(e, 2) : 0;
-      x[0] = pos(nbr(e), 0) + (a * h0 + b * h3 + d * h6) - pos(i, 0);
-      x[1] = pos(nbr(e), 1) + (a * h1 + b * h4 + d * h7) - pos(i, 1);
-      x[2] = pos(nbr(e), 2) + (a * h2 + b * h5 + d * h8) - pos(i, 2);
+  // Directed edges grouped by centre: each atom's listed pairs, then the mirrors
+  // of the pairs that list it.
+  std::vector<int> off(N + 1, 0);
+  for (int i = 0; i < N; ++i) {
+    off[i + 1] += v.offsets[i + 1] - v.offsets[i];
+    if (v.half)
+      for (int e = v.offsets[i]; e < v.offsets[i + 1]; ++e) ++off[v.neighbors[e] + 1];
+  }
+  for (int i = 0; i < N; ++i) off[i + 1] += off[i];
+  const int E = off[N];
+  std::vector<int> ri(E), rj(E), sh(3 * std::size_t(E), 0), cur(off.begin(), off.end() - 1);
+  src.assign(E, 0), dir.assign(E, 1);
+  auto put = [&](int c, int n, int e, int sign) {
+    const int k = cur[c]++;
+    ri[k] = c, rj[k] = n, src[k] = e, dir[k] = sign;
+    if (!v.shifts) return;
+    for (int d = 0; d < 3; ++d) {
+      sh[3 * k + d] = sign * v.shifts[3 * e + d];
+      if (std::abs(sh[3 * k + d]) > detail::PET_KEY_SHIFT_BIAS) throw std::runtime_error("pet: cell shift too large for the edge key");
     }
-    return x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
   };
-  IView1D cnt = ws.i1("el_cnt", N), eoff = ws.i1("el_eoff", N + 1);
-  Kokkos::parallel_for(
-      "el_count", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
-        int n = 0;
-        double x[3];
-        for (int e = off(i); e < off(i + 1); ++e) {
-          const double d2 = edge(i, e, x);
-          n += d2 > 1e-24 && d2 <= rc2;
-        }
-        cnt(i) = n;
-      });
-  const int E = prefix_sum(cnt, eoff, N);
-  IView1D re_i = ws.i1("pet_re_i", E), re_j = ws.i1("pet_re_j", E);
-  IView2D re_shift = ws.i2("pet_re_shift", E, 3);
-  RView2D re_vec = ws.r2("pet_re_vec", E, 3);
-  RView1D re_dist = ws.r1("pet_re_dist", E);
-  input = ws.i1("el_input", E);
-  auto in = input;
-  Kokkos::parallel_for(
-      "el_fill", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
-        int o = eoff(i);
-        double x[3];
-        for (int e = off(i); e < off(i + 1); ++e) {
-          const double d2 = edge(i, e, x);
-          if (!(d2 > 1e-24 && d2 <= rc2)) continue;
-          re_i(o) = i, re_j(o) = nbr(e), in(o) = e;
-          for (int c = 0; c < 3; ++c) re_vec(o, c) = x[c], re_shift(o, c) = shifted ? sin(e, c) : 0;
-          re_dist(o++) = Kokkos::sqrt(d2);
-        }
-      });
+  for (int i = 0; i < N; ++i)
+    for (int e = v.offsets[i]; e < v.offsets[i + 1]; ++e) put(i, v.neighbors[e], e, 1);
+  if (v.half)
+    for (int i = 0; i < N; ++i)
+      for (int e = v.offsets[i]; e < v.offsets[i + 1]; ++e) put(v.neighbors[e], i, e, -1);
 
-  DeviceEdgeData dev =
-      build_device_edge_data(ws, edge_map, m_high, probes, P, N, species, re_i, re_j, re_shift, re_vec, re_dist, E, h);
+  using HostI = Kokkos::View<const int*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>;
+  IView1D species = ws.i1("md:species", N), re_i = ws.i1("md:re_i", E), re_j = ws.i1("md:re_j", E);
+  IView2D re_shift = ws.i2("md:re_shift", E, 3);
+  Kokkos::deep_copy(species, HostI(sp.data(), N));
+  if (E) {
+    Kokkos::deep_copy(re_i, HostI(ri.data(), E)), Kokkos::deep_copy(re_j, HostI(rj.data(), E));
+    Kokkos::deep_copy(re_shift, Kokkos::View<const int**, Kokkos::LayoutRight, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(sh.data(), E, 3));
+  }
+  dev = DeviceEdgeData();
+  edge_topology(ws, map, dev, N, species, re_i, re_j, re_shift, ws.r2("md:re_vec", E, 3), ws.r1("md:re_dist", E), E);
   dev.n_struct = 1;
   dev.n_local = v.n_local < 0 ? N : v.n_local;
-  dev.struct_id = ws.i1("el_sid", N);
-  dev.charge = ws.i1("el_charge", 1), dev.spin_multiplicity = ws.i1("el_spin", 1);
-  Kokkos::deep_copy(dev.struct_id, 0);
+  dev.struct_id = ws.i1("md:sid", N);  // zero-filled
+  shift = re_shift;
+  dev.charge = ws.i1("md:charge", 1), dev.spin_multiplicity = ws.i1("md:spin", 1);
   Kokkos::deep_copy(dev.charge, v.charge), Kokkos::deep_copy(dev.spin_multiplicity, v.spin_multiplicity);
+  n_pairs = L, M = 0, shifted = v.shifts != nullptr, valid = true;
+}
+
+const DeviceEdgeData& EdgeSession::step(const double* positions, const double* cell, const Hypers& h,
+                                        RView1D probes, int P, bool fixed) {
+  if (!valid) throw std::runtime_error("pet: no neighbour list set");
+  if (shifted && !cell) throw std::runtime_error("pet: an edge list with shifts needs the cell");
+  const int N = dev.n_atoms, E = dev.n_raw;
+  RView2D pos = ws.r2("md:pos", N, 3);
+  if (N)
+    Kokkos::deep_copy(pos, Kokkos::View<const double**, Kokkos::LayoutRight, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(positions, N, 3));
+  double hc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  if (cell) std::copy(cell, cell + 9, hc);
+  const double h0 = hc[0], h1 = hc[1], h2 = hc[2], h3 = hc[3], h4 = hc[4], h5 = hc[5], h6 = hc[6], h7 = hc[7],
+               h8 = hc[8];
+  auto re_i = dev.raw_center, re_j = dev.raw_neigh;
+  auto vec = dev.raw_vec;
+  auto dist = dev.raw_dist;
+  auto sh = shift;
+  Kokkos::parallel_for(
+      "md_vectors", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
+        const int i = re_i(e), j = re_j(e), a = sh(e, 0), b = sh(e, 1), c = sh(e, 2);
+        const double x = pos(j, 0) + (a * h0 + b * h3 + c * h6) - pos(i, 0);
+        const double y = pos(j, 1) + (a * h1 + b * h4 + c * h7) - pos(i, 1);
+        const double z = pos(j, 2) + (a * h2 + b * h5 + c * h8) - pos(i, 2);
+        const double d2 = x * x + y * y + z * z;
+        vec(e, 0) = x, vec(e, 1) = y, vec(e, 2) = z;
+        dist(e) = d2 > 1e-24 ? Kokkos::sqrt(d2) : 1e30;  // a coincident pair weighs nothing
+      });
+  int m_high = 0;
+  if (!fixed) {
+    edge_geometry(ws, dev, h, probes, P, m_high, 0, IView1D());
+    return dev;
+  }
+  // A capacity from this geometry's largest count, with room to move.
+  auto size_to_fit = [&] {
+    edge_geometry(ws, dev, h, probes, P, m_high, 0, IView1D());
+    M = dev.max_neighbors + std::max(2, dev.max_neighbors / 8);
+  };
+  if (M == 0) size_to_fit();
+  IView1D overflow = ws.i1("md:overflow", 1);
+  edge_geometry(ws, dev, h, probes, P, m_high, M, overflow);
+  int over = 0;
+  Kokkos::deep_copy(over, Kokkos::subview(overflow, 0));
+  if (over) {
+    size_to_fit();
+    edge_geometry(ws, dev, h, probes, P, m_high, M, overflow);
+  }
   return dev;
 }
 

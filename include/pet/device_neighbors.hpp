@@ -48,6 +48,18 @@ DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_h
                                       IView2D re_shift, RView2D re_vec, RView1D re_dist, int E,
                                       const Hypers& h);
 
+// The same in two parts, for a caller that keeps a topology across geometries
+// (an MD engine's list between its rebuilds). edge_topology: each atom's range
+// of the raw list, each edge's partner, the partnerless edges; the raw vectors
+// and distances are only held. edge_geometry, from dev.raw_vec/raw_dist: the
+// adaptive cutoffs, the kept edges and their slots. m_fixed > 0 fixes M, and
+// with it every shape (DeviceEdgeData::padded): an atom with more kept edges
+// sets overflow(0), and its extra edges are dropped.
+void edge_topology(Workspace& ws, EdgeMap& edge_map, DeviceEdgeData& dev, int N, IView1D species, IView1D re_i,
+                   IView1D re_j, IView2D re_shift, RView2D re_vec, RView1D re_dist, int E);
+void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D probes, int P, int& m_high,
+                   int m_fixed, IView1D overflow);
+
 // The same for one structure, from a host neighbour search: for tests.
 DeviceEdgeData build_device_edge_data(const System& sys, const Hypers& h,
                                       const std::vector<int>& species_to_index);

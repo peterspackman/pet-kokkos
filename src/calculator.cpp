@@ -142,6 +142,7 @@ struct Calculator::Impl {
   EdgeMap nbr_edge_map{16};
   int nbr_m_high = 0;
   NefCache cache;
+  EdgeSession md;  // an engine's list (compute_edges, set_neighbors)
 
   std::vector<int> atomic_types;
 
@@ -265,33 +266,47 @@ Results Calculator::compute_batch(const std::vector<System>& systems, bool compu
   return out;
 }
 
-Results Calculator::compute_edges(const EdgeListView& edges, bool compute_forces, bool edge_gradients) const {
+// An evaluation on the session's list, back in the engine's order.
+Results Calculator::session_results(const DeviceEdgeData& dev, bool compute_forces, bool edge_gradients) const {
   auto& I = *impl_;
-  IView1D input;
-  const DeviceEdgeData dev = build_from_edges(edges, I.ckpt.hypers, I.ckpt.species_to_index, I.model.probes(),
-                                              I.model.n_probes(), I.nbr_ws, I.nbr_edge_map, I.nbr_m_high, input);
   const BatchResult br = I.model.energy_forces_batch(dev, compute_forces);
   Results out;
-  out.n_atoms = {edges.n_atoms};
+  out.n_atoms = {dev.n_atoms};
   to_host(out.energy, br.energy);
   to_host(out.per_atom_energy, br.per_atom);
   if (!compute_forces) return out;
   to_host(out.forces, br.forces);
   to_host(out.virial, br.virial);
-  out.struct_id.assign(edges.n_atoms, 0);
+  out.struct_id.assign(dev.n_atoms, 0);
   if (!edge_gradients) return out;
-  // Back into the engine's order.
-  const int L = edges.n_atoms > 0 ? edges.offsets[edges.n_atoms] : 0;
-  out.edge_gradient.assign(std::size_t(L) * 3, 0.0);
+  // A half list's pair gets both directions: g(i -> j) - g(j -> i).
+  const EdgeSession& s = I.md;
+  out.edge_gradient.assign(std::size_t(s.n_pairs) * 3, 0.0);
   if (br.edge_grad.extent(0) > 0) {
     std::vector<double> g;
-    std::vector<int> idx;
     to_host(g, br.edge_grad);
-    to_host(idx, input);
-    for (std::size_t e = 0; e < idx.size(); ++e)
-      for (int c = 0; c < 3; ++c) out.edge_gradient[std::size_t(idx[e]) * 3 + c] = g[e * 3 + c];
+    for (std::size_t e = 0; e < s.src.size(); ++e)
+      for (int c = 0; c < 3; ++c) out.edge_gradient[std::size_t(s.src[e]) * 3 + c] += s.dir[e] * g[e * 3 + c];
   }
   return out;
+}
+
+Results Calculator::compute_edges(const EdgeListView& edges, bool compute_forces, bool edge_gradients) const {
+  auto& I = *impl_;
+  I.md.set(edges, I.ckpt.species_to_index);
+  const DeviceEdgeData& dev =
+      I.md.step(edges.positions, edges.cell, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), false);
+  return session_results(dev, compute_forces, edge_gradients);
+}
+
+void Calculator::set_neighbors(const EdgeListView& list) { impl_->md.set(list, impl_->ckpt.species_to_index); }
+
+Results Calculator::compute_step(const double* positions, const double* cell, bool compute_forces,
+                                 bool edge_gradients) const {
+  auto& I = *impl_;
+  const DeviceEdgeData& dev =
+      I.md.step(positions, cell, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), I.opts.md_fixed_shapes);
+  return session_results(dev, compute_forces, edge_gradients);
 }
 
 double Calculator::ghost_cutoff() const {

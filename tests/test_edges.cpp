@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <tuple>
 #include <vector>
 
 #include "pet/calculator.hpp"
@@ -72,16 +73,31 @@ pet::EdgeListView view(const Domain& d) {
   return v;
 }
 
-// Forces and virial folded from edge gradients, as an engine would.
+// Each listed pair's vector r_j + shift . cell - r_i.
+std::vector<double> vectors(const pet::EdgeListView& v) {
+  std::vector<double> r;
+  for (int i = 0; i < v.n_atoms; ++i)
+    for (int e = v.offsets[i]; e < v.offsets[i + 1]; ++e)
+      for (int c = 0; c < 3; ++c) {
+        double x = v.positions[3 * v.neighbors[e] + c] - v.positions[3 * i + c];
+        if (v.shifts)
+          for (int k = 0; k < 3; ++k) x += v.shifts[3 * e + k] * v.cell[3 * k + c];
+        r.push_back(x);
+      }
+  return r;
+}
+
+// Forces and virial folded from edge gradients, as an engine would; a half
+// list's gradient already holds both directions.
 void fold(const pet::EdgeListView& v, const std::vector<double>& g, std::vector<double>& f, double w[6]) {
   f.assign(std::size_t(v.n_atoms) * 3, 0.0);
+  const std::vector<double> vec = vectors(v);
   double w9[9] = {};
   for (int i = 0; i < v.n_atoms; ++i)
     for (int e = v.offsets[i]; e < v.offsets[i + 1]; ++e) {
       const int j = v.neighbors[e];
       double r[3];
-      for (int c = 0; c < 3; ++c)
-        r[c] = v.vectors ? v.vectors[3 * e + c] : v.positions[3 * j + c] - v.positions[3 * i + c];
+      for (int c = 0; c < 3; ++c) r[c] = vec[3 * e + c];
       for (int c = 0; c < 3; ++c) f[3 * i + c] += g[3 * e + c], f[3 * j + c] -= g[3 * e + c];
       for (int a = 0; a < 3; ++a)
         for (int b = 0; b < 3; ++b) w9[3 * a + b] += r[a] * g[3 * e + b];
@@ -165,16 +181,12 @@ TEST_CASE("a periodic engine's edges with shifts reproduce the periodic evaluati
         // it: every atom owned, images told apart by their shifts.
         const auto raw = pet::detail::build_raw_edges(g.system, calc->cutoff() + 0.5);
         std::vector<int> off(g.system.n_atoms + 1, 0), nbr, sh;
-        std::vector<double> vec;
-        for (const auto& e : raw) {
-          ++off[e.i + 1], nbr.push_back(e.j);
-          sh.insert(sh.end(), {e.sa, e.sb, e.sc}), vec.insert(vec.end(), {e.vx, e.vy, e.vz});
-        }
+        for (const auto& e : raw) ++off[e.i + 1], nbr.push_back(e.j), sh.insert(sh.end(), {e.sa, e.sb, e.sc});
         for (int i = 0; i < g.system.n_atoms; ++i) off[i + 1] += off[i];
         pet::EdgeListView v;
         v.n_atoms = g.system.n_atoms;
         v.positions = g.system.positions.data(), v.atomic_numbers = g.system.atomic_numbers.data();
-        v.offsets = off.data(), v.neighbors = nbr.data(), v.vectors = vec.data(), v.shifts = sh.data();
+        v.offsets = off.data(), v.neighbors = nbr.data(), v.shifts = sh.data(), v.cell = g.system.cell.data();
         const pet::Results r = calc->compute_edges(v, true), ref = calc->compute(g.system, true);
         CHECK(std::fabs(r.energy[0] - ref.energy[0]) <= 1e-5 * std::fabs(ref.energy[0]));
         double df = 0;
@@ -183,6 +195,117 @@ TEST_CASE("a periodic engine's edges with shifts reproduce the periodic evaluati
         CHECK(df <= 1e-4 * std::max(1.0, max_abs(ref.forces)));
       }
       break;
+    }
+  }
+}
+
+namespace {
+
+// A periodic structure's list as a periodic engine keeps it: every atom owned,
+// pairs out to cutoff + skin with their shifts, full or half.
+struct PeriodicList {
+  std::vector<int> off, nbr, sh;
+  bool half = false;
+  pet::EdgeListView view(const pet::System& s) const {
+    pet::EdgeListView v;
+    v.n_atoms = s.n_atoms;
+    v.positions = s.positions.data(), v.atomic_numbers = s.atomic_numbers.data(), v.cell = s.cell.data();
+    v.offsets = off.data(), v.neighbors = nbr.data(), v.shifts = sh.data(), v.half = half;
+    return v;
+  }
+};
+
+PeriodicList periodic_list(const pet::System& s, double reach, bool half) {
+  PeriodicList l;
+  l.half = half;
+  l.off.assign(s.n_atoms + 1, 0);
+  for (const auto& e : pet::detail::build_raw_edges(s, reach)) {
+    // Half: each pair from one end, the later atom or the positive image.
+    const bool first = e.i < e.j || (e.i == e.j && std::make_tuple(e.sa, e.sb, e.sc) > std::make_tuple(0, 0, 0));
+    if (half && !first) continue;
+    ++l.off[e.i + 1], l.nbr.push_back(e.j), l.sh.insert(l.sh.end(), {e.sa, e.sb, e.sc});
+  }
+  for (int i = 0; i < s.n_atoms; ++i) l.off[i + 1] += l.off[i];
+  return l;
+}
+
+const Golden* first_periodic(const std::string& model, Golden& store) {
+  for (const auto& path : golden_paths(model))
+    if ((store = load_golden(path)).periodic) return &store;
+  return nullptr;
+}
+
+// Largest difference over the reference's scale, floored at 1: small forces
+// carry fp32 noise of about 1e-6 whatever their size.
+double rel(const std::vector<double>& a, const std::vector<double>& b) {
+  double d = 0, m = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) d = worst(d, std::fabs(a[i] - b[i])), m = worst(m, std::fabs(b[i]));
+  return d / std::max(m, 1.0);
+}
+
+}  // namespace
+
+TEST_CASE("a half list gives what the full list does", "[model][edges]") {
+  for (const auto& model : golden_models()) {
+    auto* calc = shared_calculator(model);
+    Golden store;
+    const Golden* g = calc ? first_periodic(model, store) : nullptr;
+    if (!g) continue;
+    DYNAMIC_SECTION(model) {
+      const pet::System& s = g->system;
+      const PeriodicList full = periodic_list(s, calc->cutoff() + 0.5, false), half = periodic_list(s, calc->cutoff() + 0.5, true);
+      const pet::Results a = calc->compute_edges(full.view(s)), b = calc->compute_edges(half.view(s));
+      INFO("energy rel " << rel(b.energy, a.energy) << ", forces rel " << rel(b.forces, a.forces));
+      CHECK(rel(b.energy, a.energy) <= 1e-6);
+      CHECK(rel(b.forces, a.forces) <= 1e-4);
+      std::vector<double> f;
+      double w[6];
+      fold(half.view(s), b.edge_gradient, f, w);
+      INFO("half fold: forces rel " << rel(f, b.forces));
+      CHECK(rel(f, b.forces) <= 1e-9);
+    }
+  }
+}
+
+TEST_CASE("a stepping engine's list follows its atoms, graphs or not", "[model][edges]") {
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    Golden store;
+    const Golden* g = found ? first_periodic(model, store) : nullptr;
+    if (!g) continue;
+    for (int f = 0; f < 2; ++f) {
+      const bool fixed = f == 1;
+      DYNAMIC_SECTION(model << (fixed ? " / fixed shapes" : "")) {
+        pet::Options graphs, eager;
+        graphs.md_fixed_shapes = eager.md_fixed_shapes = fixed;
+        eager.graphs = false;
+        pet::Calculator stepper(found->first, found->second, graphs), plain(found->first, found->second, eager),
+            fresh(found->first, found->second);
+        pet::System s = g->system;
+        const PeriodicList list = periodic_list(s, stepper.cutoff() + 1.0, true);  // a 1 A skin
+        stepper.set_neighbors(list.view(s));
+        plain.set_neighbors(list.view(s));
+        // Small moves, then a 3% compression that brings new pairs inside the
+        // cutoff -- with fixed shapes, past the capacity the first step chose.
+        const pet::System s0 = s;
+        for (int step = 0; step < 6; ++step) {
+          const double scale = step == 4 ? 0.97 : 1.0;
+          for (std::size_t i = 0; i < s.positions.size(); ++i)
+            s.positions[i] = scale * s0.positions[i] + 0.02 * std::sin(1.7 * i + step);
+          for (int k = 0; k < 9; ++k) s.cell[k] = scale * s0.cell[k];
+          const pet::Results a = stepper.compute_step(s.positions.data(), s.cell.data(), true, true);
+          const pet::Results b = plain.compute_step(s.positions.data(), s.cell.data(), true, true);
+          const pet::Results c = fresh.compute_edges(list.view(s));
+          INFO("step " << step << ": vs a fresh list, energy rel " << rel(a.energy, c.energy) << ", forces rel "
+                       << rel(a.forces, c.forces));
+          CHECK(rel(a.energy, c.energy) <= 1e-6);
+          CHECK(rel(a.forces, c.forces) <= 1e-4);
+          CHECK(rel(a.edge_gradient, c.edge_gradient) <= 1e-4);
+          // A replayed graph is the same computation to the bit.
+          CHECK(a.energy == b.energy);
+          CHECK(a.forces == b.forces);
+        }
+      }
     }
   }
 }

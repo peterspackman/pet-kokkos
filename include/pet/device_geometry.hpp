@@ -74,34 +74,46 @@ inline DeviceGeom stage_geometry_views(Workspace& ws, int Ntot, int B) {
   return g;
 }
 
-// Atoms and directed edges an MD engine supplies from its own neighbour list.
-// Atoms [0, n_local) are owned and make up the energy; the rest are ghosts
-// (periodic images, other ranks' atoms) that only shape it. Atom i's edges are
+// Atoms and pairs an MD engine supplies from its own neighbour list. Atoms
+// [0, n_local) are owned and make up the energy; the rest are ghosts (periodic
+// images, other ranks' atoms) that only shape it. Atom i's pairs are
 // [offsets[i], offsets[i+1]), i -> neighbors[e], in the engine's order; pairs
-// past the model cutoff are skipped (an engine lists cutoff + skin), and both
-// directions should be present wherever both atoms have neighbourhoods.
+// past the model cutoff are carried but weigh nothing (an engine lists cutoff +
+// skin). A full list has both directions wherever both atoms have
+// neighbourhoods; a `half` list has each pair once, from either end.
 //
-// v_e = r_j - r_i from `positions` (ghosts sit where they are). A periodic
-// engine without ghosts gives `shifts` to tell images of one pair apart, and
-// either `cell` (v_e = r_j + shift . cell - r_i, computed on the device) or the
-// `vectors` themselves.
+// v_e = r_j - r_i from `positions` (ghosts sit where they are), plus
+// shift . cell for an engine that tells periodic images apart by `shifts`.
 struct EdgeListView {
   int n_atoms = 0, n_local = -1;       // n_local -1: every atom is owned
   const double* positions = nullptr;   // [n_atoms, 3] Angstrom
   const int* atomic_numbers = nullptr; // [n_atoms]
   const int* offsets = nullptr;        // [n_atoms + 1]
   const int* neighbors = nullptr;      // [offsets[n_atoms]]
-  const double* vectors = nullptr;     // [offsets[n_atoms], 3], optional
   const int* shifts = nullptr;         // [offsets[n_atoms], 3], optional
   const double* cell = nullptr;        // [9] lattice vectors as rows, with shifts
+  bool half = false;
   int charge = 0, spin_multiplicity = 1;
 };
 
-// The device neighbour list for an engine's edges; `input` receives each raw
-// edge's index in the engine's list.
-DeviceEdgeData build_from_edges(const EdgeListView& v, const Hypers& h,
-                                const std::vector<int>& species_to_index, const RView1D& probes, int P,
-                                Workspace& ws, EdgeMap& edge_map, int& m_high, IView1D& input);
+// An engine's list on the device between its rebuilds: the topology once (set),
+// the geometry per step. A half list is mirrored here, each atom's own pairs
+// first. With `fixed`, M is a capacity chosen at the first step, so every step
+// until the next set has the same shapes; it grows when an atom outgrows it.
+struct EdgeSession {
+  Workspace ws;
+  EdgeMap map{16};
+  DeviceEdgeData dev;
+  IView2D shift;                  // [E, 3] each directed edge's image shift
+  std::vector<int> src;           // [E] each directed edge's pair in the engine's list
+  std::vector<signed char> dir;   // [E] +1 as listed, -1 its mirror
+  int n_pairs = 0, M = 0;
+  bool shifted = false, valid = false;
+
+  void set(const EdgeListView& v, const std::vector<int>& species_to_index);
+  const DeviceEdgeData& step(const double* positions, const double* cell, const Hypers& h, RView1D probes,
+                             int P, bool fixed);
+};
 
 // Stage host structures into views from `ws`: species through
 // species_to_index (throws on an unsupported element), everything else as given.

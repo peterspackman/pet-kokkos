@@ -324,6 +324,18 @@ PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
   auto ev = d.edge_vec;
   auto dd = d.dist, dpc = d.pair_cutoff;
   auto dcut = d.cutoff_factor;
+  if (d.padded) {  // every slot a row: slot k is edge k
+    Kokkos::parallel_for(
+        "pk_padded", RangePolicy(0, N * M), KOKKOS_LAMBDA(int k) {
+          const int n = k / M;
+          if (k % M == 0) off(n) = k;
+          if (k == 0) off(N) = N * M;
+          pos(k) = k, center(k) = n, species(k) = nsp(k), reverse(k) = rev(k);
+          for (int c = 0; c < 3; ++c) vec(k, c) = ev(k, c);
+          dist(k) = dd(k), pcut(k) = dpc(k), cut(k) = dcut(k);
+        });
+    return p;
+  }
   Kokkos::parallel_scan(
       "pk_off", RangePolicy(0, N), KOKKOS_LAMBDA(int n, int& upd, bool final) {
         if (final) off(n) = upd;

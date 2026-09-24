@@ -48,6 +48,7 @@ struct DeviceEdgeData {
   int max_neighbors = 0;  // M
   int n_raw = 0;          // raw (pre-adaptive-cutoff) edges
   int n_edges = -1;       // kept edges; -1 = unknown, counted when needed
+  bool padded = false;    // every slot is an edge row, padding zero-weight: fixed shapes
   int n_local = -1;       // atoms [0, n_local) count toward the energy, the rest
                           // (an MD engine's ghosts) only shape it; -1 = all
 
