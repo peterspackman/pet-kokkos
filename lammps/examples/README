@@ -1,0 +1,9 @@
+pair_style pet examples (run with -k on g 1 -sf kk for pet/kk). Structures as LAMMPS data plus the same as extxyz
+(xyz2data.py writes both, optionally rattled), so pet-eval can evaluate exactly
+what LAMMPS does:
+
+  lmp -in in.pet -var data diamond_216 -var model pet-mad-s -var elements C -var nsteps 0
+  python3 compare.py diamond_216 /path/to/pet-eval pet-mad-s log.lammps
+
+compare.py checks energy, per-atom energy, forces and pressure against pet-eval,
+and that the per-atom virial sums to the global one.

@@ -257,7 +257,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   readout({node}, {input_edge}, net, pk, grad ? &rs : nullptr, "");
   RView1D per_atom = ws_.r1("per_atom", N);
   assemble_energy(per_atom, net, dev.species, comp_view_, energy_scale_, pk.n_local);
-  if (!grad) return {per_atom, {}, {}};
+  if (!grad) return {per_atom, {}, {}, {}};
 
   View2D x4_adj = ws_.n2("x4_adj", E, 4), cf_seq_adj = ws_.n2("cf_seq_adj", N, S);
   Kokkos::deep_copy(ExecSpace(), x4_adj, Net(0));

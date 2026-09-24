@@ -67,6 +67,18 @@ option(PET_ARCH_NATIVE "Optimize for the building machine's CPU (-march=native)"
 
 set(PET_BACKEND "serial" CACHE STRING "Kokkos backend: serial, openmp, cuda, hip")
 set_property(CACHE PET_BACKEND PROPERTY STRINGS serial openmp cuda hip)
+# Inside an application that brings its own Kokkos (LAMMPS's KOKKOS package),
+# that Kokkos's device is ours: in-tree it leaves Kokkos_ENABLE_*, installed
+# Kokkos_DEVICES.
+if(TARGET Kokkos::kokkos)
+    foreach(dev CUDA HIP OPENMP)
+        if(Kokkos_ENABLE_${dev} OR "${dev}" IN_LIST Kokkos_DEVICES)
+            string(TOLOWER ${dev} PET_BACKEND)
+            break()
+        endif()
+    endforeach()
+    set(PET_BACKEND ${PET_BACKEND} CACHE STRING "Kokkos backend" FORCE)
+endif()
 
 # Precision mode. PUBLIC on the library target so a consumer sees the same
 # Net/Real types the library was compiled with.
@@ -132,7 +144,7 @@ if(NOT TARGET Kokkos::kokkos)
         GIT_TAG 5.2.2
     )
 else()
-    message(STATUS "pet-kokkos: using the consumer's existing Kokkos::kokkos")
+    message(STATUS "pet-kokkos: using the consumer's Kokkos::kokkos (${PET_BACKEND})")
 endif()
 
 # --- nlohmann/json -----------------------------------------------------------

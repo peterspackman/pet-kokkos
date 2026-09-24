@@ -154,6 +154,25 @@ class Calculator {
   void set_neighbors(const EdgeListView& list);
   Results compute_step(const double* positions, const double* cell = nullptr, bool compute_forces = true,
                        bool edge_gradients = false) const;
+
+  // compute_step for an engine whose arrays live on the device (LAMMPS's KOKKOS
+  // package): device pointers, [n, 3] row-major doubles, forces added into. Only
+  // the totals cross to the host. Optional per-atom outputs, added into too:
+  // energy [n], and the virial [n, 6] (xx yy zz xy xz yz) -- each pair's
+  // symmetrised v (x) dE/dv, half to each end, times virial_scale (LAMMPS's sign
+  // is -1). They sum to the returned virial (times virial_scale).
+  struct DeviceArrays {
+    const double* positions = nullptr;
+    double* forces = nullptr;
+    double* per_atom_energy = nullptr;
+    double* per_atom_virial = nullptr;
+    double virial_scale = 1.0;
+  };
+  struct Totals {
+    double energy = 0.0;
+    double virial[6] = {0, 0, 0, 0, 0, 0};  // as Results::virial
+  };
+  Totals compute_step(const DeviceArrays& arrays, const double* cell = nullptr) const;
   // How far past its owned atoms an engine must supply ghosts: one cutoff per
   // message-passing layer, and one more for an adaptive cutoff, which needs each
   // of those atoms' complete neighbourhoods.

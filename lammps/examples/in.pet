@@ -1,0 +1,40 @@
+# PET through pet-kokkos: one single point (dumped for comparison with
+# pet-eval), then a short NVE run.
+#
+#   lmp -in in.pet -var data diamond_216 -var model pet-mad-s -var elements C
+#   lmp -in in.pet -var data water_648 -var model pet-mad-s -var elements "H O"
+
+variable        nsteps index 100
+
+units           metal
+atom_style      atomic
+atom_modify     map array
+boundary        p p p
+read_data       ${data}.data
+
+variable        mode index images
+pair_style      pet ${model} mode ${mode}
+pair_coeff      * * ${elements}
+
+# The per-atom virial (folded from pet-kokkos's edge gradients) must sum to the
+# global one LAMMPS computes from f . r: -sum(stress/atom) / V = pressure at 0 K.
+compute         satom all stress/atom NULL virial
+compute         ssum all reduce sum c_satom[1] c_satom[2] c_satom[3] c_satom[4] c_satom[5] c_satom[6]
+variable        V equal vol
+variable        pxx_atom equal -c_ssum[1]/v_V
+variable        pxy_atom equal -c_ssum[4]/v_V
+compute         peatom all pe/atom
+
+thermo_style    custom step pe press pxx pyy pzz pxy pxz pyz v_pxx_atom v_pxy_atom
+thermo_modify   format float %.12g
+dump            forces all custom 1 ${data}.forces id fx fy fz c_peatom
+dump_modify     forces sort id format float %.14g
+run             0
+undump          forces
+
+velocity        all create 300.0 4928459 mom yes rot yes
+fix             nve all nve
+timestep        0.0005
+thermo          10
+thermo_style    custom step temp pe ke etotal press
+run             ${nsteps}

@@ -295,7 +295,7 @@ Results Calculator::compute_edges(const EdgeListView& edges, bool compute_forces
   auto& I = *impl_;
   I.md.set(edges, I.ckpt.species_to_index);
   const DeviceEdgeData& dev =
-      I.md.step(edges.positions, edges.cell, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), false);
+      I.md.step(edges.positions, false, edges.cell, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), false);
   return session_results(dev, compute_forces, edge_gradients);
 }
 
@@ -305,8 +305,64 @@ Results Calculator::compute_step(const double* positions, const double* cell, bo
                                  bool edge_gradients) const {
   auto& I = *impl_;
   const DeviceEdgeData& dev =
-      I.md.step(positions, cell, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), I.opts.md_fixed_shapes);
+      I.md.step(positions, false, cell, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), I.opts.md_fixed_shapes);
   return session_results(dev, compute_forces, edge_gradients);
+}
+
+Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double* cell) const {
+  using RangePolicy = Kokkos::RangePolicy<ExecSpace>;
+  auto& I = *impl_;
+  const DeviceEdgeData& dev = I.md.step(a.positions, true, cell, I.ckpt.hypers, I.model.probes(),
+                                        I.model.n_probes(), I.opts.md_fixed_shapes);
+  const BatchResult br = I.model.energy_forces_batch(dev, true);
+  const int N = dev.n_atoms;
+  using Out = Kokkos::View<double**, Kokkos::LayoutRight, MemSpace, Kokkos::MemoryUnmanaged>;
+  auto forces = br.forces;
+  const Out f(a.forces, N, 3);
+  Kokkos::parallel_for(
+      "md_add_forces", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
+        for (int c = 0; c < 3; ++c) f(i, c) += forces(i, c);
+      });
+  if (a.per_atom_energy) {
+    auto e = br.per_atom;
+    const Kokkos::View<double*, MemSpace, Kokkos::MemoryUnmanaged> out(a.per_atom_energy, N);
+    Kokkos::parallel_for(
+        "md_add_energy", RangePolicy(0, N), KOKKOS_LAMBDA(int i) { out(i) += e(i); });
+  }
+  // Each directed edge's sym(v (x) g), half to each end, gathered per atom: its
+  // own edges, their partners (the edges into it), and the partnerless edges
+  // into it.
+  if (a.per_atom_virial && br.edge_grad.extent(0) > 0) {
+    auto g = br.edge_grad;
+    auto v = dev.raw_vec;
+    auto roff = dev.raw_off, rrev = dev.raw_reverse, ooff = dev.orphan_off, oedge = dev.orphan_edge;
+    const bool orphans = oedge.extent(0) > 0;
+    const double scale = 0.5 * a.virial_scale;
+    const Out w(a.per_atom_virial, N, 6);
+    Kokkos::parallel_for(
+        "md_atom_virial", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
+          double s[6] = {0, 0, 0, 0, 0, 0};
+          auto add = [&](int e) {
+            s[0] += v(e, 0) * g(e, 0), s[1] += v(e, 1) * g(e, 1), s[2] += v(e, 2) * g(e, 2);
+            s[3] += 0.5 * (v(e, 0) * g(e, 1) + v(e, 1) * g(e, 0));
+            s[4] += 0.5 * (v(e, 0) * g(e, 2) + v(e, 2) * g(e, 0));
+            s[5] += 0.5 * (v(e, 1) * g(e, 2) + v(e, 2) * g(e, 1));
+          };
+          for (int e = roff(i); e < roff(i + 1); ++e) {
+            add(e);
+            if (rrev(e) >= 0) add(rrev(e));
+          }
+          if (orphans)
+            for (int k = ooff(i); k < ooff(i + 1); ++k) add(oedge(k));
+          for (int k = 0; k < 6; ++k) w(i, k) += scale * s[k];
+        });
+  }
+  Totals t;
+  auto e = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), br.energy);
+  auto w = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), br.virial);
+  t.energy = e(0);
+  for (int k = 0; k < 6; ++k) t.virial[k] = w(0, k);
+  return t;
 }
 
 double Calculator::ghost_cutoff() const {

@@ -309,3 +309,58 @@ TEST_CASE("a stepping engine's list follows its atoms, graphs or not", "[model][
     }
   }
 }
+
+TEST_CASE("a device-resident engine gets what the host one does", "[model][edges]") {
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    Golden store;
+    const Golden* g = found ? first_periodic(model, store) : nullptr;
+    if (!g) continue;
+    DYNAMIC_SECTION(model) {
+      pet::Calculator host(found->first, found->second), device(found->first, found->second);
+      const pet::System& s = g->system;
+      const int n = s.n_atoms;
+      const PeriodicList list = periodic_list(s, host.cutoff() + 1.0, true);
+      host.set_neighbors(list.view(s));
+      device.set_neighbors(list.view(s));
+      const pet::Results r = host.compute_step(s.positions.data(), s.cell.data(), true, true);
+
+      using D2 = Kokkos::View<double**, Kokkos::LayoutRight, pet::MemSpace>;
+      D2 x("x", n, 3), f("f", n, 3), w("w", n, 6);
+      Kokkos::View<double*, pet::MemSpace> e("e", n);
+      Kokkos::deep_copy(x, Kokkos::View<const double**, Kokkos::LayoutRight, Kokkos::HostSpace,
+                                        Kokkos::MemoryUnmanaged>(s.positions.data(), n, 3));
+      pet::Calculator::DeviceArrays a;
+      a.positions = x.data(), a.forces = f.data(), a.per_atom_energy = e.data(), a.per_atom_virial = w.data();
+      const pet::Calculator::Totals t = device.compute_step(a, s.cell.data());
+      auto hf = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), f);
+      auto he = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), e);
+      auto hw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), w);
+
+      CHECK(t.energy == r.energy[0]);
+      for (int k = 0; k < 6; ++k) CHECK(t.virial[k] == r.virial[k]);
+      std::vector<double> fd(hf.data(), hf.data() + 3 * n), ed(he.data(), he.data() + n);
+      CHECK(fd == r.forces);
+      CHECK(ed == r.per_atom_energy);
+
+      // The per-atom virial: the host's edge gradients split per pair, and in
+      // sum the virial.
+      std::vector<double> want(6 * n, 0.0), sum(6, 0.0);
+      const pet::EdgeListView v = list.view(s);
+      const std::vector<double> vec = vectors(v);
+      for (int i = 0; i < n; ++i)
+        for (int k = v.offsets[i]; k < v.offsets[i + 1]; ++k) {
+          const double *d = &vec[3 * k], *G = &r.edge_gradient[3 * k];
+          const double p[6] = {d[0] * G[0], d[1] * G[1], d[2] * G[2], 0.5 * (d[0] * G[1] + d[1] * G[0]),
+                               0.5 * (d[0] * G[2] + d[2] * G[0]), 0.5 * (d[1] * G[2] + d[2] * G[1])};
+          for (int c = 0; c < 6; ++c) want[6 * i + c] += 0.5 * p[c], want[6 * v.neighbors[k] + c] += 0.5 * p[c];
+        }
+      std::vector<double> got(hw.data(), hw.data() + 6 * n);
+      for (int i = 0; i < n; ++i)
+        for (int c = 0; c < 6; ++c) sum[c] += got[6 * i + c];
+      INFO("per-atom virial rel " << rel(got, want) << ", its sum vs the virial rel " << rel(sum, r.virial));
+      CHECK(rel(got, want) <= 1e-9);
+      CHECK(rel(sum, r.virial) <= 1e-9);
+    }
+  }
+}

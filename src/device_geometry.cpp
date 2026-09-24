@@ -351,14 +351,21 @@ void EdgeSession::set(const EdgeListView& v, const std::vector<int>& species_to_
   n_pairs = L, M = 0, shifted = v.shifts != nullptr, valid = true;
 }
 
-const DeviceEdgeData& EdgeSession::step(const double* positions, const double* cell, const Hypers& h,
-                                        RView1D probes, int P, bool fixed) {
+const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device, const double* cell,
+                                        const Hypers& h, RView1D probes, int P, bool fixed) {
   if (!valid) throw std::runtime_error("pet: no neighbour list set");
   if (shifted && !cell) throw std::runtime_error("pet: an edge list with shifts needs the cell");
   const int N = dev.n_atoms, E = dev.n_raw;
   RView2D pos = ws.r2("md:pos", N, 3);
-  if (N)
+  if (N && on_device) {
+    const Kokkos::View<const double**, Kokkos::LayoutRight, MemSpace, Kokkos::MemoryUnmanaged> x(positions, N, 3);
+    Kokkos::parallel_for(
+        "md_positions", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
+          for (int c = 0; c < 3; ++c) pos(i, c) = x(i, c);
+        });
+  } else if (N) {
     Kokkos::deep_copy(pos, Kokkos::View<const double**, Kokkos::LayoutRight, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(positions, N, 3));
+  }
   double hc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   if (cell) std::copy(cell, cell + 9, hc);
   const double h0 = hc[0], h1 = hc[1], h2 = hc[2], h3 = hc[3], h4 = hc[4], h5 = hc[5], h6 = hc[6], h7 = hc[7],

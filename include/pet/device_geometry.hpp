@@ -111,8 +111,9 @@ struct EdgeSession {
   bool shifted = false, valid = false;
 
   void set(const EdgeListView& v, const std::vector<int>& species_to_index);
-  const DeviceEdgeData& step(const double* positions, const double* cell, const Hypers& h, RView1D probes,
-                             int P, bool fixed);
+  // positions: host, or device when on_device.
+  const DeviceEdgeData& step(const double* positions, bool on_device, const double* cell, const Hypers& h,
+                             RView1D probes, int P, bool fixed);
 };
 
 // Stage host structures into views from `ws`: species through
