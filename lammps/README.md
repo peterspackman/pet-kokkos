@@ -75,8 +75,9 @@ Models are found on `PET_MODEL_DIR` (and `./models`, `~/.local/share/pet/models`
 In `exchange` mode the edge rows cross straight from device memory when MPI is
 GPU-aware (the log says so), else through pinned host buffers. `pair_style pet
 MODEL gpu_aware auto|yes|no` overrides the check (`auto` asks
-`MPIX_Query_cuda_support`); for `pet/kk`, LAMMPS's `-pk kokkos gpu/aware` decides,
-and its atom comm follows `-pk kokkos comm`. Open MPI 5 built against an
+`MPIX_Query_cuda_support`/`_rocm_support`, or on Cray MPICH reads
+`MPICH_GPU_SUPPORT_ENABLED`); for `pet/kk`, LAMMPS's `-pk kokkos gpu/aware`
+decides, and its atom comm follows `-pk kokkos comm`. Open MPI 5 built against an
 external PMIx may point `mca_base_component_path` at PMIx's plugins and never load
 its own CUDA ones (`MPIX_Query_cuda_support` then says 0); pass
 `--mca mca_base_component_path $OMPI/lib/openmpi:$PMIX_PLUGINS`.

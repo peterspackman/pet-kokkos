@@ -519,9 +519,12 @@ void PairPET::coeff(int narg, char **arg)
     for (int j = i; j <= n; ++j) setflag[i][j] = 1;
 }
 
-// Asked of MPI where it can say; an MPI that cannot is taken not to.
+// Asked of MPI where it can say (Open MPI, MVAPICH); Cray MPICH says so in its
+// environment instead. An MPI that cannot say is taken not to be.
 bool PairPET::mpi_gpu_aware() const
 {
+  const char *cray = getenv("MPICH_GPU_SUPPORT_ENABLED");
+  if (cray && atoi(cray) == 1) return true;
 #if defined(MPIX_CUDA_AWARE_SUPPORT) && MPIX_CUDA_AWARE_SUPPORT
   if (MPIX_Query_cuda_support()) return true;
 #endif
