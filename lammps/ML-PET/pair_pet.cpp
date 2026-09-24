@@ -6,7 +6,7 @@
    This software is distributed under the GNU General Public License.
 ------------------------------------------------------------------------- */
 
-// pair_style pet MODEL [mode images|exchange|ghosts]
+// pair_style pet MODEL [mode images|exchange|ghosts] [gpu_aware auto|yes|no]
 // pair_coeff * * ELEMENT...        (one element symbol per atom type)
 //
 // MODEL is a pet-kokkos model name (searched on PET_MODEL_DIR and friends) or a
@@ -44,10 +44,15 @@
 
 #include <Kokkos_Core.hpp>
 
+#if __has_include(<mpi-ext.h>)
+#include <mpi-ext.h>  // Open MPI's MPIX_Query_cuda_support
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 
 using namespace LAMMPS_NS;
@@ -327,9 +332,13 @@ void PairPET::edges(pet::View2D out, pet::View2D in, pet::IView1D live)
   const int n_live = sd[nprocs - 1] + sc[nprocs - 1], n_arrive = rd[nprocs];
 
   if (d_send.extent(0) < (size_t) n_live || d_send.extent(1) != (size_t) W)
-    d_send = pet::View2D("pet:send", n_send, W), h_send = decltype(h_send)("pet:h_send", n_send, W);
+    d_send = pet::View2D("pet:send", n_send, W);
   if (d_recv.extent(0) < (size_t) n_arrive || d_recv.extent(1) != (size_t) W)
-    d_recv = pet::View2D("pet:recv", recv_map.size(), W), h_recv = decltype(h_recv)("pet:h_recv", recv_map.size(), W);
+    d_recv = pet::View2D("pet:recv", recv_map.size(), W);
+  if (!gpu_aware && (h_send.extent(0) < d_send.extent(0) || h_send.extent(1) != (size_t) W))
+    h_send = decltype(h_send)("pet:h_send", d_send.extent(0), W);
+  if (!gpu_aware && (h_recv.extent(0) < d_recv.extent(0) || h_recv.extent(1) != (size_t) W))
+    h_recv = decltype(h_recv)("pet:h_recv", d_recv.extent(0), W);
   auto send = d_send, recv = d_recv;
   Kokkos::parallel_for(
       "pet_send_rows", Range(0, n_send), KOKKOS_LAMBDA(int q) {
@@ -342,12 +351,17 @@ void PairPET::edges(pet::View2D out, pet::View2D in, pet::IView1D live)
         send(c, D) = t;
       });
   const auto rows = [](auto v, int n) { return Kokkos::subview(v, std::make_pair(0, n), Kokkos::ALL); };
-  Kokkos::deep_copy(rows(h_send, n_live), rows(d_send, n_live));
   const int bytes = W * sizeof(pet::Net);
   std::vector<int> scb(nprocs), sdb(nprocs), rcb(nprocs), rdb(nprocs);
   for (int p = 0; p < nprocs; ++p) scb[p] = sc[p] * bytes, sdb[p] = sd[p] * bytes, rcb[p] = rc[p] * bytes, rdb[p] = rd[p] * bytes;
-  MPI_Alltoallv(h_send.data(), scb.data(), sdb.data(), MPI_BYTE, h_recv.data(), rcb.data(), rdb.data(), MPI_BYTE, world);
-  Kokkos::deep_copy(rows(d_recv, n_arrive), rows(h_recv, n_arrive));
+  if (gpu_aware) {  // device to device; MPI does not follow the stream, so fence first
+    Kokkos::fence();
+    MPI_Alltoallv(d_send.data(), scb.data(), sdb.data(), MPI_BYTE, d_recv.data(), rcb.data(), rdb.data(), MPI_BYTE, world);
+  } else {
+    Kokkos::deep_copy(rows(h_send, n_live), rows(d_send, n_live));
+    MPI_Alltoallv(h_send.data(), scb.data(), sdb.data(), MPI_BYTE, h_recv.data(), rcb.data(), rdb.data(), MPI_BYTE, world);
+    Kokkos::deep_copy(rows(d_recv, n_arrive), rows(h_recv, n_arrive));
+  }
 
   Kokkos::deep_copy(Kokkos::subview(d_arrive, std::make_pair(0, nprocs + 1)),
                     Kokkos::View<const int *, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(rd.data(), nprocs + 1));
@@ -449,15 +463,19 @@ void PairPET::allocate()
 
 void PairPET::settings(int narg, char **arg)
 {
-  if (narg != 1 && narg != 3)
-    error->all(FLERR, "Illegal pair_style pet command: pair_style pet MODEL [mode images|exchange|ghosts]");
+  if (narg < 1 || narg % 2 == 0)
+    error->all(FLERR, "Illegal pair_style pet command: pair_style pet MODEL [mode images|exchange|ghosts] "
+                      "[gpu_aware auto|yes|no]");
   mode = comm->nprocs == 1 ? Mode::Images : Mode::Exchange;
-  if (narg == 3) {
-    if (strcmp(arg[1], "mode") != 0) error->all(FLERR, "Illegal pair_style pet keyword {}", arg[1]);
-    if (strcmp(arg[2], "images") == 0) mode = Mode::Images;
-    else if (strcmp(arg[2], "exchange") == 0) mode = Mode::Exchange;
-    else if (strcmp(arg[2], "ghosts") == 0) mode = Mode::Ghosts;
-    else error->all(FLERR, "Illegal pair_style pet mode {}: images, exchange or ghosts", arg[2]);
+  for (int k = 1; k < narg; k += 2) {
+    const std::string key = arg[k], val = arg[k + 1];
+    if (key == "mode" && val == "images") mode = Mode::Images;
+    else if (key == "mode" && val == "exchange") mode = Mode::Exchange;
+    else if (key == "mode" && val == "ghosts") mode = Mode::Ghosts;
+    else if (key == "gpu_aware" && val == "auto") aware = Aware::Auto;
+    else if (key == "gpu_aware" && val == "yes") aware = Aware::Yes;
+    else if (key == "gpu_aware" && val == "no") aware = Aware::No;
+    else error->all(FLERR, "Illegal pair_style pet keyword: {} {}", key, val);
   }
   if (mode == Mode::Images && comm->nprocs > 1)
     error->all(FLERR, "pair_style pet mode images needs one MPI rank: other ranks' atoms are not images");
@@ -501,8 +519,24 @@ void PairPET::coeff(int narg, char **arg)
     for (int j = i; j <= n; ++j) setflag[i][j] = 1;
 }
 
+// Asked of MPI where it can say; an MPI that cannot is taken not to.
+bool PairPET::mpi_gpu_aware() const
+{
+#if defined(MPIX_CUDA_AWARE_SUPPORT) && MPIX_CUDA_AWARE_SUPPORT
+  if (MPIX_Query_cuda_support()) return true;
+#endif
+#if defined(MPIX_ROCM_AWARE_SUPPORT) && MPIX_ROCM_AWARE_SUPPORT
+  if (MPIX_Query_rocm_support()) return true;
+#endif
+  return false;
+}
+
 void PairPET::init_style()
 {
+  gpu_aware = aware == Aware::Yes || (aware == Aware::Auto && mpi_gpu_aware());
+  if (mode == Mode::Exchange && comm->nprocs > 1 && comm->me == 0)
+    utils::logmesg(lmp, "pair_style pet: edge rows cross {}\n", gpu_aware ? "from device memory (GPU-aware MPI)"
+                                                                           : "through pinned host memory");
   if (strcmp(update->unit_style, "metal") != 0) error->all(FLERR, "Pair style pet requires metal units");
   // Ghosts get forces to send home, and a half list needs newton's pair split;
   // images mode on a full list needs neither.

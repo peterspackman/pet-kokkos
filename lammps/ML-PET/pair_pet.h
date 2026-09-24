@@ -46,8 +46,8 @@ class PairPET : public Pair {
   double init_one(int, int) override;
 
   // Mode exchange: pet::Exchange's moves over LAMMPS's comm, and its hooks.
-  void atoms_forward(pet::RView1D a);
-  void atoms_reverse(pet::RView1D a);
+  virtual void atoms_forward(pet::RView1D a);
+  virtual void atoms_reverse(pet::RView1D a);
   void edges(pet::View2D out, pet::View2D in, pet::IView1D live);
   int pack_forward_comm(int, int *, double *, int, int *) override;
   void unpack_forward_comm(int, int, double *) override;
@@ -63,6 +63,12 @@ class PairPET : public Pair {
   std::vector<int> off, nbr, z, shift;   // the list at the last rebuild, pet-kokkos's form
   bool listed = false;
   bool full_list = false;                // images mode on a full list (pet/kk)
+  // Whether MPI takes device pointers, so rows cross without host copies:
+  // keyword gpu_aware yes|no, else asked of MPI (or, for pet/kk, LAMMPS's
+  // -pk kokkos gpu/aware).
+  enum class Aware { Auto, Yes, No } aware = Aware::Auto;
+  bool gpu_aware = false;
+  virtual bool mpi_gpu_aware() const;
 
   // A neighbour list, however it is held: centre ilist[ii] has numneigh[i]
   // neighbours, neighbor(i, k).

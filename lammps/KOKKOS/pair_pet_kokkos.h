@@ -16,6 +16,7 @@ PairStyle(pet/kk/device,PairPETKokkos<LMPDeviceType>);
 #ifndef LMP_PAIR_PET_KOKKOS_H
 #define LMP_PAIR_PET_KOKKOS_H
 
+#include "kokkos_base.h"
 #include "kokkos_type.h"
 #include "pair_kokkos.h"
 #include "pair_pet.h"
@@ -26,7 +27,7 @@ namespace LAMMPS_NS {
 // and reads positions from, and adds forces and per-atom energy and virial to,
 // LAMMPS's device arrays. The host sees the neighbour list only when LAMMPS
 // rebuilds it, and the totals each step.
-template <class DeviceType> class PairPETKokkos : public PairPET {
+template <class DeviceType> class PairPETKokkos : public PairPET, public KokkosBase {
  public:
   typedef DeviceType device_type;
   typedef ArrayTypes<DeviceType> AT;
@@ -36,11 +37,22 @@ template <class DeviceType> class PairPETKokkos : public PairPET {
   void compute(int, int) override;
   void init_style() override;
 
+  // Mode exchange on the device: per-atom values through LAMMPS's device comm
+  // (GPU-aware MPI, if LAMMPS has it), never the host.
+  void atoms_forward(pet::RView1D a) override;
+  void atoms_reverse(pet::RView1D a) override;
+  int pack_forward_comm_kokkos(int, DAT::tdual_int_1d, DAT::tdual_xfloat_1d &, int, int *) override;
+  void unpack_forward_comm_kokkos(int, int, DAT::tdual_xfloat_1d &) override;
+  int pack_reverse_comm_kokkos(int, int, DAT::tdual_xfloat_1d &) override;
+  void unpack_reverse_comm_kokkos(int, DAT::tdual_int_1d, DAT::tdual_xfloat_1d &) override;
+
  private:
   typename AT::tdual_efloat_1d k_eatom;
   typename AT::tdual_virial_array k_vatom;
   Kokkos::View<double *[3], Kokkos::LayoutRight, DeviceType> x_rows;  // x, if LAMMPS's is not row-major
   void rebuild();
+  bool mpi_gpu_aware() const override;
+  pet::RView1D d_atom;  // what the device comm hooks move
 };
 
 }    // namespace LAMMPS_NS
