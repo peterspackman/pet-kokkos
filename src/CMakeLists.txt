@@ -42,10 +42,8 @@ target_link_libraries(pet_kokkos
     PRIVATE pet_warnings
 )
 
-set_target_properties(pet_kokkos PROPERTIES
-    POSITION_INDEPENDENT_CODE ON
-    CXX_STANDARD 20
-)
+set_target_properties(pet_kokkos PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(pet_kokkos PUBLIC cxx_std_17)
 
 # --- precision ---------------------------------------------------------------
 # PUBLIC: a consumer must see the same Net/Real types the library was built with,

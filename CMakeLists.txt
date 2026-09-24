@@ -12,7 +12,11 @@ project(pet_kokkos
     DESCRIPTION "Kokkos evaluation of PET machine-learning interatomic potentials"
     LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+# C++17 is all the code needs; 20 by default, as Kokkos 5 requires. A consumer
+# on Kokkos 4 (LAMMPS bundles 4.6) may set 17.
+if(NOT CMAKE_CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD 20)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
