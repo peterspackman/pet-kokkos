@@ -71,6 +71,11 @@ struct Results {
   std::vector<double> virial;           // [B*6] eV, the symmetric W, Voigt order
   std::vector<int> struct_id;           // [Ntot] each atom's structure
   std::vector<int> n_atoms;             // [B]
+  // compute_edges only: dE/dv for each of the engine's edges v = r_j - r_i, in
+  // its order (0 past the cutoff). Forces, the virial, per-atom stress, heat
+  // flux... are all folds of it: F_i = sum over i's edges of g - sum over edges
+  // into i of g, W = sum over edges of v (x) g.
+  std::vector<double> edge_gradient;    // [n_edges*3] eV/A
 };
 
 // Whether the build can use vesin for the host neighbour search.
@@ -122,6 +127,17 @@ class Calculator {
   // geom.Ntot, the leading structures only (a batch whose finished structures
   // were moved to the back).
   BatchResult compute_device(const DeviceGeom& geom, bool compute_forces = true) const;
+
+  // Atoms and edges from an MD engine's own neighbour list (see EdgeListView):
+  // the energy of the owned atoms, forces on every atom, ghosts included (the
+  // engine sums those back to their owners), the virial and the edge gradients.
+  // Ghosts must reach ghost_cutoff() past the owned atoms, and every atom within
+  // ghost_cutoff() - cutoff() must have its full neighbour list.
+  Results compute_edges(const EdgeListView& edges, bool compute_forces = true) const;
+  // How far past its owned atoms an engine must supply ghosts: one cutoff per
+  // message-passing layer, and one more for an adaptive cutoff, which needs each
+  // of those atoms' complete neighbourhoods.
+  double ghost_cutoff() const;
 
   const Hypers& hypers() const;
   double cutoff() const;

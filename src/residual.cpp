@@ -92,7 +92,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   ReadoutSaves rs;
   readout(node_feat, edge_feat, net, pk, grad ? &rs : nullptr, "re_");
   RView1D per_atom = ws_.r1("re_per_atom", N);
-  assemble_energy(per_atom, net, dev.species, comp_view_, energy_scale_);
+  assemble_energy(per_atom, net, dev.species, comp_view_, energy_scale_, pk.n_local);
   if (!grad) return {per_atom, {}, {}};
 
   // The backward accumulates in many places, so here the pool zeroes what it
@@ -160,7 +160,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
 
   DeviceOut out{per_atom, {}, {}};
   forces_and_virial(ws_, dev, pk, h_, probes_, n_probes_, energy_scale_, x4_adj, cutoff_adj, cf_seq_adj,
-                    out.forces, out.vir9);
+                    out.forces, out.vir9, out.edge_grad);
   return out;
 }
 

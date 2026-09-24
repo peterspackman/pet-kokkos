@@ -263,6 +263,39 @@ Results Calculator::compute_batch(const std::vector<System>& systems, bool compu
   return out;
 }
 
+Results Calculator::compute_edges(const EdgeListView& edges, bool compute_forces) const {
+  auto& I = *impl_;
+  IView1D input;
+  const DeviceEdgeData dev = build_from_edges(edges, I.ckpt.hypers, I.ckpt.species_to_index, I.model.probes(),
+                                              I.model.n_probes(), I.nbr_ws, I.nbr_edge_map, I.nbr_m_high, input);
+  const BatchResult br = I.model.energy_forces_batch(dev, compute_forces);
+  Results out;
+  out.n_atoms = {edges.n_atoms};
+  to_host(out.energy, br.energy);
+  to_host(out.per_atom_energy, br.per_atom);
+  if (!compute_forces) return out;
+  to_host(out.forces, br.forces);
+  to_host(out.virial, br.virial);
+  out.struct_id.assign(edges.n_atoms, 0);
+  // Back into the engine's order.
+  const int L = edges.n_atoms > 0 ? edges.offsets[edges.n_atoms] : 0;
+  out.edge_gradient.assign(std::size_t(L) * 3, 0.0);
+  if (br.edge_grad.extent(0) > 0) {
+    std::vector<double> g;
+    std::vector<int> idx;
+    to_host(g, br.edge_grad);
+    to_host(idx, input);
+    for (std::size_t e = 0; e < idx.size(); ++e)
+      for (int c = 0; c < 3; ++c) out.edge_gradient[std::size_t(idx[e]) * 3 + c] = g[e * 3 + c];
+  }
+  return out;
+}
+
+double Calculator::ghost_cutoff() const {
+  const Hypers& h = impl_->ckpt.hypers;
+  return (h.num_gnn_layers + (h.adaptive() ? 1 : 0)) * h.cutoff;
+}
+
 BatchResult Calculator::compute_device(const DeviceGeom& geom, bool compute_forces) const {
   DeviceEdgeData dev = build_nef_device(
       geom, impl_->ckpt.hypers, impl_->model.probes(), impl_->model.n_probes(), impl_->nbr_ws,

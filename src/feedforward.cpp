@@ -256,7 +256,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   ReadoutSaves rs;
   readout({node}, {input_edge}, net, pk, grad ? &rs : nullptr, "");
   RView1D per_atom = ws_.r1("per_atom", N);
-  assemble_energy(per_atom, net, dev.species, comp_view_, energy_scale_);
+  assemble_energy(per_atom, net, dev.species, comp_view_, energy_scale_, pk.n_local);
   if (!grad) return {per_atom, {}, {}};
 
   View2D x4_adj = ws_.n2("x4_adj", E, 4), cf_seq_adj = ws_.n2("cf_seq_adj", N, S);
@@ -280,7 +280,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
 
   DeviceOut out{per_atom, {}, {}};
   forces_and_virial(ws_, dev, pk, h_, probes_, n_probes_, energy_scale_, x4_adj, cutoff_adj, cf_seq_adj,
-                    out.forces, out.vir9);
+                    out.forces, out.vir9, out.edge_grad);
   return out;
 }
 

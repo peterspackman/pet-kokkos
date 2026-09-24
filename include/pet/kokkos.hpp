@@ -45,6 +45,7 @@ using IView2D = Kokkos::View<int**, LR, MemSpace>;
 // int8 slices for the Ozaki GEMM (ozaki.hpp).
 using I8View1D = Kokkos::View<int8_t*, LR, MemSpace>;
 using I8View2D = Kokkos::View<int8_t**, LR, MemSpace>;
+using U64View1D = Kokkos::View<uint64_t*, LR, MemSpace>;
 
 // The scratch pool. An evaluation needs ~100 buffers, and allocating them per
 // call means cudaMalloc/cudaFree, which synchronise the device; the pool keeps
@@ -74,6 +75,7 @@ class Workspace {
   IView2D i2(const std::string& k, int r, int c) { return get<IView2D>(k, r, c); }
   IView1D i1(const std::string& k, int n) { return get<IView1D>(k, n); }
   I8View2D i8(const std::string& k, int r, int c) { return get<I8View2D>(k, r, c); }
+  U64View1D u64(const std::string& k, int n) { return get<U64View1D>(k, n); }
 
   // The view the last n2(k, ...) handed out, unfilled: a saved activation.
   View2D peek2(const std::string& k) const { return cur2_.at(k); }

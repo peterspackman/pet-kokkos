@@ -2,6 +2,8 @@
 // builder (neighbors.cpp), and tests/test_device_vs_host.cpp holds the two to it.
 #include "pet/device_neighbors.hpp"
 
+#include <Kokkos_Sort.hpp>
+
 #include "pet/neighbors.hpp"
 
 #include <cstdlib>
@@ -176,6 +178,39 @@ DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_h
       });
   dev.raw_reverse = raw_rev;
 
+  // Edges with no partner, by (target atom, edge): the force folds gather each
+  // edge's share from its partner, so these are added on their own (forces.cpp).
+  // Only an engine's list with neighbourless ghosts has any.
+  int n_orphan = 0;
+  Kokkos::parallel_reduce(
+      "pet_orphans", RangePolicy(0, E), KOKKOS_LAMBDA(int e, int& c) { c += raw_rev(e) < 0; }, n_orphan);
+  if (n_orphan > 0) {
+    U64View1D keys = ws.u64("nef:orph_keys", n_orphan);
+    IView1D ooff = dev.orphan_off = ws.i1("nef:orph_off", N + 1), oedge = dev.orphan_edge = ws.i1("nef:orph_edge", n_orphan);
+    Kokkos::parallel_scan(
+        "pet_orph_keys", RangePolicy(0, E), KOKKOS_LAMBDA(int e, int& k, bool final) {
+          if (raw_rev(e) >= 0) return;
+          if (final) keys(k) = uint64_t(re_j(e)) << 32 | uint32_t(e);
+          ++k;
+        });
+    Kokkos::sort(ExecSpace(), keys);
+    // orphan_off(a) = the first orphan pointing at a or beyond.
+    Kokkos::parallel_for(
+        "pet_orph_off", RangePolicy(0, N + 1), KOKKOS_LAMBDA(int a) {
+          int lo = 0, hi = n_orphan;
+          while (lo < hi) {
+            const int mid = (lo + hi) / 2;
+            if (int(keys(mid) >> 32) < a) lo = mid + 1;
+            else hi = mid;
+          }
+          ooff(a) = lo;
+        });
+    Kokkos::parallel_for(
+        "pet_orph_edge", RangePolicy(0, n_orphan), KOKKOS_LAMBDA(int k) { oedge(k) = int(keys(k) & 0xffffffffu); });
+  } else {
+    dev.orphan_off = IView1D(), dev.orphan_edge = IView1D();
+  }
+
   // The adaptive cutoff of each atom. Both schemes taper the neighbour count with
   // the bump, whatever the model's own cutoff function, as metatrain does.
   RView1D acut = ws.r1("nef:acut", N);
@@ -222,7 +257,7 @@ DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_h
   auto pcut = dev.pair_cutoff = ws.r1("nef:out:pcut", NM);
   auto cut = dev.cutoff_factor = ws.n1("nef:out:cutoff", NM);
   auto cf_seq = dev.cf_seq = ws.n2("nef:out:cf_seq", N, S);
-  IView1D flat = ws.i1("nef:flat_edge", E);
+  IView1D flat = dev.raw_slot = ws.i1("nef:flat_edge", E);
   Kokkos::deep_copy(ExecSpace(), reverse, -1);
   Kokkos::deep_copy(ExecSpace(), flat, -1);
   Kokkos::parallel_for(

@@ -74,6 +74,33 @@ inline DeviceGeom stage_geometry_views(Workspace& ws, int Ntot, int B) {
   return g;
 }
 
+// Atoms and directed edges an MD engine supplies from its own neighbour list.
+// Atoms [0, n_local) are owned and make up the energy; the rest are ghosts
+// (periodic images, other ranks' atoms) that only shape it. Atom i's edges are
+// [offsets[i], offsets[i+1]), i -> neighbors[e], in the engine's order; pairs
+// past the model cutoff are skipped (an engine lists cutoff + skin), and both
+// directions should be present wherever both atoms have neighbourhoods.
+//
+// v_e = r_j - r_i from `positions` (ghosts sit where they are), unless the engine
+// gives `vectors` -- with `shifts` to tell periodic images of one pair apart, as
+// a periodic engine without ghosts must.
+struct EdgeListView {
+  int n_atoms = 0, n_local = -1;       // n_local -1: every atom is owned
+  const double* positions = nullptr;   // [n_atoms, 3] Angstrom
+  const int* atomic_numbers = nullptr; // [n_atoms]
+  const int* offsets = nullptr;        // [n_atoms + 1]
+  const int* neighbors = nullptr;      // [offsets[n_atoms]]
+  const double* vectors = nullptr;     // [offsets[n_atoms], 3], optional
+  const int* shifts = nullptr;         // [offsets[n_atoms], 3], optional, with vectors
+  int charge = 0, spin_multiplicity = 1;
+};
+
+// The device neighbour list for an engine's edges; `input` receives each raw
+// edge's index in the engine's list.
+DeviceEdgeData build_from_edges(const EdgeListView& v, const Hypers& h,
+                                const std::vector<int>& species_to_index, const RView1D& probes, int P,
+                                Workspace& ws, EdgeMap& edge_map, int& m_high, IView1D& input);
+
 // Stage host structures into views from `ws`: species through
 // species_to_index (throws on an unsupported element), everything else as given.
 DeviceGeom stage_systems(Workspace& ws, const std::vector<System>& systems,

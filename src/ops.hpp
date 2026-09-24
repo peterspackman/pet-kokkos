@@ -68,9 +68,9 @@ void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, Vi
 
 // e(n) (+)= node_pred(n) + sum over n's edges of cutoff * edge_pred.
 void readout_accumulate(View1D e, View2D node_pred, View2D edge_pred, const PackedEdges& pk, bool acc);
-// per_atom(n) = scale * net(n) + composition(species(n)).
+// per_atom(n) = scale * net(n) + composition(species(n)), and 0 past n_local.
 void assemble_energy(RView1D per_atom, View1D net, IView1D species, RView1D composition,
-                     double scale);
+                     double scale, int n_local);
 
 // ---- attention.cpp ----------------------------------------------------------
 
@@ -99,9 +99,10 @@ void sum_by_structure(RView2D x, IView1D soff, RView2D out, bool acc);
 // ([E, 4], of (v, |v|)), cutoff_adj ([E], of the readout's cutoff factor) and
 // cf_seq_adj ([N, S], of the attention bias). Adds the adaptive cutoff's share
 // when the model has one. Returns forces [N, 3] and the per-structure virial
-// [n_struct, 9], both scaled by `scale`.
+// [n_struct, 9], both scaled by `scale`, and -- when dev has raw_slot -- dE/dv for
+// every raw edge [n_raw, 3], which the forces and virial are a fold of.
 void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdges& pk,
                        const Hypers& h, RView1D probes, int n_probes, double scale, View2D x4_adj,
-                       View1D cutoff_adj, View2D cf_seq_adj, RView2D& forces, RView2D& vir9);
+                       View1D cutoff_adj, View2D cf_seq_adj, RView2D& forces, RView2D& vir9, RView2D& edge_grad);
 
 }  // namespace pet

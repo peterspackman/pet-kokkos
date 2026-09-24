@@ -72,7 +72,8 @@ void fold_edge_gradients(Workspace& ws, RView2D grad, const PackedEdges& pk, IVi
 // The scheme always tapers with the bump function, whatever the model's own
 // cutoff function: metatrain's adaptive_cutoff.py does, and so do the forwards.
 void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h, RView1D probes,
-                       int P, RView1D adapted_adj, double scale, RView2D forces, RView2D vir9) {
+                       int P, RView1D adapted_adj, double scale, RView2D forces, RView2D vir9,
+                       RView2D edge_grad) {
   const int N = dev.n_atoms, E = dev.n_raw, NS = dev.n_struct;
   const bool solver = h.adaptive_cutoff_method == AdaptiveCutoffMethod::Solver;
   if (E == 0 || (!solver && P < 2)) return;
@@ -181,6 +182,12 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
         });
   }
 
+  if (edge_grad.extent(0) == (size_t) E)
+    Kokkos::parallel_for(
+        "ad_edge_grad", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
+          for (int c = 0; c < 3; ++c) edge_grad(e, c) += gmag(e) * vec(e, c);
+        });
+
   if (roff.extent(0) != (size_t) (N + 1) || rrev.extent(0) != (size_t) E) {
     // No per-atom ranges: scatter with atomics. Correct, not reproducible.
     Kokkos::parallel_for(
@@ -248,9 +255,34 @@ void sum_by_structure(RView2D x, IView1D soff, RView2D out, bool acc) {
       });
 }
 
+namespace {
+
+// The adaptive cutoff's share: each kept edge's pair-cutoff adjoint, half to
+// each end, then back through each atom's cutoff to its raw edges.
+void adaptive_part(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h, RView1D probes, int n_probes,
+                   const PackedEdges& pk, RView1D pc_adj, double scale, RView2D forces, RView2D vir9,
+                   RView2D edge_grad) {
+  const int N = dev.n_atoms;
+  auto off = pk.off, rev = pk.reverse;
+  RView1D adapted_adj = ws.r1("adapted_adj", N);
+  Kokkos::parallel_for(
+      "adapted_adj", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
+        double s = 0.0;
+        for (int k = off(a); k < off(a + 1); ++k) {
+          s += 0.5 * pc_adj(k);
+          if (rev(k) >= 0) s += 0.5 * pc_adj(rev(k));
+        }
+        adapted_adj(a) = s;
+      });
+  adaptive_backward(ws, dev, h, probes, n_probes, adapted_adj, scale, forces, vir9, edge_grad);
+}
+
+}  // namespace
+
 void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdges& pk,
                        const Hypers& h, RView1D probes, int n_probes, double scale, View2D x4_adj,
-                       View1D cutoff_adj, View2D cf_seq_adj, RView2D& forces, RView2D& vir9) {
+                       View1D cutoff_adj, View2D cf_seq_adj, RView2D& forces, RView2D& vir9,
+                       RView2D& edge_grad) {
   const int N = dev.n_atoms, E = pk.E;
   const bool adaptive = h.adaptive(), bump = h.cutoff_function == CutoffFunction::Bump;
   const double width = h.cutoff_width;
@@ -278,19 +310,34 @@ void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdg
   forces = ws.r2("forces", N, 3);
   vir9 = ws.r2("virial9", dev.n_struct, 9);
   fold_edge_gradients(ws, grad, pk, dev.struct_id, N, dev.n_struct, scale, forces, vir9);
-  if (!adaptive) return;
 
-  RView1D adapted_adj = ws.r1("adapted_adj", N);
-  Kokkos::parallel_for(
-      "adapted_adj", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
-        double s = 0.0;
-        for (int k = off(a); k < off(a + 1); ++k) {
-          s += 0.5 * pc_adj(k);
-          if (rev(k) >= 0) s += 0.5 * pc_adj(rev(k));
-        }
-        adapted_adj(a) = s;
-      });
-  adaptive_backward(ws, dev, h, probes, n_probes, adapted_adj, scale, forces, vir9);
+  // The same per raw edge, in the raw list's order: the kept edge's gradient, 0
+  // for a dropped one; the adaptive cutoff adds its share below.
+  const int R = dev.n_raw;
+  if (dev.raw_slot.extent(0) == (size_t) R && R > 0) {
+    edge_grad = ws.r2("raw_edge_grad", R, 3);
+    auto slot = dev.raw_slot, slot_edge = pk.slot_edge;
+    Kokkos::parallel_for(
+        "raw_edge_grad", RangePolicy(0, R), KOKKOS_LAMBDA(int e) {
+          const int k = slot(e) >= 0 ? slot_edge(slot(e)) : -1;
+          for (int c = 0; c < 3; ++c) edge_grad(e, c) = k >= 0 ? scale * grad(k, c) : 0.0;
+        });
+  } else {
+    edge_grad = RView2D();
+  }
+  if (adaptive) adaptive_part(ws, dev, h, probes, n_probes, pk, pc_adj, scale, forces, vir9, edge_grad);
+
+  // The folds above take an edge's share of its target's force from the partner
+  // edge; an edge with none gives it here, from its own gradient.
+  if (dev.orphan_edge.extent(0) > 0 && edge_grad.extent(0) > 0) {
+    auto ooff = dev.orphan_off, oedge = dev.orphan_edge;
+    auto eg = edge_grad;
+    Kokkos::parallel_for(
+        "orphan_forces", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
+          for (int k = ooff(a); k < ooff(a + 1); ++k)
+            for (int c = 0; c < 3; ++c) forces(a, c) -= eg(oedge(k), c);
+        });
+  }
 }
 
 }  // namespace pet

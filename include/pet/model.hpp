@@ -31,7 +31,11 @@ struct BatchResult {
   RView2D forces;     // [N, 3] eV/A; empty without forces
   RView2D virial;     // [B, 6] Voigt, eV; empty without forces
   IView1D struct_id;  // [N]
-  RView1D per_atom;   // [N] eV
+  RView1D per_atom;   // [N] eV; 0 for atoms past n_local
+  // dE/dv for every raw edge v = r_j + shift - r_i, in the raw list's order: what
+  // forces, the virial, per-atom stress etc. are all folded from. With forces,
+  // on device-built lists; empty otherwise.
+  RView2D edge_grad;  // [n_raw, 3] eV/A
   int n_struct = 0;
   int n_atoms = 0;
 };
@@ -44,6 +48,8 @@ struct DeviceEdgeData {
   int max_neighbors = 0;  // M
   int n_raw = 0;          // raw (pre-adaptive-cutoff) edges
   int n_edges = -1;       // kept edges; -1 = unknown, counted when needed
+  int n_local = -1;       // atoms [0, n_local) count toward the energy, the rest
+                          // (an MD engine's ghosts) only shape it; -1 = all
 
   IView1D species;        // [N]
   IView1D neigh_species;  // [N*M] the neighbour's species (padding: 0)
@@ -60,6 +66,10 @@ struct DeviceEdgeData {
   // raw_off/raw_reverse that backward falls back to atomics.
   IView1D raw_center, raw_neigh;  // [E]
   RView1D raw_dist;               // [E]
+  IView1D raw_slot;               // [E] the kept edge's slot n*M + m, -1 if dropped
+  // Raw edges with no partner -- into a ghost the engine listed no neighbours
+  // for -- by target atom: orphan_edge[orphan_off(a), orphan_off(a+1)) point at a.
+  IView1D orphan_off, orphan_edge;  // [N+1], [n_orphans]
   RView2D raw_vec;                // [E, 3]
   IView1D raw_off;                // [N+1]
   IView1D raw_reverse;            // [E]
@@ -121,13 +131,15 @@ struct PackedEdges {
   RView2D vec;         // [E, 3]
   RView1D dist, pcut;  // [E]
   View1D cut;          // [E] smooth cutoff factor
+  IView1D slot_edge;   // [N*M] each slot's packed edge, -1 for padding
+  int n_local = 0;     // see DeviceEdgeData::n_local
 };
 
 // One evaluation's outputs, on the device: per-atom energy [N] and, with forces,
 // forces [N, 3] and the per-structure virial [n_struct, 9] (row-major 3x3).
 struct DeviceOut {
   RView1D per_atom;
-  RView2D forces, vir9;
+  RView2D forces, vir9, edge_grad;
 };
 
 // What one GNN layer of the feedforward featurizer saves for its backward, one
@@ -179,7 +191,7 @@ class PetModel {
   // on the device, and the EnergyResult is left empty.
   EnergyResult compute(const DeviceEdgeData& dev, std::vector<double>* host_forces,
                        RView2D* dev_forces, RView1D* dev_per_atom = nullptr,
-                       RView2D* dev_virial = nullptr);
+                       RView2D* dev_virial = nullptr, RView2D* dev_edge_grad = nullptr);
 
   const Hypers& hypers() const { return h_; }
   // The adaptive cutoff's probe grid, for the neighbour builders.

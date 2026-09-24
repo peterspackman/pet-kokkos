@@ -231,10 +231,10 @@ void readout_accumulate(View1D e, View2D node_pred, View2D edge_pred, const Pack
 }
 
 void assemble_energy(RView1D per_atom, View1D net, IView1D species, RView1D composition,
-                     double scale) {
+                     double scale, int n_local) {
   Kokkos::parallel_for(
       "assemble", RangePolicy(0, per_atom.extent(0)),
-      KOKKOS_LAMBDA(int n) { per_atom(n) = scale * net(n) + composition(species(n)); });
+      KOKKOS_LAMBDA(int n) { per_atom(n) = n < n_local ? scale * net(n) + composition(species(n)) : 0.0; });
 }
 
 }  // namespace pet

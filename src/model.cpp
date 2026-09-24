@@ -308,7 +308,8 @@ PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
   p.vec = ws_.r2("pk:vec", p.E, 3);
   p.dist = ws_.r1("pk:dist", p.E), p.pcut = ws_.r1("pk:pcut", p.E);
   p.cut = ws_.n1("pk:cut", p.E);
-  IView1D pos = ws_.i1("pk:pos", N * M);  // slot -> packed index, -1 for padding
+  IView1D pos = p.slot_edge = ws_.i1("pk:pos", N * M);
+  p.n_local = d.n_local < 0 ? N : d.n_local;
   auto mask = d.mask;
   auto kept = KOKKOS_LAMBDA(int n, int end) {  // atom n's kept slots before `end`
     int c = 0;
@@ -461,11 +462,16 @@ void PetModel::readout_bwd(const ReadoutSaves& sav, int i, const PackedEdges& pk
   View2D npa = ws_.n2("ro:npa", N, 1), epa = ws_.n2("ro:epa", E, 1);
   auto epred = sav.epred[i];
   auto cut = pk.cut;
-  Kokkos::parallel_for("ro_seed_n", RangePolicy(0, N), KOKKOS_LAMBDA(int n) { npa(n, 0) = Net(1); });
+  auto center = pk.center;
+  const int nl = pk.n_local;  // ghosts shape the energy but are not in it
+  Kokkos::parallel_for(
+      "ro_seed_n", RangePolicy(0, N), KOKKOS_LAMBDA(int n) { npa(n, 0) = n < nl ? Net(1) : Net(0); });
   Kokkos::parallel_for(
       "ro_seed_e", RangePolicy(0, E), KOKKOS_LAMBDA(int k) {
-        epa(k, 0) = cut(k);
-        cutoff_adj(k) = acc ? cutoff_adj(k) + epred(k, 0) : epred(k, 0);
+        const bool own = center(k) < nl;
+        epa(k, 0) = own ? cut(k) : Net(0);
+        const Net ep = own ? epred(k, 0) : Net(0);
+        cutoff_adj(k) = acc ? cutoff_adj(k) + ep : ep;
       });
   View2D nh1_adj = ws_.n2("ro:nh1_adj", N, Dh), nh0_adj = ws_.n2("ro:nh0_adj", N, Dh);
   linear_bwd(nh1_adj, npa, mat("node_last_layers.energy." + si + ".energy___0.weight"), beta);
@@ -502,7 +508,7 @@ BatchResult PetModel::energy_forces_batch(const DeviceEdgeData& dev, bool comput
   out.n_struct = B, out.n_atoms = N, out.struct_id = dev.struct_id;
   if (N == 0 || B == 0) return out;
   compute(dev, nullptr, compute_forces ? &out.forces : nullptr, &out.per_atom,
-          compute_forces ? &out.virial : nullptr);
+          compute_forces ? &out.virial : nullptr, &out.edge_grad);
   // Each structure's energy, summed over its atoms in order: the energy itself
   // must not depend on thread arrival order.
   out.energy = ws_.r1("batch_energy", B);
@@ -526,7 +532,8 @@ Recompute PetModel::recompute_tier(int N, int S, int E) const {
 }
 
 EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* host_forces,
-                               RView2D* dev_forces, RView1D* dev_per_atom, RView2D* dev_virial) {
+                               RView2D* dev_forces, RView1D* dev_per_atom, RView2D* dev_virial,
+                               RView2D* dev_edge_grad) {
   const int N = dev.n_atoms, NS = dev.n_struct;
   const bool grad = host_forces || dev_forces;
   last_n_atoms_ = N;
@@ -576,6 +583,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
     std::copy(v, v + 6, res.virial);
   }
   if (dev_forces) *dev_forces = out.forces;
+  if (dev_edge_grad) *dev_edge_grad = out.edge_grad;
   if (host_forces) {
     auto f = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out.forces);
     host_forces->assign(f.data(), f.data() + std::size_t(N) * 3);
@@ -589,13 +597,13 @@ std::vector<std::uintptr_t> PetModel::graph_key(const DeviceEdgeData& d, bool gr
   std::vector<std::uintptr_t> k{(std::uintptr_t) grad,       (std::uintptr_t) d.n_atoms,
                                 (std::uintptr_t) d.max_neighbors, (std::uintptr_t) d.n_raw,
                                 (std::uintptr_t) d.n_struct,  (std::uintptr_t) d.n_edges,
-                                ws_.generation()};
+                                (std::uintptr_t) d.n_local,   ws_.generation()};
   auto add = [&k](const auto& v) { k.push_back((std::uintptr_t) v.data()), k.push_back(v.size()); };
   add(d.species), add(d.neigh_species), add(d.reverse_index), add(d.edge_vec), add(d.dist);
   add(d.mask), add(d.pair_cutoff), add(d.cutoff_factor), add(d.cf_seq), add(d.raw_center);
   add(d.raw_neigh), add(d.raw_dist), add(d.raw_vec), add(d.raw_off), add(d.raw_reverse);
   add(d.adapt_eff), add(d.adapt_r), add(d.adapt_dn), add(d.struct_id), add(d.charge);
-  add(d.spin_multiplicity);
+  add(d.spin_multiplicity), add(d.raw_slot), add(d.orphan_off), add(d.orphan_edge);
   return k;
 }
 
