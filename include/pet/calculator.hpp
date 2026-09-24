@@ -49,6 +49,8 @@ struct Options {
 
   // Device memory an evaluation may use, in bytes; 0 asks the device.
   std::size_t memory_budget_bytes = 0;
+  // Processes sharing the device (MPI ranks on one GPU): the budget is split.
+  int device_share = 1;
 
   // How much of the forward the backward recomputes instead of keeping (see
   // pet::Recompute). Auto keeps everything that fits memory_budget_bytes.
@@ -133,7 +135,8 @@ class Calculator {
   // engine sums those back to their owners), the virial and the edge gradients.
   // Ghosts must reach ghost_cutoff() past the owned atoms, and every atom within
   // ghost_cutoff() - cutoff() must have its full neighbour list.
-  Results compute_edges(const EdgeListView& edges, bool compute_forces = true) const;
+  // Edge gradients cost a copy of every edge back to the host: off when unused.
+  Results compute_edges(const EdgeListView& edges, bool compute_forces = true, bool edge_gradients = true) const;
   // How far past its owned atoms an engine must supply ghosts: one cutoff per
   // message-passing layer, and one more for an adaptive cutoff, which needs each
   // of those atoms' complete neighbourhoods.

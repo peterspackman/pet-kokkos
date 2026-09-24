@@ -278,7 +278,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
     ff_layer_bwd(dev, pk, L, ckpt ? one : sav[L], keep_wide, node_adj, input_edge_adj, x4_adj, cf_seq_adj);
   }
 
-  DeviceOut out{per_atom, {}, {}};
+  DeviceOut out{per_atom, {}, {}, {}};
   forces_and_virial(ws_, dev, pk, h_, probes_, n_probes_, energy_scale_, x4_adj, cutoff_adj, cf_seq_adj,
                     out.forces, out.vir9, out.edge_grad);
   return out;

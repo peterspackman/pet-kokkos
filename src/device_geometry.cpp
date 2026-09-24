@@ -318,12 +318,24 @@ DeviceEdgeData build_from_edges(const EdgeListView& v, const Hypers& h,
   if (v.vectors && L) Kokkos::deep_copy(vin, HostR(v.vectors, L, 3));
   if (v.shifts && L)
     Kokkos::deep_copy(sin, Kokkos::View<const int**, Kokkos::LayoutRight, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(v.shifts, L, 3));
+  if (v.shifts && !v.vectors && !v.cell) throw std::runtime_error("pet: an edge list with shifts needs vectors or a cell");
+  double hc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  if (v.cell) std::copy(v.cell, v.cell + 9, hc);
 
   // The engine's edges within the cutoff, in its order: count, scan, fill.
   const bool given = v.vectors != nullptr, shifted = v.shifts != nullptr;
   const double rc2 = h.cutoff * h.cutoff;
+  const double h0 = hc[0], h1 = hc[1], h2 = hc[2], h3 = hc[3], h4 = hc[4], h5 = hc[5], h6 = hc[6], h7 = hc[7],
+               h8 = hc[8];
   auto edge = KOKKOS_LAMBDA(int i, int e, double* x) {
-    for (int c = 0; c < 3; ++c) x[c] = given ? vin(e, c) : pos(nbr(e), c) - pos(i, c);
+    if (given) {
+      for (int c = 0; c < 3; ++c) x[c] = vin(e, c);
+    } else {
+      const int a = shifted ? sin(e, 0) : 0, b = shifted ? sin(e, 1) : 0, d = shifted ? sin(e, 2) : 0;
+      x[0] = pos(nbr(e), 0) + (a * h0 + b * h3 + d * h6) - pos(i, 0);
+      x[1] = pos(nbr(e), 1) + (a * h1 + b * h4 + d * h7) - pos(i, 1);
+      x[2] = pos(nbr(e), 2) + (a * h2 + b * h5 + d * h8) - pos(i, 2);
+    }
     return x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
   };
   IView1D cnt = ws.i1("el_cnt", N), eoff = ws.i1("el_eoff", N + 1);

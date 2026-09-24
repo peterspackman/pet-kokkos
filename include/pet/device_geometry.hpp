@@ -81,9 +81,10 @@ inline DeviceGeom stage_geometry_views(Workspace& ws, int Ntot, int B) {
 // past the model cutoff are skipped (an engine lists cutoff + skin), and both
 // directions should be present wherever both atoms have neighbourhoods.
 //
-// v_e = r_j - r_i from `positions` (ghosts sit where they are), unless the engine
-// gives `vectors` -- with `shifts` to tell periodic images of one pair apart, as
-// a periodic engine without ghosts must.
+// v_e = r_j - r_i from `positions` (ghosts sit where they are). A periodic
+// engine without ghosts gives `shifts` to tell images of one pair apart, and
+// either `cell` (v_e = r_j + shift . cell - r_i, computed on the device) or the
+// `vectors` themselves.
 struct EdgeListView {
   int n_atoms = 0, n_local = -1;       // n_local -1: every atom is owned
   const double* positions = nullptr;   // [n_atoms, 3] Angstrom
@@ -91,7 +92,8 @@ struct EdgeListView {
   const int* offsets = nullptr;        // [n_atoms + 1]
   const int* neighbors = nullptr;      // [offsets[n_atoms]]
   const double* vectors = nullptr;     // [offsets[n_atoms], 3], optional
-  const int* shifts = nullptr;         // [offsets[n_atoms], 3], optional, with vectors
+  const int* shifts = nullptr;         // [offsets[n_atoms], 3], optional
+  const double* cell = nullptr;        // [9] lattice vectors as rows, with shifts
   int charge = 0, spin_multiplicity = 1;
 };
 

@@ -158,7 +158,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     ie_adj = ie_next;
   }
 
-  DeviceOut out{per_atom, {}, {}};
+  DeviceOut out{per_atom, {}, {}, {}};
   forces_and_virial(ws_, dev, pk, h_, probes_, n_probes_, energy_scale_, x4_adj, cutoff_adj, cf_seq_adj,
                     out.forces, out.vir9, out.edge_grad);
   return out;

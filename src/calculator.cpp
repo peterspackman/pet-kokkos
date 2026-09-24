@@ -45,7 +45,8 @@ constexpr double kMemCardFraction = 0.7;
 constexpr long kMaxEdgeSlots = 131072;
 constexpr long kMinSampleSlots = 4096;  // below this, fixed-size buffers dominate the sample
 
-void device_memory(std::size_t budget_override, std::size_t& free_b, std::size_t& total_b) {
+void device_memory(const Options& o, std::size_t& free_b, std::size_t& total_b) {
+  const std::size_t budget_override = o.memory_budget_bytes;
   free_b = total_b = 0;
 #if defined(KOKKOS_ENABLE_CUDA)
   if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) free_b = total_b = 0;
@@ -54,6 +55,7 @@ void device_memory(std::size_t budget_override, std::size_t& free_b, std::size_t
 #endif
   if (budget_override > 0) free_b = total_b = budget_override;  // also simulates a smaller card
   if (total_b == 0) free_b = total_b = std::size_t(4) * 1024u * 1024u * 1024u;
+  if (o.device_share > 1) free_b /= o.device_share, total_b /= o.device_share;
 }
 
 bool model_dir_has(const std::string& dir, const std::string& name, std::string& json_out,
@@ -149,7 +151,7 @@ struct Calculator::Impl {
       if (ckpt.species_to_index[z] >= 0) atomic_types.push_back(z);
     if (o.allow_tf32) set_tf32(true);
     std::size_t free_b = 0, total_b = 0;
-    device_memory(o.memory_budget_bytes, free_b, total_b);
+    device_memory(o, free_b, total_b);
     // PET_GRAPHS=0 is for profilers that fence around every kernel.
     const char* g = std::getenv("PET_GRAPHS");
     model.set_graphs(o.graphs && !(g && g[0] == '0'));
@@ -263,7 +265,7 @@ Results Calculator::compute_batch(const std::vector<System>& systems, bool compu
   return out;
 }
 
-Results Calculator::compute_edges(const EdgeListView& edges, bool compute_forces) const {
+Results Calculator::compute_edges(const EdgeListView& edges, bool compute_forces, bool edge_gradients) const {
   auto& I = *impl_;
   IView1D input;
   const DeviceEdgeData dev = build_from_edges(edges, I.ckpt.hypers, I.ckpt.species_to_index, I.model.probes(),
@@ -277,6 +279,7 @@ Results Calculator::compute_edges(const EdgeListView& edges, bool compute_forces
   to_host(out.forces, br.forces);
   to_host(out.virial, br.virial);
   out.struct_id.assign(edges.n_atoms, 0);
+  if (!edge_gradients) return out;
   // Back into the engine's order.
   const int L = edges.n_atoms > 0 ? edges.offsets[edges.n_atoms] : 0;
   out.edge_gradient.assign(std::size_t(L) * 3, 0.0);
@@ -324,7 +327,7 @@ int Calculator::recommended_batch_atoms() const {
   const double bytes_per_slot = double(pool) / double(slots);
   const int m = std::max(1, impl_->model.peak_max_neighbors());
   std::size_t free_b = 0, total_b = 0;
-  device_memory(impl_->opts.memory_budget_bytes, free_b, total_b);
+  device_memory(impl_->opts, free_b, total_b);
 
   const double budget =
       std::min(double(free_b) + double(pool), double(total_b) * kMemCardFraction) * kMemHeadroom;

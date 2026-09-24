@@ -107,8 +107,9 @@ class Workspace {
     if (fit < 0) {
       fit = grow >= 0 ? grow : (int) tmp_.size();
       if (grow < 0) tmp_.emplace_back(), busy_.push_back(false);
+      const bool regrow = tmp_[fit].extent(0) > 0;
       tmp_[fit] = View1D();  // free the old one first
-      tmp_[fit] = View1D("ws:tmp", need);
+      tmp_[fit] = View1D("ws:tmp", regrow ? need + need / 4 : need);
       ++generation_;
     }
     busy_[fit] = true;
@@ -147,8 +148,10 @@ class Workspace {
   V get(const std::string& k, Ext... n) {
     using T = typename V::non_const_value_type;
     const std::size_t bytes = (std::size_t(n) * ... * sizeof(T));
+    // Exact the first time; a quarter over when it has to grow again, so a
+    // stepping loop whose sizes wander (MD) stops reallocating.
     auto& buf = named_[k];
-    if (buf.extent(0) < bytes) buf = Bytes(k, bytes), ++generation_;
+    if (buf.extent(0) < bytes) buf = Bytes(k, buf.extent(0) ? bytes + bytes / 4 : bytes), ++generation_;
     V v(reinterpret_cast<T*>(buf.data()), n...);
     fill(v);
     return v;
