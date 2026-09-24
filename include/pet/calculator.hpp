@@ -132,8 +132,9 @@ class Calculator {
   // place, then compute_device. Staging resets the neighbour cache.
   DeviceGeom stage(const std::vector<System>& systems) const;
   // From staged geometry, results left on the device. With a smaller geom.B and
-  // geom.Ntot, the leading structures only (a batch whose finished structures
-  // were moved to the back).
+  // geom.Ntot, the leading structures only. A driver that packs the structures
+  // still running to the front writes where each went in geom.staged, and the
+  // neighbour cache (cache_neighbors) follows them without searching again.
   BatchResult compute_device(const DeviceGeom& geom, bool compute_forces = true) const;
 
   // Atoms and edges from an MD engine's own neighbour list (see EdgeListView):

@@ -256,11 +256,16 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
           if (count(a) > m_fixed) overflow(0) = 1;
         });
   } else {
+    // Both into device memory, then one readback.
+    IView1D mn = ws.i1("nef:m_n", 2);
     Kokkos::parallel_reduce(
         "pet_maxM", RangePolicy(0, NC), KOKKOS_LAMBDA(int a, int& m) { m = count(a) > m ? count(a) : m; },
-        Kokkos::Max<int>(M));
+        Kokkos::Max<int, MemSpace>(Kokkos::subview(mn, 0)));
     Kokkos::parallel_reduce(
-        "pet_nkept", RangePolicy(0, NC), KOKKOS_LAMBDA(int a, int& c) { c += count(a); }, dev.n_edges);
+        "pet_nkept", RangePolicy(0, NC), KOKKOS_LAMBDA(int a, int& c) { c += count(a); },
+        Kokkos::Sum<int, MemSpace>(Kokkos::subview(mn, 1)));
+    const auto hmn = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), mn);
+    M = hmn(0), dev.n_edges = hmn(1);
     M = std::max(M, 1);
     if (m_high > 0) M = m_high = std::max(M, m_high);
     dev.padded = false;

@@ -43,9 +43,12 @@ void image_ranges_rows(const double cell[9], double cutoff, int periodic, int n[
   if (periodic & 4) n[2] = (int) Kokkos::ceil(cutoff / (vol / nab));
 }
 
-// One batch of B structures, Ntot atoms in all, staged on the device. Only pos
-// and scell may change between evaluations (a relaxation, MD). Lowering B and
-// Ntot evaluates the leading structures only.
+// One batch of B structures, Ntot atoms in all, staged on the device. Between
+// evaluations a driver moves pos and scell (a relaxation, MD). Lowering B and
+// Ntot evaluates the leading structures only; a driver that also packs the
+// structures still running to the front rewrites every field, and names in
+// `staged` which staged structure each slot now holds, so a Verlet cache can
+// follow them.
 struct DeviceGeom {
   RView2D pos;     // [Ntot,3] cartesian, Angstrom, unwrapped (see build_nef_device)
   IView1D sid;     // [Ntot]   owning structure
@@ -56,6 +59,7 @@ struct DeviceGeom {
   RView2D scell;   // [B,9]    cell rows = lattice vectors, Angstrom
   IView1D charge;  // [B]      total charge (conditioned models)
   IView1D spin;    // [B]      spin multiplicity 2S+1 (conditioned models)
+  IView1D staged;  // [B]      the staged structure in each slot (stage: b)
   int Ntot = 0, B = 0;
 };
 
@@ -72,6 +76,7 @@ inline DeviceGeom stage_geometry_views(Workspace& ws, int Ntot, int B) {
   g.scell = ws.r2("pet_scell", B, 9);
   g.charge = ws.i1("pet_charge", B);
   g.spin = ws.i1("pet_spin", B);
+  g.staged = ws.i1("pet_staged", B);
   return g;
 }
 
@@ -125,20 +130,35 @@ struct EdgeSession {
 DeviceGeom stage_systems(Workspace& ws, const std::vector<System>& systems,
                          const std::vector<int>& species_to_index);
 
-// A Verlet cache for the search: the pairs within cutoff + skin, found only when
-// an atom moves, or the cell strains, far enough to bring a new pair inside the
-// cutoff; each call recomputes their vectors and keeps those within the cutoff.
-// Images are stored in unwrapped terms, so a pair survives an atom crossing a
-// cell face. The edge set and order match the uncached search exactly; on a
-// reused round the vectors differ in the last bits (unwrapped rather than
+// A Verlet cache for a batch being stepped: the pairs within cutoff + skin and
+// their topology (partners, each atom's range), searched for only when some atom
+// has moved, or some cell strained, far enough that a pair outside could now be
+// inside the cutoff. Between searches a call recomputes the cached pairs'
+// vectors, and those past the cutoff weigh nothing, as in an engine's list.
+//
+// It follows a shrinking batch: when DeviceGeom::staged shows structures gone or
+// packed into other slots, the survivors' pairs are reassembled from the last
+// search, not searched again. Images are stored in unwrapped terms, so a pair
+// survives an atom crossing a cell face. The kept edges and their order match the
+// uncached search; the vectors differ in the last bits (unwrapped rather than
 // wrapped arithmetic). tests/test_device_vs_host.cpp checks both.
 struct NefCache {
-  IView1D ci, cj;  // [Es] cached topology: centre + neighbour (global indices)
-  IView2D cshift;  // [Es,3] periodic image (sa,sb,sc), in UNWRAPPED terms
-  RView2D pos0;    // [Ntot,3] positions at last rebuild (skin check)
-  RView2D cell0;   // [B,9] cell at last rebuild (strain check)
-  int Es = 0;      // cached edge count (within cutoff+skin)
-  int built_Ntot = -1;
+  static constexpr double kSkin = 1.0;  // Angstrom
+  Workspace ws;                         // everything below lives here
+  EdgeMap map{16};
+  // The batch as last searched, in its own numbering: the topology, each
+  // pair's image, positions and inverse cells then, and each slot's staged
+  // structure and ranges. slot_of: staged structure -> slot, -1 if absent.
+  DeviceEdgeData ref;
+  IView2D ref_shift;
+  RView2D pos0, cinv0;
+  IView1D ref_soff, ref_scnt, ref_eoff, slot_of;
+  // The batch the last call evaluated: `ref` itself, or ref reassembled for a
+  // smaller batch.
+  DeviceEdgeData cur;
+  IView2D cur_shift;
+  IView1D cur_staged;
+  int cur_B = -1, cur_N = -1;
   bool valid = false;
 };
 

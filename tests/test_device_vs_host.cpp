@@ -214,6 +214,43 @@ TEST_CASE("staged geometry follows moves, strains and a shrinking batch", "[mode
       Kokkos::deep_copy(g.pos, hp), Kokkos::deep_copy(g.scell, hc);
       check(g.B, Ntot, "moved and strained");
 
+      // The first structure finishes: the rest are packed to the front, as a
+      // relaxation driver does, and `staged` says where each went. The cache
+      // reassembles their pairs rather than searching again.
+      if (systems.size() >= 2) {
+        const std::vector<pet::System> rest(systems.begin() + 1, systems.end());
+        auto hsid = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), g.sid);
+        auto hspec = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), g.spec);
+        auto hsoff = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), g.soff);
+        auto hscnt = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), g.scnt);
+        auto hsper = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), g.sper);
+        auto hst = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), g.staged);
+        const int skip = systems[0].n_atoms;
+        int N = 0;
+        for (int b = 1, gi = 0; b < (int) systems.size(); ++b) {
+          const int from = hsoff(b), n = hscnt(b);
+          for (int e = 0; e < 9; ++e) hc(b - 1, e) = systems[b].cell[e];
+          hsoff(b - 1) = gi, hscnt(b - 1) = n, hsper(b - 1) = hsper(b), hst(b - 1) = b;
+          for (int i = 0; i < n; ++i, ++gi) {
+            for (int d = 0; d < 3; ++d) hp(gi, d) = hp(from + i, d);
+            hspec(gi) = hspec(from + i), hsid(gi) = b - 1;
+          }
+          N = gi;
+        }
+        REQUIRE(N == Ntot - skip);
+        Kokkos::deep_copy(g.pos, hp), Kokkos::deep_copy(g.scell, hc), Kokkos::deep_copy(g.sid, hsid);
+        Kokkos::deep_copy(g.spec, hspec), Kokkos::deep_copy(g.soff, hsoff), Kokkos::deep_copy(g.scnt, hscnt);
+        Kokkos::deep_copy(g.sper, hsper), Kokkos::deep_copy(g.staged, hst);
+        g.B = (int) rest.size(), g.Ntot = N;
+        const pet::Results a = to_host(calc.compute_device(g), g.B, N), b = ref.compute(rest, true);
+        const Deviation e = deviation(a.energy, b.energy), f = deviation(a.forces, b.forces);
+        INFO("packed after the first finished: energy rel " << e.relative() << ", force rel " << f.relative());
+        CHECK(e.relative() <= kFp32Noise);
+        CHECK(f.relative() <= kFp32Noise);
+        // Restore the full batch for what follows.
+        g = calc.stage(systems);
+      }
+
       // The leading structure alone must be exactly what staging it alone gives.
       g.B = 1, g.Ntot = systems[0].n_atoms;
       pet::Calculator solo(found->first, found->second);
