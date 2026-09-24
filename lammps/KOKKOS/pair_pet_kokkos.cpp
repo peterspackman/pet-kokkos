@@ -65,6 +65,7 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::rebuild()
   l.ilist = ilist.data(), l.numneigh = numneigh.data();
   l.neighbor = [&](int i, int k) { return neighbors(i, k) & NEIGHMASK; };
   if (mode == Mode::Images) set_images(l, false);
+  else if (mode == Mode::Exchange) set_exchange(l);
   else set_ghosts(l);
   listed = true;
 }

@@ -405,7 +405,7 @@ class ImageExchange : public pet::Exchange {
     for (std::size_t g = n_local_; g < owner_.size(); ++g) h(owner_[g]) += h(g), h(g) = 0;
     Kokkos::deep_copy(a, h);
   }
-  void edges(pet::View2D out, pet::View2D in) override {
+  void edges(pet::View2D out, pet::View2D in, pet::IView1D) override {
     auto o = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
     auto i = Kokkos::create_mirror_view(in);
     for (std::size_t r = 0; r < partner_.size(); ++r)

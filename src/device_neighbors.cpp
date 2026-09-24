@@ -211,7 +211,7 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
                    int m_fixed, IView1D overflow) {
   const bool adaptive = h.adaptive(), bump = h.cutoff_function == CutoffFunction::Bump;
   const double width = h.cutoff_width, cutoff = h.cutoff;
-  const int N = dev.n_atoms, E = dev.n_raw;
+  const int N = dev.n_atoms, NC = dev.centres(), E = dev.n_raw;
   auto roff = dev.raw_off, raw_rev = dev.raw_reverse, re_i = dev.raw_center, re_j = dev.raw_neigh;
   auto re_dist = dev.raw_dist;
   auto re_vec = dev.raw_vec;
@@ -232,7 +232,7 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
   // Which edges are kept -- those within the mean of their two atoms' cutoffs --
   // their smooth factors, and each atom's count.
   RView1D rcv = ws.r1("nef:rcv", E), factor = ws.r1("nef:factorv", E);
-  IView1D keep = ws.i1("nef:keepv", E), count = ws.i1("nef:count", N);
+  IView1D keep = ws.i1("nef:keepv", E), count = ws.i1("nef:count", NC);
   Kokkos::deep_copy(ExecSpace(), count, 0);
   Kokkos::parallel_for(
       "pet_keep", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
@@ -250,22 +250,22 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
   // `overflow` for the caller to grow M and redo.
   int M = m_fixed;
   if (m_fixed > 0) {
-    dev.n_edges = N * M, dev.padded = true;
+    dev.n_edges = NC * M, dev.padded = true;
     Kokkos::parallel_for(
-        "pet_overflow", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
+        "pet_overflow", RangePolicy(0, NC), KOKKOS_LAMBDA(int a) {
           if (count(a) > m_fixed) overflow(0) = 1;
         });
   } else {
     Kokkos::parallel_reduce(
-        "pet_maxM", RangePolicy(0, N), KOKKOS_LAMBDA(int a, int& m) { m = count(a) > m ? count(a) : m; },
+        "pet_maxM", RangePolicy(0, NC), KOKKOS_LAMBDA(int a, int& m) { m = count(a) > m ? count(a) : m; },
         Kokkos::Max<int>(M));
     Kokkos::parallel_reduce(
-        "pet_nkept", RangePolicy(0, N), KOKKOS_LAMBDA(int a, int& c) { c += count(a); }, dev.n_edges);
+        "pet_nkept", RangePolicy(0, NC), KOKKOS_LAMBDA(int a, int& c) { c += count(a); }, dev.n_edges);
     M = std::max(M, 1);
     if (m_high > 0) M = m_high = std::max(M, m_high);
     dev.padded = false;
   }
-  const int S = M + 1, NM = N * M;
+  const int S = M + 1, NM = NC * M;
   dev.max_neighbors = M;
 
   // The kept edges into their atoms' slots, in edge order: slot = the number of
@@ -277,12 +277,12 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
   auto mask = dev.mask = ws.r1("nef:out:mask", NM);
   auto pcut = dev.pair_cutoff = ws.r1("nef:out:pcut", NM);
   auto cut = dev.cutoff_factor = ws.n1("nef:out:cutoff", NM);
-  auto cf_seq = dev.cf_seq = ws.n2("nef:out:cf_seq", N, S);
+  auto cf_seq = dev.cf_seq = ws.n2("nef:out:cf_seq", NC, S);
   IView1D flat = dev.raw_slot = ws.i1("nef:flat_edge", E);
   Kokkos::deep_copy(ExecSpace(), reverse, -1);
   Kokkos::deep_copy(ExecSpace(), flat, -1);
   Kokkos::parallel_for(
-      "pet_scatter", AtomTeams(N, 1, kLanes), KOKKOS_LAMBDA(const Atom& t) {
+      "pet_scatter", AtomTeams(NC, 1, kLanes), KOKKOS_LAMBDA(const Atom& t) {
         const int i = t.league_rank(), e0 = roff(i);
         // A zero-based range, offset by hand: Kokkos 5.0.2's CUDA vector scan
         // ignores a ThreadVectorRange's begin and walks [0, end).
@@ -306,7 +306,7 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
       });
   // The attention bias source: 1 for the central token, then the factors.
   Kokkos::parallel_for(
-      "pet_cfseq", RangePolicy(0, N * S), KOKKOS_LAMBDA(int i) {
+      "pet_cfseq", RangePolicy(0, NC * S), KOKKOS_LAMBDA(int i) {
         const int n = i / S, s = i % S;
         cf_seq(n, s) = s == 0 ? static_cast<Net>(1.0) : cut(n * M + s - 1);
       });

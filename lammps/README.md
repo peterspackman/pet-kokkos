@@ -53,18 +53,24 @@ pair_coeff  * * C H O                # an element per atom type
 ```sh
 lmp -in in.lmp                                  # pair_style pet
 lmp -k on g 1 -sf kk -in in.lmp                 # pair_style pet/kk, on the GPU
-mpirun -np 4 lmp -k on g 4 -sf kk -pk kokkos newton on -in in.lmp
+mpirun -np 4 lmp -k on g 4 -sf kk -pk kokkos newton on neigh half -in in.lmp
 ```
+
+(pet/kk asks for its own full list; `neigh half` only satisfies the KOKKOS
+package's rule that full lists go with `newton off`.)
 
 Models are found on `PET_MODEL_DIR` (and `./models`, `~/.local/share/pet/models`).
 
-`pair_style pet MODEL mode images|ghosts`:
+`pair_style pet MODEL mode images|exchange|ghosts`:
 - `images` (the default on one MPI rank): every ghost is a periodic image of an
   owned atom, so PET evaluates only the owned atoms. Exact, and the cheapest.
-- `ghosts` (the default on several): the ghost cutoff is raised to what the
-  model's message passing needs (several cutoffs), and PET evaluates the ghost
-  shell too, counting only the owned atoms' energy. Needs `newton on`; pays
-  only on subdomains much larger than the shell.
+- `exchange` (the default on several): each rank evaluates its owned atoms with
+  ghosts one cutoff deep, and at every message-passing layer the ranks swap the
+  rows of the edges that cross between them (and, in the backward, their
+  adjoints): ghost cutoffs by LAMMPS's comm, edge rows straight to the owning
+  rank by MPI_Alltoallv, only for edges PET keeps. Needs `newton on`.
+- `ghosts`: no exchange; ghosts as deep as the message passing reaches (several
+  cutoffs), all evaluated. Kept for comparison.
 
 `pair_style pet` needs `newton on` (its half list); `pet/kk` in `images` mode
 does not. Per-atom energy and virial (`compute pe/atom`, `stress/atom`) are

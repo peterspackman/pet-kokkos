@@ -16,7 +16,7 @@ namespace pet {
 void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D& node,
                         View2D input_edge, View2D cond, LayerSaves* sav, bool save_wide, View2D remote_in,
                         bool share) {
-  const int N = dev.n_atoms, S = dev.max_neighbors + 1, E = pk.E;
+  const int N = dev.centres(), S = dev.max_neighbors + 1, E = pk.E;
   const int D = h_.d_pet, Dn = h_.d_node, A = h_.num_attention_layers;
   const bool save = sav != nullptr;
   const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
@@ -127,7 +127,7 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
           const int r = i / D, d = i % D;
           out(r, d) = rp(r) >= 0 ? out_edge(rp(r), d) : Net(0);
         });
-    dev.exchange->edges(out, remote_in);
+    dev.exchange->edges(out, remote_in, rp);
   }
   View2D concat = save ? keep(sav->concat, "cc", -1, E, 2 * D) : ws_.tmp(E, 2 * D);
   Kokkos::parallel_for(
@@ -147,7 +147,7 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
 void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, int L, const LayerSaves& sav,
                             bool kept_wide, View2D node_adj, View2D input_edge_adj, View2D x4_adj,
                             View2D cf_seq_adj) {
-  const int N = dev.n_atoms, S = dev.max_neighbors + 1, E = pk.E;
+  const int N = dev.centres(), S = dev.max_neighbors + 1, E = pk.E;
   const int D = h_.d_pet, Dn = h_.d_node, A = h_.num_attention_layers;
   const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
   auto off = pk.off, rev = pk.reverse;
@@ -185,7 +185,7 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
             const int r = i / D, d = i % D;
             out(r, d) = rp(r) >= 0 ? concat_adj(rp(r), D + d) : Net(0);
           });
-      dev.exchange->edges(out, remote_adj);
+      dev.exchange->edges(out, remote_adj, rp);
     }
     Kokkos::parallel_for(
         "bw_concat", RangePolicy(0, E * D), KOKKOS_LAMBDA(int i) {
@@ -249,7 +249,7 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
 }
 
 DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
-  const int N = dev.n_atoms, S = dev.max_neighbors + 1;
+  const int N = dev.centres(), S = dev.max_neighbors + 1;  // the model's rows
   const int D = h_.d_pet, Dn = h_.d_node, G = h_.num_gnn_layers;
   Workspace::Scope scope(ws_);
   // Every buffer's first writer overwrites it; the few accumulators are zeroed
@@ -288,7 +288,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   View1D net = ws_.n1("per_atom_net", N);
   ReadoutSaves rs;
   readout({node}, {input_edge}, net, pk, grad ? &rs : nullptr, "");
-  RView1D per_atom = ws_.r1("per_atom", N);
+  RView1D per_atom = ws_.r1("per_atom", dev.n_atoms);  // every atom's, 0 past n_local
   assemble_energy(per_atom, net, dev.species, comp_view_, energy_scale_, pk.n_local);
   if (!grad) return {per_atom, {}, {}, {}};
 

@@ -312,7 +312,7 @@ static void remote_map(const DeviceEdgeData& d, PackedEdges& p) {
 }
 
 PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
-  const int N = d.n_atoms, M = d.max_neighbors;
+  const int N = d.centres(), M = d.max_neighbors;
   PackedEdges p;
   p.E = d.n_edges;
   p.off = ws_.i1("pk:off", N + 1);
@@ -384,7 +384,7 @@ PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
 // has no backward. Empty for a model without it.
 View2D PetModel::conditioning(const DeviceEdgeData& dev) {
   if (!h_.system_conditioning) return View2D();
-  const int N = dev.n_atoms, NS = dev.n_struct, Dn = h_.d_node, max_q = h_.max_charge;
+  const int N = dev.centres(), NS = dev.n_struct, Dn = h_.d_node, max_q = h_.max_charge;
   IView1D q = dev.charge, sm = dev.spin_multiplicity;
   if ((int) q.extent(0) != NS || (int) sm.extent(0) != NS) {  // metatrain's default: a neutral singlet
     q = ws_.i1("cond_q", NS), sm = ws_.i1("cond_sm", NS);
@@ -578,7 +578,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   if (d.n_edges < 0) {
     auto mask = d.mask;
     Kokkos::parallel_reduce(
-        "count_edges", RangePolicy(0, N * d.max_neighbors),
+        "count_edges", RangePolicy(0, d.centres() * d.max_neighbors),
         KOKKOS_LAMBDA(int k, int& c) { c += mask(k) > 0.0; }, d.n_edges);
   }
   auto pass = [&] {
@@ -626,7 +626,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
 // Everything recorded device work depends on besides the model: the shapes,
 // where each input lives, and the workspace's allocation generation.
 std::vector<std::uintptr_t> PetModel::graph_key(const DeviceEdgeData& d, bool grad) const {
-  std::vector<std::uintptr_t> k{(std::uintptr_t) grad,       (std::uintptr_t) d.n_atoms,
+  std::vector<std::uintptr_t> k{(std::uintptr_t) grad,       (std::uintptr_t) d.n_atoms, (std::uintptr_t) d.n_centres,
                                 (std::uintptr_t) d.max_neighbors, (std::uintptr_t) d.n_raw,
                                 (std::uintptr_t) d.n_struct,  (std::uintptr_t) d.n_edges,
                                 (std::uintptr_t) d.n_local,   ws_.generation()};

@@ -47,10 +47,11 @@ void fold_edge_gradients(Workspace& ws, RView2D grad, const PackedEdges& pk, IVi
   RView2D vir_atom = ws.r2("fold:vir_atom", N, 9);
   auto off = pk.off, rev = pk.reverse;
   auto vec = pk.vec;
+  const int nc = pk.off.extent(0) - 1;  // atoms with edges; the rest are only neighbours
   Kokkos::parallel_for(
       "fold_forces", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
         double f[3] = {0, 0, 0}, w[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
-        for (int k = off(i); k < off(i + 1); ++k) {
+        for (int k = i < nc ? off(i) : 0; k < (i < nc ? off(i + 1) : 0); ++k) {
           for (int c = 0; c < 3; ++c) f[c] += grad(k, c);
           for (int a = 0; a < 3; ++a)
             for (int b = 0; b < 3; ++b) w[a * 3 + b] += vec(k, a) * grad(k, b);
@@ -265,10 +266,11 @@ void adaptive_part(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h, RV
   const int N = dev.n_atoms;
   auto off = pk.off, rev = pk.reverse;
   RView1D adapted_adj = ws.r1("adapted_adj", N);
+  const int nc = pk.off.extent(0) - 1;
   Kokkos::parallel_for(
       "adapted_adj", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
         double s = 0.0;
-        for (int k = off(a); k < off(a + 1); ++k) {
+        for (int k = a < nc ? off(a) : 0; k < (a < nc ? off(a + 1) : 0); ++k) {
           s += 0.5 * pc_adj(k);
           if (rev(k) >= 0) s += 0.5 * pc_adj(rev(k));
         }

@@ -6,7 +6,7 @@
    This software is distributed under the GNU General Public License.
 ------------------------------------------------------------------------- */
 
-// pair_style pet MODEL [mode images|ghosts]
+// pair_style pet MODEL [mode images|exchange|ghosts]
 // pair_coeff * * ELEMENT...        (one element symbol per atom type)
 //
 // MODEL is a pet-kokkos model name (searched on PET_MODEL_DIR and friends) or a
@@ -18,11 +18,14 @@
 //   images (the default on one MPI rank): every ghost is a periodic image of an
 //     owned atom, so pet-kokkos sees only the owned atoms, with each edge to an
 //     image labelled by its lattice shift. Exact, and costs the owned atoms only.
-//   ghosts (the default on more): the ghost cutoff is raised to what the model
-//     needs (pet::Calculator::ghost_cutoff), ghosts get neighbour lists too, and
-//     pet-kokkos evaluates them all and counts only the owned atoms' energy;
-//     ghost forces come home by reverse communication. It costs the ghost shell
-//     too -- several cutoffs deep -- so it only pays on large subdomains.
+//   exchange (the default on more): each rank evaluates its owned atoms, ghosts
+//     one cutoff deep, and at every layer the ranks swap the rows of edges that
+//     cross between them (pet/exchange.hpp): ghosts' adaptive cutoffs and their
+//     adjoints by LAMMPS's comm, edge rows straight to the owning rank. Ghost
+//     forces come home by reverse communication.
+//   ghosts: no exchange; the ghost cutoff is raised to what the message passing
+//     needs (pet::Calculator::ghost_cutoff) and pet-kokkos evaluates that whole
+//     shell. Kept for comparison: it costs several cutoffs of ghosts.
 
 #include "pair_pet.h"
 
@@ -100,6 +103,7 @@ void PairPET::compute(int eflag, int vflag)
     l.ilist = list->ilist, l.numneigh = list->numneigh;
     l.neighbor = [this](int i, int k) { return list->firstneigh[i][k] & NEIGHMASK; };
     if (mode == Mode::Images) set_images(l, true);
+    else if (mode == Mode::Exchange) set_exchange(l);
     else set_ghosts(l);
     listed = true;
   }
@@ -201,12 +205,226 @@ void PairPET::set_ghosts(const List &l)
   set(nall, false);
 }
 
+// Owned atoms with their lists, ghosts one cutoff deep with none; and the
+// routing of the edges to ghosts: to the rank owning each ghost, matched there
+// by (that atom's tag, this atom's tag, the edge vector) to its own edges.
+void PairPET::set_exchange(const List &l)
+{
+  const int nlocal = atom->nlocal, nall = nlocal + atom->nghost, nprocs = comm->nprocs;
+  double **x = atom->x;
+  const tagint *tag = atom->tag;
+  off.assign(nall + 1, 0);
+  for (int ii = 0; ii < l.n; ++ii) off[l.ilist[ii] + 1] = l.numneigh[l.ilist[ii]];
+  for (int i = 0; i < nall; ++i) off[i + 1] += off[i];
+  nbr.resize(off[nall]);
+  shift.clear();
+  for (int ii = 0; ii < l.n; ++ii) {
+    const int i = l.ilist[ii];
+    for (int k = 0; k < l.numneigh[i]; ++k) nbr[off[i] + k] = l.neighbor(i, k);
+  }
+
+  atom_buf.assign(nall, comm->me);  // each ghost's owner
+  forward_atoms();
+  std::vector<int> remote_of(off[nall], -1);
+  std::vector<std::vector<int>> to_rank(nprocs);
+  std::vector<double> key;
+  int n_remote = 0;
+  for (int i = 0; i < nlocal; ++i)
+    for (int e = off[i]; e < off[i + 1]; ++e) {
+      const int j = nbr[e];
+      if (j < nlocal) continue;
+      to_rank[(int) atom_buf[j]].push_back(remote_of[e] = n_remote++);
+      key.insert(key.end(), {double(tag[j]), double(tag[i]), x[j][0] - x[i][0], x[j][1] - x[i][1], x[j][2] - x[i][2]});
+    }
+  send_order.clear(), send_counts.assign(nprocs, 0), recv_counts.assign(nprocs, 0);
+  for (int p = 0; p < nprocs; ++p) {
+    send_counts[p] = to_rank[p].size();
+    send_order.insert(send_order.end(), to_rank[p].begin(), to_rank[p].end());
+  }
+  MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, world);
+  send_displs.assign(nprocs, 0), recv_displs.assign(nprocs, 0);
+  for (int p = 1; p < nprocs; ++p)
+    send_displs[p] = send_displs[p - 1] + send_counts[p - 1], recv_displs[p] = recv_displs[p - 1] + recv_counts[p - 1];
+  const int n_recv = recv_displs[nprocs - 1] + recv_counts[nprocs - 1];
+
+  std::vector<double> keys_out(5 * n_remote), keys_in(5 * n_recv);
+  for (int q = 0; q < n_remote; ++q) std::copy_n(&key[5 * send_order[q]], 5, &keys_out[5 * q]);
+  alltoall_rows((const char *) keys_out.data(), 5 * sizeof(double), (char *) keys_in.data());
+  std::unordered_map<tagint, int> local;
+  for (int i = 0; i < nlocal; ++i) local[tag[i]] = i;
+  recv_map.assign(n_recv, -1);
+  int unmatched = 0;
+  for (int q = 0; q < n_recv; ++q) {
+    const double *k = &keys_in[5 * q];
+    const auto it = local.find((tagint) k[0]);
+    if (it != local.end()) {
+      const int o = it->second;
+      for (int e = off[o]; e < off[o + 1] && recv_map[q] < 0; ++e) {
+        const int h = nbr[e];
+        if (h >= nlocal && tag[h] == (tagint) k[1] &&
+            std::fabs(x[h][0] - x[o][0] + k[2]) + std::fabs(x[h][1] - x[o][1] + k[3]) + std::fabs(x[h][2] - x[o][2] + k[4]) < 1e-6)
+          recv_map[q] = remote_of[e];
+      }
+    }
+    unmatched += recv_map[q] < 0;
+  }
+  int all = 0;
+  MPI_Allreduce(&unmatched, &all, 1, MPI_INT, MPI_SUM, world);
+  if (all && comm->me == 0)
+    error->warning(FLERR, "pair_style pet mode exchange: {} edge rows found no partner edge", all);
+  using HostI = Kokkos::View<const int *, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>;
+  d_send_order = pet::IView1D("pet:send_order", n_remote), d_recv_map = pet::IView1D("pet:recv_map", n_recv);
+  Kokkos::deep_copy(d_send_order, HostI(send_order.data(), n_remote));
+  Kokkos::deep_copy(d_recv_map, HostI(recv_map.data(), n_recv));
+  std::vector<int> block(n_remote), rank(n_remote);
+  for (int p = 0; p < nprocs; ++p)
+    for (int q = send_displs[p]; q < send_displs[p] + send_counts[p]; ++q) block[q] = send_displs[p], rank[q] = p;
+  d_send_block = pet::IView1D("pet:send_block", n_remote), d_send_rank = pet::IView1D("pet:send_rank", n_remote);
+  d_recv_displs = pet::IView1D("pet:recv_displs", nprocs);
+  Kokkos::deep_copy(d_send_block, HostI(block.data(), n_remote));
+  Kokkos::deep_copy(d_send_rank, HostI(rank.data(), n_remote));
+  Kokkos::deep_copy(d_recv_displs, HostI(recv_displs.data(), nprocs));
+  d_live_at = pet::IView1D("pet:live_at", n_remote + 1), d_live_counts = pet::IView1D("pet:live_counts", nprocs);
+  d_arrive = pet::IView1D("pet:arrive", nprocs + 1);
+  set(nall, false);
+}
+
+// Rows of `width` bytes to each rank, in send_order; what arrives, in rank order.
+void PairPET::alltoall_rows(const char *out, int width, char *in)
+{
+  const int nprocs = comm->nprocs;
+  std::vector<int> sc(nprocs), sd(nprocs), rc(nprocs), rd(nprocs);
+  for (int p = 0; p < nprocs; ++p)
+    sc[p] = send_counts[p] * width, sd[p] = send_displs[p] * width, rc[p] = recv_counts[p] * width,
+    rd[p] = recv_displs[p] * width;
+  MPI_Alltoallv(out, sc.data(), sd.data(), MPI_BYTE, in, rc.data(), rd.data(), MPI_BYTE, world);
+}
+
+// Live rows only (edges PET keeps this step), compacted in send order on the
+// device, each tagged in its extra last column with its place among the rows
+// its destination expects from this rank; across by MPI from pinned host
+// buffers; placed by tag on the device.
+void PairPET::edges(pet::View2D out, pet::View2D in, pet::IView1D live)
+{
+  using Range = Kokkos::RangePolicy<pet::ExecSpace>;
+  const int D = out.extent(1), W = D + 1, nprocs = comm->nprocs, n_send = send_order.size();
+  auto order = d_send_order, block = d_send_block, rank = d_send_rank, at = d_live_at, counts = d_live_counts;
+  Kokkos::parallel_scan(
+      "pet_live_scan", Range(0, n_send + 1), KOKKOS_LAMBDA(int q, int &c, bool final) {
+        if (final) at(q) = c;
+        if (q < n_send) c += live(order(q)) >= 0;
+      });
+  Kokkos::deep_copy(counts, 0);
+  Kokkos::parallel_for(
+      "pet_live_counts", Range(0, n_send), KOKKOS_LAMBDA(int q) {
+        if (live(order(q)) >= 0) Kokkos::atomic_inc(&counts(rank(q)));
+      });
+  std::vector<int> sc(nprocs), rc(nprocs), sd(nprocs, 0), rd(nprocs + 1, 0);
+  Kokkos::deep_copy(Kokkos::View<int *, Kokkos::HostSpace>(sc.data(), nprocs), counts);
+  MPI_Alltoall(sc.data(), 1, MPI_INT, rc.data(), 1, MPI_INT, world);
+  for (int p = 1; p < nprocs; ++p) sd[p] = sd[p - 1] + sc[p - 1];
+  for (int p = 0; p < nprocs; ++p) rd[p + 1] = rd[p] + rc[p];
+  const int n_live = sd[nprocs - 1] + sc[nprocs - 1], n_arrive = rd[nprocs];
+
+  if (d_send.extent(0) < (size_t) n_live || d_send.extent(1) != (size_t) W)
+    d_send = pet::View2D("pet:send", n_send, W), h_send = decltype(h_send)("pet:h_send", n_send, W);
+  if (d_recv.extent(0) < (size_t) n_arrive || d_recv.extent(1) != (size_t) W)
+    d_recv = pet::View2D("pet:recv", recv_map.size(), W), h_recv = decltype(h_recv)("pet:h_recv", recv_map.size(), W);
+  auto send = d_send, recv = d_recv;
+  Kokkos::parallel_for(
+      "pet_send_rows", Range(0, n_send), KOKKOS_LAMBDA(int q) {
+        const int r = order(q);
+        if (live(r) < 0) return;
+        const int c = at(q), tag = q - block(q);
+        for (int d = 0; d < D; ++d) send(c, d) = out(r, d);
+        pet::Net t = 0;
+        memcpy(&t, &tag, sizeof(int));
+        send(c, D) = t;
+      });
+  const auto rows = [](auto v, int n) { return Kokkos::subview(v, std::make_pair(0, n), Kokkos::ALL); };
+  Kokkos::deep_copy(rows(h_send, n_live), rows(d_send, n_live));
+  const int bytes = W * sizeof(pet::Net);
+  std::vector<int> scb(nprocs), sdb(nprocs), rcb(nprocs), rdb(nprocs);
+  for (int p = 0; p < nprocs; ++p) scb[p] = sc[p] * bytes, sdb[p] = sd[p] * bytes, rcb[p] = rc[p] * bytes, rdb[p] = rd[p] * bytes;
+  MPI_Alltoallv(h_send.data(), scb.data(), sdb.data(), MPI_BYTE, h_recv.data(), rcb.data(), rdb.data(), MPI_BYTE, world);
+  Kokkos::deep_copy(rows(d_recv, n_arrive), rows(h_recv, n_arrive));
+
+  Kokkos::deep_copy(Kokkos::subview(d_arrive, std::make_pair(0, nprocs + 1)),
+                    Kokkos::View<const int *, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(rd.data(), nprocs + 1));
+  Kokkos::deep_copy(in, pet::Net(0));
+  auto map = d_recv_map, displs = d_recv_displs, arrive = d_arrive;
+  Kokkos::parallel_for(
+      "pet_recv_rows", Range(0, n_arrive), KOKKOS_LAMBDA(int a) {
+        int p = 0;
+        while (arrive(p + 1) <= a) ++p;  // the sending rank
+        int tag = 0;
+        const pet::Net t = recv(a, D);
+        memcpy(&tag, &t, sizeof(int));
+        const int r = map(displs(p) + tag);
+        if (r >= 0)
+          for (int d = 0; d < D; ++d) in(r, d) = recv(a, d);
+      });
+}
+
+void PairPET::atoms_forward(pet::RView1D a)
+{
+  const int nall = atom->nlocal + atom->nghost;
+  const auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), a);
+  atom_buf.assign(h.data(), h.data() + nall);
+  forward_atoms();
+  std::copy_n(atom_buf.data(), nall, h.data());
+  Kokkos::deep_copy(a, h);
+}
+
+// atom_buf through LAMMPS's comm, by the host hooks below -- also under the
+// KOKKOS package, whose comm would otherwise want device ones.
+void PairPET::forward_atoms()
+{
+  const ExecutionSpace space = execution_space;
+  execution_space = Host;
+  comm->forward_comm(this);
+  execution_space = space;
+}
+
+void PairPET::atoms_reverse(pet::RView1D a)
+{
+  const int nlocal = atom->nlocal, nall = nlocal + atom->nghost;
+  const auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), a);
+  atom_buf.assign(h.data(), h.data() + nall);
+  comm->reverse_comm(this);
+  for (int i = 0; i < nall; ++i) h(i) = i < nlocal ? atom_buf[i] : 0.0;
+  Kokkos::deep_copy(a, h);
+}
+
+int PairPET::pack_forward_comm(int n, int *list, double *buf, int, int *)
+{
+  for (int k = 0; k < n; ++k) buf[k] = atom_buf[list[k]];
+  return n;
+}
+
+void PairPET::unpack_forward_comm(int n, int first, double *buf)
+{
+  for (int k = 0; k < n; ++k) atom_buf[first + k] = buf[k];
+}
+
+int PairPET::pack_reverse_comm(int n, int first, double *buf)
+{
+  for (int k = 0; k < n; ++k) buf[k] = atom_buf[first + k];
+  return n;
+}
+
+void PairPET::unpack_reverse_comm(int n, int *list, double *buf)
+{
+  for (int k = 0; k < n; ++k) atom_buf[list[k]] += buf[k];
+}
+
 void PairPET::set(int n, bool half)
 {
   z.resize(n);
   for (int i = 0; i < n; ++i) z[i] = type_z[atom->type[i]];
   pet::EdgeListView v;
   v.n_atoms = n, v.n_local = atom->nlocal, v.half = half;
+  v.exchange = mode == Mode::Exchange ? &link : nullptr;
   v.atomic_numbers = z.data(), v.offsets = off.data(), v.neighbors = nbr.data();
   v.shifts = shift.empty() ? nullptr : shift.data();
   try {
@@ -231,17 +449,20 @@ void PairPET::allocate()
 
 void PairPET::settings(int narg, char **arg)
 {
-  if (narg != 1 && narg != 3) error->all(FLERR, "Illegal pair_style pet command: pair_style pet MODEL [mode images|ghosts]");
-  mode = comm->nprocs == 1 ? Mode::Images : Mode::Ghosts;
+  if (narg != 1 && narg != 3)
+    error->all(FLERR, "Illegal pair_style pet command: pair_style pet MODEL [mode images|exchange|ghosts]");
+  mode = comm->nprocs == 1 ? Mode::Images : Mode::Exchange;
   if (narg == 3) {
     if (strcmp(arg[1], "mode") != 0) error->all(FLERR, "Illegal pair_style pet keyword {}", arg[1]);
     if (strcmp(arg[2], "images") == 0) mode = Mode::Images;
+    else if (strcmp(arg[2], "exchange") == 0) mode = Mode::Exchange;
     else if (strcmp(arg[2], "ghosts") == 0) mode = Mode::Ghosts;
-    else error->all(FLERR, "Illegal pair_style pet mode {}: images or ghosts", arg[2]);
+    else error->all(FLERR, "Illegal pair_style pet mode {}: images, exchange or ghosts", arg[2]);
   }
   if (mode == Mode::Images && comm->nprocs > 1)
     error->all(FLERR, "pair_style pet mode images needs one MPI rank: other ranks' atoms are not images");
   ghostneigh = mode == Mode::Ghosts;
+  comm_forward = comm_reverse = 1;  // mode exchange: one value per atom
   no_virial_fdotr_compute = 1;  // pet-kokkos's symmetric virial instead, see compute()
   ensure_kokkos();
 
@@ -292,6 +513,10 @@ void PairPET::init_style()
   if (mode == Mode::Images) {
     if (full_list) neighbor->add_request(this, NeighConst::REQ_FULL);
     else neighbor->add_request(this);  // half: pet-kokkos mirrors it
+    return;
+  }
+  if (mode == Mode::Exchange) {  // owned atoms' lists; ghosts one cutoff deep
+    neighbor->add_request(this, NeighConst::REQ_FULL);
     return;
   }
   // Neighbours of ghosts too: their features feed the owned atoms' through the

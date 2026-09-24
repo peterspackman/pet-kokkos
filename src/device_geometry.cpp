@@ -344,6 +344,7 @@ void EdgeSession::set(const EdgeListView& v, const std::vector<int>& species_to_
   edge_topology(ws, map, dev, N, species, re_i, re_j, re_shift, ws.r2("md:re_vec", E, 3), ws.r1("md:re_dist", E), E);
   dev.n_struct = 1;
   dev.n_local = v.n_local < 0 ? N : v.n_local;
+  dev.n_centres = v.exchange ? dev.n_local : N;  // over several ranks, ghosts are only neighbours
   dev.struct_id = ws.i1("md:sid", N);  // zero-filled
   shift = re_shift;
   dev.charge = ws.i1("md:charge", 1), dev.spin_multiplicity = ws.i1("md:spin", 1);

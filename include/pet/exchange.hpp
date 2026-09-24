@@ -30,8 +30,10 @@ class Exchange {
   // pairs in turn, those whose neighbour is a ghost). Send each row of `out` to
   // the rank owning that ghost, where it belongs to the partner edge; fill `in`
   // with the partner edges' rows in the same order. Rows are `out.extent(1)`
-  // wide: one layer's edge outputs, or their adjoints.
-  virtual void edges(View2D out, View2D in) = 0;
+  // wide: one layer's edge outputs, or their adjoints. Only rows with
+  // live(r) >= 0 carry anything -- the rest are edges past the cutoff, on
+  // both ends -- so only they need to cross; the other rows of `in` are zero.
+  virtual void edges(View2D out, View2D in, IView1D live) = 0;
 };
 
 }  // namespace pet

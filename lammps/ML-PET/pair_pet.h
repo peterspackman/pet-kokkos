@@ -17,6 +17,10 @@ PairStyle(pet,PairPET);
 
 #include "pair.h"
 
+#include "pet/exchange.hpp"
+
+#include <Kokkos_Core.hpp>
+
 #include <functional>
 #include <memory>
 #include <vector>
@@ -41,8 +45,17 @@ class PairPET : public Pair {
   void init_style() override;
   double init_one(int, int) override;
 
+  // Mode exchange: pet::Exchange's moves over LAMMPS's comm, and its hooks.
+  void atoms_forward(pet::RView1D a);
+  void atoms_reverse(pet::RView1D a);
+  void edges(pet::View2D out, pet::View2D in, pet::IView1D live);
+  int pack_forward_comm(int, int *, double *, int, int *) override;
+  void unpack_forward_comm(int, int, double *) override;
+  int pack_reverse_comm(int, int, double *) override;
+  void unpack_reverse_comm(int, int *, double *) override;
+
  protected:
-  enum class Mode { Images, Ghosts };
+  enum class Mode { Images, Ghosts, Exchange };
   Mode mode = Mode::Images;
   std::unique_ptr<pet::Calculator> calc;
   double cutoff = 0.0;                   // the model's
@@ -68,11 +81,35 @@ class PairPET : public Pair {
 
   void set_images(const List &l, bool half);
   void set_ghosts(const List &l);
+  void set_exchange(const List &l);
   void cell_rows(double cell[9]) const;
 
  private:
   void allocate();
   void set(int n, bool half);
+
+  // Mode exchange. Atom values ride LAMMPS's forward and reverse comm (which
+  // relay through ghosts of ghosts); edge rows go straight to the rank owning
+  // the ghost, grouped by rank (MPI_Alltoallv), and are matched to that rank's
+  // edges once per rebuild: recv_map[q] is the edge the q-th row arriving is for.
+  std::vector<int> send_order, recv_map;           // remote edges by destination; arrival -> edge
+  std::vector<int> send_counts, send_displs, recv_counts, recv_displs;  // per rank, in rows
+  pet::IView1D d_send_order, d_recv_map;            // the same, on the device
+  pet::IView1D d_send_block, d_send_rank;          // each send position's block start and rank
+  pet::IView1D d_recv_displs;                      // where each rank's rows start, arriving
+  pet::IView1D d_live_at, d_live_counts, d_arrive; // per step: compacted index, per-rank counts, offsets
+  pet::View2D d_send, d_recv;                      // rows in send / arrival order
+  Kokkos::View<pet::Net **, Kokkos::LayoutRight, Kokkos::SharedHostPinnedSpace> h_send, h_recv;
+  std::vector<double> atom_buf;                    // one value per atom, for the comm hooks
+  struct Link : pet::Exchange {                    // what pet-kokkos calls
+    PairPET *p;
+    explicit Link(PairPET *pair) : p(pair) {}
+    void atoms_forward(pet::RView1D a) override { p->atoms_forward(a); }
+    void atoms_reverse(pet::RView1D a) override { p->atoms_reverse(a); }
+    void edges(pet::View2D out, pet::View2D in, pet::IView1D live) override { p->edges(out, in, live); }
+  } link{this};
+  void alltoall_rows(const char *out, int width, char *in);
+  void forward_atoms();
 };
 
 }    // namespace LAMMPS_NS
