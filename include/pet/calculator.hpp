@@ -58,7 +58,7 @@ struct Options {
 
   // Replay a repeated evaluation (same shapes and buffers, as in a stepping
   // loop) as one CUDA graph: bit-identical, much faster for small structures.
-  // CUDA only; PET_GRAPHS=0 turns it off.
+  // CUDA and HIP; PET_GRAPHS=0 turns it off.
   bool graphs = true;
 
   // A cap on atoms per batch ahead of the memory estimate; 0 = none.

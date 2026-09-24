@@ -1,4 +1,5 @@
-// Record-and-replay of an evaluation's device work as one CUDA graph launch.
+// Record-and-replay of an evaluation's device work as one graph launch (CUDA
+// graphs; HIP's are the same API).
 //
 // For a small structure the ~160 launches of an evaluation are nearly all of its
 // cost. run() does the work eagerly the first time it sees a key, captures it
@@ -7,23 +8,62 @@
 //
 // The key must name everything the recorded work depends on -- shapes, where
 // the inputs live, the workspace's allocation generation -- since a replay reuses
-// the recorded pointers and arguments. Only the latest graph is kept, which is
-// what a stepping loop needs. A failed capture turns graphs off and redoes the
-// work eagerly. Off CUDA, run() just does the work.
+// the recorded pointers and arguments. A few graphs are kept, the least recently
+// used dropped first, for a caller that alternates between shapes (an MD engine
+// asking for the energy alone on some steps). A failed capture turns graphs off
+// and redoes the work eagerly. Without a GPU, run() just does the work.
 #pragma once
 
 #include "pet/kokkos.hpp"
 
+#if defined(KOKKOS_ENABLE_HIP)
+#include <hip/hip_runtime.h>
+#endif
+
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 #include <vector>
 
 namespace pet {
 
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+#define PET_HAVE_GRAPHS 1
+namespace gpu {
+#if defined(KOKKOS_ENABLE_CUDA)
+using Graph = cudaGraph_t;
+using Exec = cudaGraphExec_t;
+inline cudaStream_t stream() { return ExecSpace().cuda_stream(); }
+// Relaxed: Kokkos makes allocator calls (e.g. a zero-byte team-scratch resize)
+// that the global mode would refuse, and none of them enqueue work.
+inline bool begin() { return cudaStreamBeginCapture(stream(), cudaStreamCaptureModeRelaxed) == cudaSuccess; }
+inline bool end(Graph* g) { return cudaStreamEndCapture(stream(), g) == cudaSuccess; }
+inline bool instantiate(Exec* e, Graph g) { return cudaGraphInstantiate(e, g, 0) == cudaSuccess; }
+inline void launch(Exec e) { cudaGraphLaunch(e, stream()); }
+inline void destroy(Graph g) { cudaGraphDestroy(g); }
+inline void destroy(Exec e) { cudaGraphExecDestroy(e); }
+inline void clear_error() { (void) cudaGetLastError(); }
+#else
+using Graph = hipGraph_t;
+using Exec = hipGraphExec_t;
+inline hipStream_t stream() { return ExecSpace().hip_stream(); }
+inline bool begin() { return hipStreamBeginCapture(stream(), hipStreamCaptureModeRelaxed) == hipSuccess; }
+inline bool end(Graph* g) { return hipStreamEndCapture(stream(), g) == hipSuccess; }
+inline bool instantiate(Exec* e, Graph g) { return hipGraphInstantiate(e, g, nullptr, nullptr, 0) == hipSuccess; }
+inline void launch(Exec e) { (void) hipGraphLaunch(e, stream()); }
+inline void destroy(Graph g) { (void) hipGraphDestroy(g); }
+inline void destroy(Exec e) { (void) hipGraphExecDestroy(e); }
+inline void clear_error() { (void) hipGetLastError(); }
+#endif
+}  // namespace gpu
+#endif
+
 template <class Out>
 class GraphCache {
  public:
   using Key = std::vector<std::uintptr_t>;
+  static constexpr std::size_t kKeep = 8;  // graphs held; keys remembered: twice that
+
   GraphCache() = default;
   GraphCache(const GraphCache&) = delete;
   GraphCache& operator=(const GraphCache&) = delete;
@@ -31,30 +71,40 @@ class GraphCache {
 
   template <class F>
   Out run(const Key& key, F&& work) {
-#if defined(KOKKOS_ENABLE_CUDA)
-    if (!broken_ && exec_ && key == key_) return launch(), out_;
-    if (broken_ || key != seen_) {  // first sight: run eagerly, capture next time
-      seen_ = key;
+#if defined(PET_HAVE_GRAPHS)
+    if (broken_) return work();
+    ++tick_;
+    for (auto& g : graphs_)
+      if (g.key == key) {
+        g.used = tick_;
+        gpu::launch(g.exec);
+        return g.out;
+      }
+    if (std::find(seen_.begin(), seen_.end(), key) == seen_.end()) {  // first sight: run eagerly
+      if (seen_.size() >= 2 * kKeep) seen_.erase(seen_.begin());
+      seen_.push_back(key);
       return work();
     }
-    reset();
-    const cudaStream_t s = ExecSpace().cuda_stream();
-    cudaGraph_t g = nullptr;
-    // Relaxed: Kokkos makes allocator calls (e.g. a zero-byte team-scratch
-    // resize) that the global mode would refuse, and none of them enqueue work.
-    if (cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed) == cudaSuccess) {
-      out_ = work();
-      if (cudaStreamEndCapture(s, &g) == cudaSuccess && g &&
-          cudaGraphInstantiate(&exec_, g, 0) == cudaSuccess) {
-        cudaGraphDestroy(g);
-        key_ = key;
-        launch();
-        return out_;
+    gpu::Graph graph = nullptr;
+    gpu::Exec exec = nullptr;
+    if (gpu::begin()) {
+      Out out = work();
+      if (gpu::end(&graph) && graph && gpu::instantiate(&exec, graph)) {
+        gpu::destroy(graph);
+        if (graphs_.size() >= kKeep) {  // drop the least recently used
+          auto lru = std::min_element(graphs_.begin(), graphs_.end(),
+                                      [](const Entry& a, const Entry& b) { return a.used < b.used; });
+          gpu::destroy(lru->exec);
+          graphs_.erase(lru);
+        }
+        graphs_.push_back({key, exec, out, tick_});
+        gpu::launch(exec);
+        return out;
       }
-      if (g) cudaGraphDestroy(g);
+      if (graph) gpu::destroy(graph);
     }
-    (void) cudaGetLastError();  // clear the failed capture's sticky error
-    broken_ = true, exec_ = nullptr;
+    gpu::clear_error();  // the failed capture's sticky error
+    broken_ = true;
     return work();
 #else
     (void) key;
@@ -63,18 +113,23 @@ class GraphCache {
   }
 
  private:
-#if defined(KOKKOS_ENABLE_CUDA)
-  void launch() { cudaGraphLaunch(exec_, ExecSpace().cuda_stream()); }
+#if defined(PET_HAVE_GRAPHS)
+  struct Entry {
+    Key key;
+    gpu::Exec exec;
+    Out out;
+    std::uint64_t used;
+  };
   void reset() {
-    if (exec_) cudaGraphExecDestroy(exec_);
-    exec_ = nullptr, key_.clear();
+    for (auto& g : graphs_) gpu::destroy(g.exec);
+    graphs_.clear();
   }
-  cudaGraphExec_t exec_ = nullptr;
+  std::vector<Entry> graphs_;
+  std::vector<Key> seen_;
+  std::uint64_t tick_ = 0;
 #else
   void reset() {}
 #endif
-  Key key_, seen_;
-  Out out_{};
   bool broken_ = false;
 };
 
