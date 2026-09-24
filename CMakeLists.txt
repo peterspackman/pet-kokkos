@@ -125,7 +125,7 @@ if(NOT TARGET Kokkos::kokkos)
     CPMAddPackage(
         NAME Kokkos
         GITHUB_REPOSITORY kokkos/kokkos
-        GIT_TAG 5.0.2
+        GIT_TAG 5.2.2
     )
 else()
     message(STATUS "pet-kokkos: using the consumer's existing Kokkos::kokkos")

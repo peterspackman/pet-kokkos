@@ -21,9 +21,10 @@
 namespace pet {
 
 // Images to search along each lattice vector (cell rows) for `cutoff`: the
-// device twin of detail::image_ranges.
+// device twin of detail::image_ranges; `periodic` is a bitmask of the periodic
+// axes.
 KOKKOS_INLINE_FUNCTION
-void image_ranges_rows(const double cell[9], double cutoff, int n[3]) {
+void image_ranges_rows(const double cell[9], double cutoff, int periodic, int n[3]) {
   n[0] = n[1] = n[2] = 0;
   const double a[3] = {cell[0], cell[1], cell[2]};
   const double b[3] = {cell[3], cell[4], cell[5]};
@@ -36,22 +37,24 @@ void image_ranges_rows(const double cell[9], double cutoff, int n[3]) {
   const double nbc = Kokkos::sqrt(bc[0]*bc[0]+bc[1]*bc[1]+bc[2]*bc[2]);
   const double nca = Kokkos::sqrt(ca[0]*ca[0]+ca[1]*ca[1]+ca[2]*ca[2]);
   const double nab = Kokkos::sqrt(ab[0]*ab[0]+ab[1]*ab[1]+ab[2]*ab[2]);
-  n[0] = (int) Kokkos::ceil(cutoff / (vol / nbc));
-  n[1] = (int) Kokkos::ceil(cutoff / (vol / nca));
-  n[2] = (int) Kokkos::ceil(cutoff / (vol / nab));
+  if (periodic & 1) n[0] = (int) Kokkos::ceil(cutoff / (vol / nbc));
+  if (periodic & 2) n[1] = (int) Kokkos::ceil(cutoff / (vol / nca));
+  if (periodic & 4) n[2] = (int) Kokkos::ceil(cutoff / (vol / nab));
 }
 
-// One batch of B structures, N atoms in all, staged on the device. sid, spec,
-// soff and scnt are fixed through a relaxation; pos and scell move.
+// One batch of B structures, Ntot atoms in all, staged on the device. Only pos
+// and scell may change between evaluations (a relaxation, MD). Lowering B and
+// Ntot evaluates the leading structures only.
 struct DeviceGeom {
-  RView2D pos;    // [Ntot,3] cartesian, Angstrom, UNWRAPPED (see build_nef_device)
-  IView1D sid;    // [Ntot]   owning structure
-  IView1D spec;   // [Ntot]   species index
-  IView1D soff;   // [B]      atom offset per structure
-  IView1D scnt;   // [B]      atom count per structure
-  IView2D srng;   // [B,3]    periodic image ranges at the model cutoff
-  IView1D sper;   // [B]      1 if periodic, 0 for an isolated molecule
-  RView2D scell;  // [B,9]    cell rows = lattice vectors, Angstrom
+  RView2D pos;     // [Ntot,3] cartesian, Angstrom, unwrapped (see build_nef_device)
+  IView1D sid;     // [Ntot]   owning structure
+  IView1D spec;    // [Ntot]   species index (Calculator::stage maps atomic numbers)
+  IView1D soff;    // [B]      atom offset per structure
+  IView1D scnt;    // [B]      atom count per structure
+  IView1D sper;    // [B]      periodic axes, bit d for lattice vector d; 0 = a molecule
+  RView2D scell;   // [B,9]    cell rows = lattice vectors, Angstrom
+  IView1D charge;  // [B]      total charge (conditioned models)
+  IView1D spin;    // [B]      spin multiplicity 2S+1 (conditioned models)
   int Ntot = 0, B = 0;
 };
 
@@ -64,11 +67,17 @@ inline DeviceGeom stage_geometry_views(Workspace& ws, int Ntot, int B) {
   g.spec = ws.i1("pet_spec", Ntot);
   g.soff = ws.i1("pet_soff", B);
   g.scnt = ws.i1("pet_scnt", B);
-  g.srng = ws.i2("pet_srng", B, 3);
   g.sper = ws.i1("pet_sper", B);
   g.scell = ws.r2("pet_scell", B, 9);
+  g.charge = ws.i1("pet_charge", B);
+  g.spin = ws.i1("pet_spin", B);
   return g;
 }
+
+// Stage host structures into views from `ws`: species through
+// species_to_index (throws on an unsupported element), everything else as given.
+DeviceGeom stage_systems(Workspace& ws, const std::vector<System>& systems,
+                         const std::vector<int>& species_to_index);
 
 // A Verlet cache for the search: the pairs within cutoff + skin, found only when
 // an atom moves, or the cell strains, far enough to bring a new pair inside the

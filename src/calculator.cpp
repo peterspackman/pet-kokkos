@@ -191,8 +191,9 @@ bool Calculator::supports(int atomic_number) const {
   return atomic_number >= 0 && atomic_number < (int) m.size() && m[atomic_number] >= 0;
 }
 
-DeviceGeom Calculator::stage(int n_atoms_total, int n_struct) const {
-  return stage_geometry_views(impl_->nbr_ws, n_atoms_total, n_struct);
+DeviceGeom Calculator::stage(const std::vector<System>& systems) const {
+  impl_->cache = NefCache{};
+  return stage_systems(impl_->nbr_ws, systems, impl_->ckpt.species_to_index);
 }
 
 Results Calculator::compute(const System& system, bool compute_forces) const {

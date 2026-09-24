@@ -114,11 +114,14 @@ class Calculator {
   // gets the answer it would alone (to the bit on the host path). One structure
   // goes to the overload above.
   Results compute(const std::vector<System>& systems, bool compute_forces = true) const;
-  // From geometry already on the device (see stage), results left there.
+  // Structures staged on the device, from this Calculator's pool, for a caller
+  // that steps them there (a relaxation, MD): move geom.pos and geom.scell in
+  // place, then compute_device. Staging resets the neighbour cache.
+  DeviceGeom stage(const std::vector<System>& systems) const;
+  // From staged geometry, results left on the device. With a smaller geom.B and
+  // geom.Ntot, the leading structures only (a batch whose finished structures
+  // were moved to the back).
   BatchResult compute_device(const DeviceGeom& geom, bool compute_forces = true) const;
-  // Device staging for n_atoms_total atoms in n_struct structures, from this
-  // Calculator's pool: fill it, then compute_device.
-  DeviceGeom stage(int n_atoms_total, int n_struct) const;
 
   const Hypers& hypers() const;
   double cutoff() const;
