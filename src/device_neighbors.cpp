@@ -226,6 +226,8 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
   } else if (adaptive) {
     dev.adapt_eff = grid_cutoffs(ws, h, N, roff, re_dist, probes, P, acut);
   }
+  // A ghost has no list here: its cutoff comes from the rank that owns it.
+  if (adaptive && dev.exchange) dev.exchange->atoms_forward(acut);
 
   // Which edges are kept -- those within the mean of their two atoms' cutoffs --
   // their smooth factors, and each atom's count.

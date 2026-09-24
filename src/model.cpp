@@ -298,6 +298,19 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse)
 
 // ---- shared by both featurizers -----------------------------------------------------
 
+// Each edge to a ghost: its packed row, and back.
+static void remote_map(const DeviceEdgeData& d, PackedEdges& p) {
+  if (p.n_remote == 0) return;
+  auto raw = d.remote_raw, slot = d.raw_slot, slot_edge = p.slot_edge, of = p.remote_of, packed = p.remote_packed;
+  Kokkos::deep_copy(ExecSpace(), of, -1);
+  Kokkos::parallel_for(
+      "pk_remote", Kokkos::RangePolicy<ExecSpace>(0, p.n_remote), KOKKOS_LAMBDA(int r) {
+        const int s = slot(raw(r)), k = s >= 0 ? slot_edge(s) : -1;
+        packed(r) = k;
+        if (k >= 0) of(k) = r;
+      });
+}
+
 PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
   const int N = d.n_atoms, M = d.max_neighbors;
   PackedEdges p;
@@ -324,6 +337,10 @@ PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
   auto ev = d.edge_vec;
   auto dd = d.dist, dpc = d.pair_cutoff;
   auto dcut = d.cutoff_factor;
+  if (d.exchange && d.remote_raw.extent(0) > 0) {  // mapped once packed (remote_map)
+    p.n_remote = d.remote_raw.extent(0);
+    p.remote_of = ws_.i1("pk:remote_of", p.E), p.remote_packed = ws_.i1("pk:remote_packed", p.n_remote);
+  }
   if (d.padded) {  // every slot a row: slot k is edge k
     Kokkos::parallel_for(
         "pk_padded", RangePolicy(0, N * M), KOKKOS_LAMBDA(int k) {
@@ -334,6 +351,7 @@ PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
           for (int c = 0; c < 3; ++c) vec(k, c) = ev(k, c);
           dist(k) = dd(k), pcut(k) = dpc(k), cut(k) = dcut(k);
         });
+    remote_map(d, p);
     return p;
   }
   Kokkos::parallel_scan(
@@ -356,6 +374,7 @@ PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
       "pk_reverse", RangePolicy(0, N * M), KOKKOS_LAMBDA(int k) {
         if (pos(k) >= 0) reverse(pos(k)) = rev(k) >= 0 ? pos(rev(k)) : -1;
       });
+  remote_map(d, p);
   return p;
 }
 
@@ -565,7 +584,8 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   auto pass = [&] {
     return h_.featurizer_type == FeaturizerType::Residual ? residual_pass(d, grad) : ff_pass(d, grad);
   };
-  const DeviceOut out = graphs_ && !ozaki_active() ? graph_.run(graph_key(d, grad), pass) : pass();
+  // A graph cannot hold the exchange's calls to the engine.
+  const DeviceOut out = graphs_ && !ozaki_active() && !d.exchange ? graph_.run(graph_key(d, grad), pass) : pass();
 
   EnergyResult res;
   if (dev_per_atom) *dev_per_atom = out.per_atom;

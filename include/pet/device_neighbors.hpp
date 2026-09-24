@@ -58,7 +58,7 @@ DeviceEdgeData build_device_edge_data(Workspace& ws, EdgeMap& edge_map, int& m_h
 void edge_topology(Workspace& ws, EdgeMap& edge_map, DeviceEdgeData& dev, int N, IView1D species, IView1D re_i,
                    IView1D re_j, IView2D re_shift, RView2D re_vec, RView1D re_dist, int E);
 void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D probes, int P, int& m_high,
-                   int m_fixed, IView1D overflow);
+                   int m_fixed, IView1D overflow);  // dev.exchange: ghosts' cutoffs from their owners
 
 // The same for one structure, from a host neighbour search: for tests.
 DeviceEdgeData build_device_edge_data(const System& sys, const Hypers& h,

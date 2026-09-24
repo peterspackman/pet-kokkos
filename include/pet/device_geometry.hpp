@@ -15,6 +15,7 @@
 
 #include "pet/config.hpp"
 #include "pet/device_neighbors.hpp"
+#include "pet/exchange.hpp"
 #include "pet/kokkos.hpp"
 #include "pet/neighbors.hpp"
 
@@ -94,6 +95,9 @@ struct EdgeListView {
   const double* cell = nullptr;        // [9] lattice vectors as rows, with shifts
   bool half = false;
   int charge = 0, spin_multiplicity = 1;
+  // Over several ranks: only the owned atoms have pairs, ghosts are one cutoff
+  // deep, and the engine carries what crosses (exchange.hpp). A full list.
+  Exchange* exchange = nullptr;
 };
 
 // An engine's list on the device between its rebuilds: the topology once (set),

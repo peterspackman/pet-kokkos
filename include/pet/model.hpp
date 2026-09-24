@@ -9,6 +9,7 @@
 
 #include "pet/checkpoint.hpp"
 #include "pet/config.hpp"
+#include "pet/exchange.hpp"
 #include "pet/graph.hpp"
 #include "pet/kokkos.hpp"
 #include "pet/neighbors.hpp"
@@ -71,6 +72,10 @@ struct DeviceEdgeData {
   // Raw edges with no partner -- into a ghost the engine listed no neighbours
   // for -- by target atom: orphan_edge[orphan_off(a), orphan_off(a+1)) point at a.
   IView1D orphan_off, orphan_edge;  // [N+1], [n_orphans]
+  // Over several ranks (exchange.hpp): the engine's side of the swap, and each
+  // edge to a ghost, in the engine's order, as a raw index.
+  Exchange* exchange = nullptr;
+  IView1D remote_raw;  // [n_remote]
   RView2D raw_vec;                // [E, 3]
   IView1D raw_off;                // [N+1]
   IView1D raw_reverse;            // [E]
@@ -134,6 +139,9 @@ struct PackedEdges {
   View1D cut;          // [E] smooth cutoff factor
   IView1D slot_edge;   // [N*M] each slot's packed edge, -1 for padding
   int n_local = 0;     // see DeviceEdgeData::n_local
+  int n_remote = 0;       // edges to ghosts (DeviceEdgeData::remote_raw)
+  IView1D remote_of;      // [E] each edge's remote index, -1 if its partner is here
+  IView1D remote_packed;  // [n_remote] each remote edge's packed index, -1 if dropped
 };
 
 // One evaluation's outputs, on the device: per-atom energy [N] and, with forces,
@@ -221,8 +229,11 @@ class PetModel {
   // private member function.
   DeviceOut ff_pass(const DeviceEdgeData& dev, bool grad);        // feedforward.cpp
   DeviceOut residual_pass(const DeviceEdgeData& dev, bool grad);  // residual.cpp
+  // remote_in: the partners' rows for edges to ghosts, fetched when `share`,
+  // else (a recompute) already there.
   void ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D& node,
-                View2D input_edge, View2D cond, LayerSaves* sav, bool save_wide);
+                View2D input_edge, View2D cond, LayerSaves* sav, bool save_wide, View2D remote_in = {},
+                bool share = false);
   void ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, int L, const LayerSaves& sav,
                     bool kept_wide, View2D node_adj, View2D input_edge_adj, View2D x4_adj,
                     View2D cf_seq_adj);

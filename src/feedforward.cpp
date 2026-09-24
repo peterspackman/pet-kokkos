@@ -14,7 +14,8 @@
 namespace pet {
 
 void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D& node,
-                        View2D input_edge, View2D cond, LayerSaves* sav, bool save_wide) {
+                        View2D input_edge, View2D cond, LayerSaves* sav, bool save_wide, View2D remote_in,
+                        bool share) {
   const int N = dev.n_atoms, S = dev.max_neighbors + 1, E = pk.E;
   const int D = h_.d_pet, Dn = h_.d_node, A = h_.num_attention_layers;
   const bool save = sav != nullptr;
@@ -114,14 +115,26 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
   node = node_cur;
 
   // input_edge += out_edge + comb_mlp(layernorm(concat)), concat = [out_edge |
-  // out_edge of the reverse edge]; the MLP's last linear accumulates onto it.
+  // out_edge of the reverse edge]; the MLP's last linear accumulates onto it. An
+  // edge to a ghost reads its reverse from the rank owning the ghost.
   const View2D out_edge = edge_cur;
+  const bool remote = pk.n_remote > 0;
+  auto ro = pk.remote_of, rp = pk.remote_packed;
+  if (remote && share) {
+    View2D out = ws_.tmp(pk.n_remote, D);
+    Kokkos::parallel_for(
+        "remote_rows", RangePolicy(0, pk.n_remote * D), KOKKOS_LAMBDA(int i) {
+          const int r = i / D, d = i % D;
+          out(r, d) = rp(r) >= 0 ? out_edge(rp(r), d) : Net(0);
+        });
+    dev.exchange->edges(out, remote_in);
+  }
   View2D concat = save ? keep(sav->concat, "cc", -1, E, 2 * D) : ws_.tmp(E, 2 * D);
   Kokkos::parallel_for(
       "cat_rev", RangePolicy(0, E * D), KOKKOS_LAMBDA(int i) {
         const int k = i / D, d = i % D, r = rev(k);
         concat(k, d) = out_edge(k, d);
-        concat(k, D + d) = (r >= 0) ? out_edge(r, d) : Net(0);
+        concat(k, D + d) = r >= 0 ? out_edge(r, d) : remote && ro(k) >= 0 ? remote_in(ro(k), d) : Net(0);
         input_edge(k, d) += out_edge(k, d);
       });
   View2D comb_norm = ws_.tmp(E, 2 * D), cph = ws_.tmp(E, 2 * D);
@@ -160,10 +173,25 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
     silu_bwd(cph_adj, sav.cph);
     linear_bwd(cnorm_adj, cph_adj, mat("combination_mlps." + ls + ".0.weight"), 0);
     pet::norm_bwd(concat_adj, cnorm_adj, sav.concat, vec("combination_norms." + ls + ".weight"), true, false);
+    // An edge to a ghost: its partner's rank has the adjoint of this edge's row,
+    // and wants the adjoint of the row this edge read.
+    const bool remote = pk.n_remote > 0;
+    auto ro = pk.remote_of, rp = pk.remote_packed;
+    View2D remote_adj = ws_.tmp(remote ? pk.n_remote : 0, D);
+    if (remote) {
+      View2D out = ws_.tmp(pk.n_remote, D);
+      Kokkos::parallel_for(
+          "remote_adj", RangePolicy(0, pk.n_remote * D), KOKKOS_LAMBDA(int i) {
+            const int r = i / D, d = i % D;
+            out(r, d) = rp(r) >= 0 ? concat_adj(rp(r), D + d) : Net(0);
+          });
+      dev.exchange->edges(out, remote_adj);
+    }
     Kokkos::parallel_for(
         "bw_concat", RangePolicy(0, E * D), KOKKOS_LAMBDA(int i) {
           const int k = i / D, d = i % D, r = rev(k);
-          edge_adj(k, d) = input_edge_adj(k, d) + concat_adj(k, d) + (r >= 0 ? concat_adj(r, D + d) : Net(0));
+          const Net back = r >= 0 ? concat_adj(r, D + d) : remote && ro(k) >= 0 ? remote_adj(ro(k), d) : Net(0);
+          edge_adj(k, d) = input_edge_adj(k, d) + concat_adj(k, d) + back;
         });
   }
 
@@ -242,6 +270,10 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   const bool keep_wide = rc == Recompute::Never, ckpt = grad && rc == Recompute::Layers;
   std::vector<LayerSaves> sav(grad && !ckpt ? G : 0);
   std::vector<std::pair<View2D, View2D>> inputs(ckpt ? G : 0);
+  // Over several ranks, each layer's rows from the partners' ranks, kept so a
+  // recompute need not ask again.
+  std::vector<View2D> remote_in(pk.n_remote > 0 ? G : 0);
+  for (int L = 0; L < (int) remote_in.size(); ++L) remote_in[L] = ws_.n2("remote_in_" + std::to_string(L), pk.n_remote, D);
   for (int L = 0; L < G; ++L) {
     if (ckpt) {
       inputs[L] = {ws_.n2("ck_node_" + std::to_string(L), N, Dn), ws_.n2("ck_ie_" + std::to_string(L), E, D)};
@@ -249,7 +281,8 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
       copy(inputs[L].second, input_edge);
     }
     if (!sav.empty()) sav[L].tag = std::to_string(L);
-    ff_layer(dev, pk, L, node, input_edge, cond, sav.empty() ? nullptr : &sav[L], grad && keep_wide);
+    ff_layer(dev, pk, L, node, input_edge, cond, sav.empty() ? nullptr : &sav[L], grad && keep_wide,
+             remote_in.empty() ? View2D() : remote_in[L], true);
   }
 
   View1D net = ws_.n1("per_atom_net", N);
@@ -273,7 +306,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
       copy(n, inputs[L].first);
       copy(ie, inputs[L].second);
       one.tag = "c";  // one shared set of saves
-      ff_layer(dev, pk, L, n, ie, cond, &one, false);
+      ff_layer(dev, pk, L, n, ie, cond, &one, false, remote_in.empty() ? View2D() : remote_in[L], false);
     }
     ff_layer_bwd(dev, pk, L, ckpt ? one : sav[L], keep_wide, node_adj, input_edge_adj, x4_adj, cf_seq_adj);
   }

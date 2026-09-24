@@ -8,9 +8,13 @@
 // for the next layer.
 #include "ops.hpp"
 
+#include <stdexcept>
+
 namespace pet {
 
 DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
+  if (dev.exchange)
+    throw std::runtime_error("pet: the residual featurizer does not run over several ranks (exchange) yet");
   const int N = dev.n_atoms, S = dev.max_neighbors + 1;
   const int D = h_.d_pet, G = h_.num_gnn_layers, A = h_.num_attention_layers, R = h_.num_readout_layers;
   Workspace::Scope scope(ws_);

@@ -368,3 +368,94 @@ TEST_CASE("a device-resident engine gets what the host one does", "[model][edges
     }
   }
 }
+
+namespace {
+
+// Other ranks, played in-process: every ghost is a periodic image of an owned
+// atom, so its owner is that atom, and the partner of an edge i -> g is the edge
+// owner(g) -> (an image of i) with the opposite vector.
+class ImageExchange : public pet::Exchange {
+ public:
+  ImageExchange(const Domain& d, int D) : owner_(d.owner), n_local_(d.n_local) {
+    struct Edge { int i, j; double v[3]; };
+    std::vector<Edge> remote;
+    for (int i = 0; i < d.n_local; ++i)
+      for (int e = d.off[i]; e < d.off[i + 1]; ++e)
+        if (d.nbr[e] >= d.n_local) {
+          Edge x{i, d.nbr[e], {}};
+          for (int c = 0; c < 3; ++c) x.v[c] = d.pos[3 * x.j + c] - d.pos[3 * i + c];
+          remote.push_back(x);
+        }
+    partner_.assign(remote.size(), -1);
+    for (std::size_t r = 0; r < remote.size(); ++r)
+      for (std::size_t q = 0; q < remote.size(); ++q) {
+        const Edge &a = remote[r], &b = remote[q];
+        if (b.i != owner_[a.j] || owner_[b.j] != a.i) continue;
+        if (std::fabs(a.v[0] + b.v[0]) + std::fabs(a.v[1] + b.v[1]) + std::fabs(a.v[2] + b.v[2]) < 1e-9) partner_[r] = q;
+      }
+    (void) D;
+  }
+  void atoms_forward(pet::RView1D a) override {
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), a);
+    for (std::size_t g = n_local_; g < owner_.size(); ++g) h(g) = h(owner_[g]);
+    Kokkos::deep_copy(a, h);
+  }
+  void atoms_reverse(pet::RView1D a) override {
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), a);
+    for (std::size_t g = n_local_; g < owner_.size(); ++g) h(owner_[g]) += h(g), h(g) = 0;
+    Kokkos::deep_copy(a, h);
+  }
+  void edges(pet::View2D out, pet::View2D in) override {
+    auto o = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
+    auto i = Kokkos::create_mirror_view(in);
+    for (std::size_t r = 0; r < partner_.size(); ++r)
+      for (std::size_t c = 0; c < o.extent(1); ++c) i(r, c) = partner_[r] >= 0 && !mute ? o(partner_[r], c) : 0;
+    Kokkos::deep_copy(in, i);
+  }
+  bool paired() const { return std::find(partner_.begin(), partner_.end(), -1) == partner_.end(); }
+  bool mute = false;  // drop the edge rows: what a ghost shell without the exchange would see
+
+ private:
+  std::vector<int> owner_, partner_;
+  std::size_t n_local_;
+};
+
+}  // namespace
+
+TEST_CASE("ranks that exchange messages reproduce the periodic evaluation", "[model][edges]") {
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    Golden store;
+    const Golden* g = found ? first_periodic(model, store) : nullptr;
+    if (!g) continue;
+    pet::Calculator calc(found->first, found->second);
+    if (calc.hypers().featurizer_type != pet::FeaturizerType::FeedForward) continue;
+    DYNAMIC_SECTION(model) {
+      const pet::System& s = g->system;
+      const double rc = calc.cutoff();
+      // Ghosts one cutoff (and a skin) deep, and neighbour lists for owned atoms only.
+      const Domain d = make_domain(s, rc + 0.5, 0.0, rc + 0.5);
+      ImageExchange x(d, calc.hypers().d_pet);
+      REQUIRE(x.paired());
+      pet::EdgeListView v = view(d);
+      v.exchange = &x;
+      calc.set_neighbors(v);
+      const pet::Results r = calc.compute_step(d.pos.data(), nullptr, true, true), ref = calc.compute(s, true);
+
+      INFO(d.z.size() - d.n_local << " ghosts; E " << r.energy[0] << " vs " << ref.energy[0]);
+      CHECK(std::fabs(r.energy[0] - ref.energy[0]) <= 1e-5 * std::fabs(ref.energy[0]));
+      std::vector<double> f(std::size_t(s.n_atoms) * 3, 0.0);
+      for (std::size_t a = 0; a < d.owner.size(); ++a)
+        for (int c = 0; c < 3; ++c) f[3 * d.owner[a] + c] += r.forces[3 * a + c];
+      INFO("forces rel " << rel(f, ref.forces) << ", virial rel " << rel(r.virial, ref.virial));
+      CHECK(rel(f, ref.forces) <= 1e-4);
+      CHECK(rel(r.virial, ref.virial) <= 1e-4);
+
+      // And the exchange is what makes it so.
+      x.mute = true;
+      const pet::Results m = calc.compute_step(d.pos.data(), nullptr, true, false);
+      INFO("without the edge rows, E " << m.energy[0]);
+      CHECK(std::fabs(m.energy[0] - ref.energy[0]) > 1e-3 * std::fabs(ref.energy[0]));
+    }
+  }
+}

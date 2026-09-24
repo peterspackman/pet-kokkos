@@ -274,6 +274,22 @@ void adaptive_part(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h, RV
         }
         adapted_adj(a) = s;
       });
+  // Over several ranks: an edge to a ghost owes the ghost half its pair-cutoff
+  // adjoint too (the partner edge owes this rank's atom the other half, there);
+  // gathered per ghost over the partnerless edges into it, then sent home.
+  if (dev.exchange) {
+    if (dev.orphan_edge.extent(0) > 0) {
+      auto ooff = dev.orphan_off, oedge = dev.orphan_edge, slot = dev.raw_slot, slot_edge = pk.slot_edge;
+      Kokkos::parallel_for(
+          "remote_adapted", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
+            for (int k = ooff(a); k < ooff(a + 1); ++k) {
+              const int s = slot(oedge(k)), p = s >= 0 ? slot_edge(s) : -1;
+              if (p >= 0) adapted_adj(a) += 0.5 * pc_adj(p);
+            }
+          });
+    }
+    dev.exchange->atoms_reverse(adapted_adj);
+  }
   adaptive_backward(ws, dev, h, probes, n_probes, adapted_adj, scale, forces, vir9, edge_grad);
 }
 

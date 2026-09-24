@@ -348,6 +348,16 @@ void EdgeSession::set(const EdgeListView& v, const std::vector<int>& species_to_
   shift = re_shift;
   dev.charge = ws.i1("md:charge", 1), dev.spin_multiplicity = ws.i1("md:spin", 1);
   Kokkos::deep_copy(dev.charge, v.charge), Kokkos::deep_copy(dev.spin_multiplicity, v.spin_multiplicity);
+  // Over several ranks, the edges to ghosts, in the engine's order.
+  if (v.exchange) {
+    if (v.half) throw std::runtime_error("pet: an exchanged list must be full");
+    std::vector<int> remote;
+    for (int e = 0; e < E; ++e)
+      if (rj[e] >= dev.n_local) remote.push_back(e);
+    dev.exchange = v.exchange;
+    dev.remote_raw = ws.i1("md:remote", remote.size());
+    if (!remote.empty()) Kokkos::deep_copy(dev.remote_raw, HostI(remote.data(), remote.size()));
+  }
   n_pairs = L, M = 0, shifted = v.shifts != nullptr, valid = true;
 }
 
