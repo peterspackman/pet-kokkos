@@ -314,15 +314,17 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
   auto& I = *impl_;
   const DeviceEdgeData& dev = I.md.step(a.positions, true, cell, I.ckpt.hypers, I.model.probes(),
                                         I.model.n_probes(), I.opts.md_fixed_shapes);
-  const BatchResult br = I.model.energy_forces_batch(dev, true);
+  const BatchResult br = I.model.energy_forces_batch(dev, a.forces != nullptr);
   const int N = dev.n_atoms;
   using Out = Kokkos::View<double**, Kokkos::LayoutRight, MemSpace, Kokkos::MemoryUnmanaged>;
-  auto forces = br.forces;
-  const Out f(a.forces, N, 3);
-  Kokkos::parallel_for(
-      "md_add_forces", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
-        for (int c = 0; c < 3; ++c) f(i, c) += forces(i, c);
-      });
+  if (a.forces) {
+    auto forces = br.forces;
+    const Out f(a.forces, N, 3);
+    Kokkos::parallel_for(
+        "md_add_forces", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
+          for (int c = 0; c < 3; ++c) f(i, c) += forces(i, c);
+        });
+  }
   if (a.per_atom_energy) {
     auto e = br.per_atom;
     const Kokkos::View<double*, MemSpace, Kokkos::MemoryUnmanaged> out(a.per_atom_energy, N);
@@ -359,8 +361,9 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
   }
   Totals t;
   auto e = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), br.energy);
-  auto w = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), br.virial);
   t.energy = e(0);
+  if (!a.forces) return t;
+  auto w = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), br.virial);
   for (int k = 0; k < 6; ++k) t.virial[k] = w(0, k);
   return t;
 }

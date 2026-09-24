@@ -160,7 +160,8 @@ class Calculator {
   // the totals cross to the host. Optional per-atom outputs, added into too:
   // energy [n], and the virial [n, 6] (xx yy zz xy xz yz) -- each pair's
   // symmetrised v (x) dE/dv, half to each end, times virial_scale (LAMMPS's sign
-  // is -1). They sum to the returned virial (times virial_scale).
+  // is -1). They sum to the returned virial (times virial_scale). No forces
+  // pointer: the energy only, without the backward pass.
   struct DeviceArrays {
     const double* positions = nullptr;
     double* forces = nullptr;

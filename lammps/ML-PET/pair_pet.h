@@ -58,6 +58,14 @@ class PairPET : public Pair {
     const int *ilist = nullptr, *numneigh = nullptr;
     std::function<int(int, int)> neighbor;
   };
+  // Energy only, no forces: LAMMPS versions that pass ENERGY_ONLY (Monte Carlo,
+  // numdiff, FEP) set Pair::eflag_only after ev_init; others lack the member.
+  template <class T = Pair> auto energy_only(int) -> decltype(bool(static_cast<T *>(this)->eflag_only))
+  {
+    return static_cast<T *>(this)->eflag_only;
+  }
+  bool energy_only(long) { return false; }
+
   void set_images(const List &l, bool half);
   void set_ghosts(const List &l);
   void cell_rows(double cell[9]) const;

@@ -94,9 +94,9 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::compute(int eflag_in
     Kokkos::deep_copy(Kokkos::subview(x_rows, std::make_pair(size_t(0), size_t(x.extent(0))), Kokkos::ALL), x);
     a.positions = x_rows.data();
   }
-  a.forces = f.data();
+  a.forces = energy_only(0) ? nullptr : f.data();  // no forces: no backward pass
   a.per_atom_energy = eflag_atom ? k_eatom.template view<DeviceType>().data() : nullptr;
-  a.per_atom_virial = vflag_atom ? k_vatom.template view<DeviceType>().data() : nullptr;
+  a.per_atom_virial = vflag_atom && a.forces ? k_vatom.template view<DeviceType>().data() : nullptr;
   a.virial_scale = -1.0;  // LAMMPS's virial is minus pet-kokkos's (see pair_pet.cpp)
   double cell[9];
   cell_rows(cell);
@@ -108,7 +108,7 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::compute(int eflag_in
   }
 
   if (eflag_global) eng_vdwl += t.energy;
-  if (vflag_global)
+  if (vflag_global && a.forces)
     for (int k = 0; k < 6; ++k) virial[k] -= t.virial[k];
   if (eflag_atom) {
     k_eatom.template modify<DeviceType>();
@@ -118,7 +118,7 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::compute(int eflag_in
     k_vatom.template modify<DeviceType>();
     k_vatom.template sync<LMPHostType>();
   }
-  atomKK->modified(execution_space, F_MASK);
+  if (a.forces) atomKK->modified(execution_space, F_MASK);
 }
 
 namespace LAMMPS_NS {

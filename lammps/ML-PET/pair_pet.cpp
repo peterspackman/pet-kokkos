@@ -108,18 +108,20 @@ void PairPET::compute(int eflag, int vflag)
   double **x = atom->x, **f = atom->f;
   double cell[9];
   cell_rows(cell);
+  const bool forces = !energy_only(0);
   pet::Results r;
   try {
-    r = calc->compute_step(n ? &x[0][0] : nullptr, cell, true, vflag_atom);
+    r = calc->compute_step(n ? &x[0][0] : nullptr, cell, forces, forces && vflag_atom);
   } catch (std::exception &e) {
     error->one(FLERR, "pair_style pet: {}", e.what());
   }
 
-  for (int i = 0; i < n; ++i)
-    for (int c = 0; c < 3; ++c) f[i][c] += r.forces[3 * i + c];
   if (eflag_global) eng_vdwl += r.energy[0];
   if (eflag_atom)
     for (int i = 0; i < nlocal; ++i) eatom[i] += r.per_atom_energy[i];
+  if (!forces) return;
+  for (int i = 0; i < n; ++i)
+    for (int c = 0; c < 3; ++c) f[i][c] += r.forces[3 * i + c];
   // LAMMPS's virial is sum (x_i - x_j) (x) F_i, minus pet-kokkos's sum v (x) dE/dv.
   // Not f . r: PET is not exactly rotation invariant, so sum x (x) F has an
   // antisymmetric part, and f . r keeps one off-diagonal of it.

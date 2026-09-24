@@ -339,6 +339,10 @@ TEST_CASE("a device-resident engine gets what the host one does", "[model][edges
 
       CHECK(t.energy == r.energy[0]);
       for (int k = 0; k < 6; ++k) CHECK(t.virial[k] == r.virial[k]);
+      // No forces pointer: the energy alone, without the backward pass.
+      pet::Calculator::DeviceArrays eo;
+      eo.positions = x.data();
+      CHECK(device.compute_step(eo, s.cell.data()).energy == r.energy[0]);
       std::vector<double> fd(hf.data(), hf.data() + 3 * n), ed(he.data(), he.data() + n);
       CHECK(fd == r.forces);
       CHECK(ed == r.per_atom_energy);
