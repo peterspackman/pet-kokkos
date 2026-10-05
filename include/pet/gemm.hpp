@@ -27,17 +27,17 @@ namespace pet {
 // off unless asked for:
 //   Native           fp32 (fp64 in an fp64 build), the reference
 //   TF32             fp32 in and out, the products on TF32 tensor cores
-//   BF16, FP16       operands converted to 16 bits, on tensor cores, fp32
-//                    accumulation and output (gemm_lowp.cpp)
+//   BF16, FP16       operands converted to 16 bits, on tensor or matrix cores,
+//                    fp32 accumulation and output (gemm_lowp.cpp)
 //   FP8              E4M3 operands, each scaled by its largest entry, on FP8
 //                    tensor cores (Ada, Hopper), fp32 accumulation and output
 //   Ozaki            fp64-accurate products on integer tensor cores, for an
 //                    fp64 build (ozaki.hpp)
-// A mode the build or device cannot do runs Native: all but Native and Ozaki
-// need CUDA and an fp32 network, TF32 and BF16 compute capability 8.0, FP8 8.9;
-// a GEMM the narrow path does not take (a shape cuBLASLt refuses) runs fp32.
-// Process-global,
-// from PET_GEMM=native|tf32|bf16|fp16|fp8|ozaki.
+// A mode the build or device cannot do runs Native. All but Native and Ozaki
+// need an fp32 network; TF32 and FP8 need CUDA (compute capability 8.0 and
+// 8.9); BF16 and FP16 run on CUDA (8.0, 7.0) or on AMD's matrix cores (rocBLAS).
+// A GEMM the narrow path does not take (a shape cuBLASLt refuses) runs fp32.
+// Process-global, from PET_GEMM=native|tf32|bf16|fp16|fp8|ozaki.
 enum class GemmMode { Native, TF32, BF16, FP16, FP8, Ozaki };
 
 inline GemmMode parse_gemm_mode(const char* s) {
@@ -117,7 +117,7 @@ inline void vendor_gemm(rocblas_operation oa, rocblas_operation ob, int m, int n
 inline void add_bias(const View2D& C, const View1D& b) {
   const int n = C.extent(1);
   Kokkos::parallel_for(
-      "bias", Kokkos::RangePolicy<ExecSpace>(0, C.extent(0) * n),
+      "bias", RangePolicy(0, C.extent(0) * n),
       KOKKOS_LAMBDA(int i) { C(i / n, i % n) += b(i % n); });
 }
 
@@ -205,7 +205,7 @@ inline void gemm(char transA, char transB, Net alpha, const View2D& A, const Vie
   if (has_bias) add_bias(C, bias);
 #else
   Kokkos::parallel_for(
-      "gemm_naive", Kokkos::RangePolicy<ExecSpace>(0, m * n), KOKKOS_LAMBDA(int ij) {
+      "gemm_naive", RangePolicy(0, m * n), KOKKOS_LAMBDA(int ij) {
         const int i = ij / n, j = ij % n;
         Net acc = Net(0);
         for (int p = 0; p < k; ++p) acc += (ta ? A(p, i) : A(i, p)) * (tb ? B(j, p) : B(p, j));

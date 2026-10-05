@@ -10,7 +10,6 @@
 namespace pet {
 
 namespace {
-using RangePolicy = Kokkos::RangePolicy<ExecSpace>;
 
 // Floor division and the matching non-negative remainder. A bin index outside
 // [0, n) folds into the box and the quotient is the lattice shift that took it
@@ -178,8 +177,8 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
   // order. One warp per bin, each lane placing its atoms at their rank: a big
   // cell at a long cutoff has a few bins of hundreds of atoms.
   Kokkos::parallel_for(
-      "cl_sortbins", Kokkos::TeamPolicy<ExecSpace>(nbins, 1, 32),
-      KOKKOS_LAMBDA(const Kokkos::TeamPolicy<ExecSpace>::member_type& t) {
+      "cl_sortbins", TeamPolicy(nbins, 1, 32),
+      KOKKOS_LAMBDA(const TeamPolicy::member_type& t) {
         const int lo = bstart(t.league_rank()), n = bstart(t.league_rank() + 1) - lo;
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, n), [&](int q) {
           const int a = bunsorted(lo + q);
@@ -193,7 +192,7 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
   // One warp per atom, its lanes on the members of each candidate bin. The fill
   // places each hit with an ordered warp scan, so the list comes out in the order
   // a sequential walk would give: bins in fixed order, members by atom index.
-  using Teams = Kokkos::TeamPolicy<ExecSpace>;
+  using Teams = TeamPolicy;
   using Team = Teams::member_type;
   IView1D ecnt = ws.i1("cl_ecnt", Ntot);
   IView1D eoff = ws.i1("cl_eoff", Ntot + 1);

@@ -10,7 +10,6 @@ namespace pet {
 
 namespace {
 
-using RangePolicy = Kokkos::RangePolicy<ExecSpace>;
 
 // The brute-force search for one atom: every image within `rng` of every atom
 // of its structure, images outermost, in a fixed order. hit(j, sa, sb, sc, v, d2)

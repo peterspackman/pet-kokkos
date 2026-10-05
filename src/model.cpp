@@ -304,7 +304,7 @@ static void remote_map(const DeviceEdgeData& d, PackedEdges& p) {
   auto raw = d.remote_raw, slot = d.raw_slot, slot_edge = p.slot_edge, of = p.remote_of, packed = p.remote_packed;
   Kokkos::deep_copy(ExecSpace(), of, -1);
   Kokkos::parallel_for(
-      "pk_remote", Kokkos::RangePolicy<ExecSpace>(0, p.n_remote), KOKKOS_LAMBDA(int r) {
+      "pk_remote", RangePolicy(0, p.n_remote), KOKKOS_LAMBDA(int r) {
         const int s = slot(raw(r)), k = s >= 0 ? slot_edge(s) : -1;
         packed(r) = k;
         if (k >= 0) of(k) = r;

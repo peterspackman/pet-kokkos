@@ -18,8 +18,6 @@
 namespace pet {
 
 namespace {
-using RangePolicy = Kokkos::RangePolicy<ExecSpace>;
-using TeamPolicy = Kokkos::TeamPolicy<ExecSpace>;
 using Team = TeamPolicy::member_type;
 
 int env_int(const char* name, int fallback, int lo, int hi) {

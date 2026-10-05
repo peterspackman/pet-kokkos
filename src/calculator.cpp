@@ -312,7 +312,6 @@ Results Calculator::compute_step(const double* positions, const double* cell, bo
 }
 
 Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double* cell) const {
-  using RangePolicy = Kokkos::RangePolicy<ExecSpace>;
   auto& I = *impl_;
   const DeviceEdgeData& dev = I.md.step(a.positions, true, cell, I.ckpt.hypers, I.model.probes(),
                                         I.model.n_probes(), I.opts.md_fixed_shapes);

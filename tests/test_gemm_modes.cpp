@@ -100,3 +100,23 @@ TEST_CASE("each GEMM mode is as accurate as its precision, and no more", "[gemm]
     }
   }
 }
+
+TEST_CASE("BF16 and FP16 run on AMD matrix cores", "[gemm]") {
+#if defined(KOKKOS_ENABLE_HIP)
+  if (sizeof(pet::Net) != sizeof(float)) return;
+  ModeGuard guard;
+  for (const bool transposed : {true, false}) {
+    const double native = run(pet::GemmMode::Native, transposed);
+    const double bf16 = run(pet::GemmMode::BF16, transposed);
+    const double fp16 = run(pet::GemmMode::FP16, transposed);
+    INFO((transposed ? "A W^T" : "A W") << ": native " << native << ", bf16 " << bf16 << ", fp16 " << fp16);
+    CHECK(native < 1e-6);
+    CHECK(bf16 > 10 * native);
+    CHECK(bf16 < 3e-2);
+    CHECK(fp16 > 10 * native);
+    CHECK(fp16 < bf16);  // 11 bits of mantissa against 8
+  }
+#else
+  SUCCEED("HIP only");
+#endif
+}

@@ -17,6 +17,14 @@ namespace pet {
 
 using ExecSpace = Kokkos::DefaultExecutionSpace;
 using MemSpace = ExecSpace::memory_space;
+
+// Every kernel takes its functor as kernel arguments (up to 4 KiB, more than any
+// here needs). By default Kokkos copies a functor over 512 bytes to a constant-
+// memory buffer instead, and before each reuse the host waits for the last
+// kernel that used it: a host sync per launch, which a HIP graph capture also
+// refuses.
+using RangePolicy = Kokkos::RangePolicy<ExecSpace, Kokkos::Experimental::WorkItemProperty::HintLightWeight_t>;
+using TeamPolicy = Kokkos::TeamPolicy<ExecSpace, Kokkos::Experimental::WorkItemProperty::HintLightWeight_t>;
 using LR = Kokkos::LayoutRight;
 
 // Precision, chosen at compile time. Net is the network's type (every GEMM and

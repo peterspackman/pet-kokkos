@@ -1,4 +1,6 @@
 // GEMMs on 8- and 16-bit operands (GemmMode::FP8, BF16, FP16; see gemm.hpp).
+// On NVIDIA GPUs all three through cuBLASLt; on AMD, BF16 and FP16 through
+// rocBLAS (below).
 //
 // Both operands are converted to the narrow type and multiplied on tensor cores
 // by cuBLASLt, accumulating and writing fp32. FP8 is E4M3 with one fp32 scale per
@@ -247,6 +249,105 @@ bool gemm_lowp(char transA, char transW, Net alpha, const View2D& A, const View2
     case GemmMode::FP8: return compute_capability() >= 89 && run<E4M3>(alpha, A, W, tw, beta, C, bias);
     case GemmMode::BF16: return compute_capability() >= 80 && run<BF16>(alpha, A, W, tw, beta, C, bias);
     case GemmMode::FP16: return compute_capability() >= 70 && run<FP16>(alpha, A, W, tw, beta, C, bias);
+    default: return false;
+  }
+}
+
+std::size_t lowp_generation() { return scratch_state().generation; }
+
+}  // namespace pet
+
+#elif defined(KOKKOS_ENABLE_HIP) && !defined(PET_KOKKOS_FP64)
+// On AMD GPUs: BF16 and FP16 through rocBLAS on the matrix cores (MI200 and
+// later), fp32 accumulation and output. No FP8 or TF32 on an MI250X.
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+
+#include <map>
+#include <vector>
+
+namespace pet {
+namespace {
+
+struct BF16 {
+  using T = __hip_bfloat16;
+  static constexpr rocblas_datatype type = rocblas_datatype_bf16_r;
+  KOKKOS_INLINE_FUNCTION static T from(float x) { return __float2bfloat16(x); }
+};
+struct FP16 {
+  using T = __half;
+  static constexpr rocblas_datatype type = rocblas_datatype_f16_r;
+  KOKKOS_INLINE_FUNCTION static T from(float x) { return __float2half(x); }
+};
+
+// W, or W^T when `transposed`, converted once per weight, type and layout, on
+// first use (never inside a graph capture) and kept for the process.
+template <class F>
+const Kokkos::View<typename F::T*, MemSpace>& weight(const View2D& W, bool transposed) {
+  static auto* cache = new std::map<std::pair<const void*, bool>, Kokkos::View<typename F::T*, MemSpace>>;
+  auto [it, fresh] = cache->try_emplace({W.data(), transposed});
+  if (!fresh) return it->second;
+  const int r = W.extent(0), c = W.extent(1);
+  auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), W);
+  std::vector<typename F::T> q(std::size_t(r) * c);
+  for (int i = 0; i < r; ++i)
+    for (int j = 0; j < c; ++j) q[transposed ? std::size_t(j) * r + i : std::size_t(i) * c + j] = F::from(float(h(i, j)));
+  it->second = Kokkos::View<typename F::T*, MemSpace>("lowp_weight", q.size());
+  Kokkos::deep_copy(it->second, Kokkos::View<const typename F::T*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(
+                                    q.data(), q.size()));
+  return it->second;
+}
+
+// Activation scratch: only grows; `generation` counts its moves for the graph key.
+struct Scratch {
+  Kokkos::View<char*, MemSpace> q;
+  std::size_t generation = 0;
+};
+Scratch& scratch_state() {
+  static auto* s = new Scratch;
+  return *s;
+}
+char* scratch(std::size_t bytes) {
+  Scratch& s = scratch_state();
+  if (s.q.extent(0) < bytes) {
+    s.q = Kokkos::View<char*, MemSpace>();
+    s.q = Kokkos::View<char*, MemSpace>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "lowp_act"), bytes + bytes / 4);
+    ++s.generation;
+  }
+  return s.q.data();
+}
+
+// C = alpha A op(W) + beta C as C^T = op(W)^T A^T in rocBLAS's column-major
+// terms, W in its [n,k] layout, so both operands contract along k.
+template <class F>
+bool run(Net alpha, const View2D& A, const View2D& W, bool tw, Net beta, const View2D& C, const View1D& bias) {
+  const int m = C.extent(0), n = C.extent(1), k = A.extent(1), ldc = C.extent(1);
+  if (m == 0 || int(tw ? W.extent(1) : W.extent(0)) != k) return false;
+  const auto& w = weight<F>(W, !tw);
+  using T = typename F::T;
+  T* x = reinterpret_cast<T*>(scratch(std::size_t(m) * k * sizeof(T)));
+  const float* a = A.data();
+  Kokkos::parallel_for(
+      "lowp_convert", RangePolicy(0, long(m) * k), KOKKOS_LAMBDA(long i) { x[i] = F::from(a[i]); });
+  const float al = alpha, be = beta;
+  const rocblas_status st = rocblas_gemm_ex(
+      blas_handle(), rocblas_operation_transpose, rocblas_operation_none, n, m, k, &al, w.data(), F::type, k, x,
+      F::type, k, &be, C.data(), rocblas_datatype_f32_r, ldc, C.data(), rocblas_datatype_f32_r, ldc,
+      rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+  if (st != rocblas_status_success) return false;
+  if (bias.extent(0) > 0) add_bias(C, bias);
+  return true;
+}
+
+}  // namespace
+
+bool gemm_lowp(char transA, char transW, Net alpha, const View2D& A, const View2D& W, Net beta, const View2D& C,
+               const View1D& bias) {
+  if (transA == 'T' || transA == 't') return false;
+  const bool tw = transW == 'T' || transW == 't';
+  switch (gemm_mode()) {
+    case GemmMode::BF16: return run<BF16>(alpha, A, W, tw, beta, C, bias);
+    case GemmMode::FP16: return run<FP16>(alpha, A, W, tw, beta, C, bias);
     default: return false;
   }
 }

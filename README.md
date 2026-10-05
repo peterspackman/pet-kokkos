@@ -143,8 +143,16 @@ Only the GEMMs change, so the gain is bounded by their share of the time, and
 is larger on data-centre GPUs, whose 16- and 8-bit tensor cores outrun their
 fp32 by more. `fp16` matches `tf32` in accuracy (both carry 10 bits of
 mantissa); `fp8` is coarse enough to be a screening tool, not a force field.
-FP8 needs compute capability 8.9 (Ada, Hopper); on AMD GPUs every mode runs
-`native`.
+FP8 needs compute capability 8.9 (Ada, Hopper). On AMD GPUs `bf16` and `fp16`
+run on the matrix cores through rocBLAS; the other modes run `native`.
+
+On one GCD of an MI250X (Setonix), one evaluation with forces:
+
+| model | 64-atom diamond | 648-atom water | 1728-atom diamond |
+|---|---|---|---|
+| pet-mad-xs | 4.7 ms | 7.3 ms | 16.7 ms |
+| pet-mad-s | 7.0 ms | 37.8 ms (`bf16`: 33.2) | 87.9 ms (`bf16`: 77.3) |
+| pet-mad-m | 29.5 ms | 268 ms (`bf16`: 239) | 587 ms (`bf16`: 526) |
 
 **Virial convention.** The virial is the symmetric `W = V·σ` in Voigt order
 `[xx, yy, zz, xy, xz, yz]`. A strain-gradient optimizer wants `dE/dε`, whose
@@ -157,7 +165,7 @@ off-diagonals are `2·W_xy`; apply that factor on your side.
 | `PET_MODEL_DIR` | extra directories to search for models |
 | `PET_GEMM=native\|tf32\|fp16\|bf16\|fp8\|ozaki` | the GEMM precision (above) |
 | `PET_CUTLASS=0` | plain cuBLAS instead of the fused CUTLASS kernels |
-| `PET_GRAPHS=0` | no CUDA graph replay (for profilers that time each kernel) |
+| `PET_GRAPHS=0` | no CUDA/HIP graph replay (for profilers that time each kernel) |
 | `PET_DEVICE_SEARCH=auto\|cells\|brute` | the device neighbour search |
 | `PET_NEIGHBORS=builtin` | the built-in host search instead of vesin |
 | `PET_OZAKI_SLICES` | digits in the fp64 GEMM emulation (fp64 builds) |

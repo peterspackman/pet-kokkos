@@ -13,8 +13,7 @@ namespace pet {
 
 namespace {
 
-using RangePolicy = Kokkos::RangePolicy<ExecSpace>;
-using AtomTeams = Kokkos::TeamPolicy<ExecSpace>;  // one warp per atom, lanes on its edges
+using AtomTeams = TeamPolicy;  // one warp per atom, lanes on its edges
 using Atom = AtomTeams::member_type;
 constexpr int kLanes = 32;
 

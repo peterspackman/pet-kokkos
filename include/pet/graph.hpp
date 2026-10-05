@@ -1,4 +1,5 @@
-// Record-and-replay of an evaluation's device work as one CUDA graph launch.
+// Record-and-replay of an evaluation's device work as one graph launch (CUDA
+// graphs, or HIP's, which are the same API).
 //
 // For a small structure the ~160 launches of an evaluation are nearly all of its
 // cost. run() does the work eagerly the first time it sees a key, captures it
@@ -10,12 +11,18 @@
 // the recorded pointers and arguments. A few graphs are kept, the least recently
 // used dropped first, for a caller that alternates between shapes (an MD engine
 // asking for the energy alone on some steps). A failed capture turns graphs off
-// and redoes the work eagerly. Elsewhere run() just does the work: HIP has the
-// same graph API, but Kokkos's HIP backend synchronises an event (for team
-// scratch) inside the capture, which HIP refuses and Kokkos treats as fatal.
+// and redoes the work eagerly. Without a GPU, run() just does the work.
+//
+// Capture needs every kernel launched with its functor as kernel arguments
+// (pet::RangePolicy / TeamPolicy): a functor Kokkos stages through constant
+// memory makes the host wait on an event, which a HIP capture refuses.
 #pragma once
 
 #include "pet/kokkos.hpp"
+
+#if defined(KOKKOS_ENABLE_HIP)
+#include <hip/hip_runtime.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -39,6 +46,20 @@ inline void launch(Exec e) { cudaGraphLaunch(e, stream()); }
 inline void destroy(Graph g) { cudaGraphDestroy(g); }
 inline void destroy(Exec e) { cudaGraphExecDestroy(e); }
 inline void clear_error() { (void) cudaGetLastError(); }
+}  // namespace gpu
+#elif defined(KOKKOS_ENABLE_HIP)
+#define PET_HAVE_GRAPHS 1
+namespace gpu {
+using Graph = hipGraph_t;
+using Exec = hipGraphExec_t;
+inline hipStream_t stream() { return ExecSpace().hip_stream(); }
+inline bool begin() { return hipStreamBeginCapture(stream(), hipStreamCaptureModeRelaxed) == hipSuccess; }
+inline bool end(Graph* g) { return hipStreamEndCapture(stream(), g) == hipSuccess; }
+inline bool instantiate(Exec* e, Graph g) { return hipGraphInstantiate(e, g, nullptr, nullptr, 0) == hipSuccess; }
+inline void launch(Exec e) { (void) hipGraphLaunch(e, stream()); }
+inline void destroy(Graph g) { (void) hipGraphDestroy(g); }
+inline void destroy(Exec e) { (void) hipGraphExecDestroy(e); }
+inline void clear_error() { (void) hipGetLastError(); }
 }  // namespace gpu
 #endif
 
