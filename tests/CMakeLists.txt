@@ -21,6 +21,7 @@ add_executable(pet_tests
     test_determinism.cpp
     test_device_vs_host.cpp
     test_ozaki.cpp
+    test_gemm_modes.cpp
     test_cell_list.cpp
     test_edges.cpp
 )
@@ -46,6 +47,7 @@ add_test(NAME determinism  COMMAND pet_tests "[determinism]")
 add_test(NAME paths_agree  COMMAND pet_tests "[paths]")
 # Needs a CUDA fp64 build to do anything; skips with a warning elsewhere.
 add_test(NAME ozaki        COMMAND pet_tests "[ozaki]")
+add_test(NAME gemm_modes   COMMAND pet_tests "[gemm]")
 add_test(NAME cell_list    COMMAND pet_tests "[cells]")
 add_test(NAME edges        COMMAND pet_tests "[edges]")
 

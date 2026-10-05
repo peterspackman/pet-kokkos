@@ -33,8 +33,6 @@ int env_int(const char* name, int fallback, int lo, int hi) {
 OzakiConfig& ozaki_config() {
   static OzakiConfig cfg = [] {
     OzakiConfig c;
-    if (const char* m = std::getenv("PET_GEMM_MODE"))
-      c.mode = (std::string(m) == "ozaki") ? GemmMode::Ozaki : GemmMode::Native;
     c.slices = env_int("PET_OZAKI_SLICES", kOzakiMaxSlices, 1, kOzakiMaxSlices);
     return c;
   }();

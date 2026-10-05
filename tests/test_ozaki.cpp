@@ -55,12 +55,13 @@ struct Case {
 // CHECK cannot leave it on for later tests.
 struct ConfigGuard {
   pet::OzakiConfig saved = pet::ozaki_config();
-  ~ConfigGuard() { pet::ozaki_config() = saved; }
+  pet::GemmMode saved_mode = pet::gemm_mode();
+  ~ConfigGuard() { pet::ozaki_config() = saved, pet::gemm_mode() = saved_mode; }
   void use(int slices) {
-    pet::ozaki_config().mode = pet::GemmMode::Ozaki;
+    pet::gemm_mode() = pet::GemmMode::Ozaki;
     pet::ozaki_config().slices = slices;
   }
-  void native() { pet::ozaki_config().mode = pet::GemmMode::Native; }
+  void native() { pet::gemm_mode() = pet::GemmMode::Native; }
 };
 
 }  // namespace

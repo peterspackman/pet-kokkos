@@ -17,6 +17,7 @@
 #   io/extxyz.cpp    extended XYZ
 #   fused_gemm.cpp   GEMMs with their elementwise neighbours fused (CUTLASS)
 #   ozaki.cpp        fp64-accurate GEMMs on integer tensor cores
+#   gemm_lowp.cpp    GEMMs on FP8, BF16 and FP16 operands (tensor cores)
 
 add_library(pet_kokkos STATIC
     model.cpp
@@ -33,6 +34,7 @@ add_library(pet_kokkos STATIC
     checkpoint.cpp
     io/extxyz.cpp
     ozaki.cpp
+    gemm_lowp.cpp
     vesin_neighbors.cpp
     fused_gemm.cpp
 )

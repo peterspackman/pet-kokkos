@@ -150,7 +150,7 @@ struct Calculator::Impl {
       : ckpt(json_path, weights_path), model(ckpt), opts(o) {
     for (int z = 0; z < (int) ckpt.species_to_index.size(); ++z)
       if (ckpt.species_to_index[z] >= 0) atomic_types.push_back(z);
-    if (o.allow_tf32) set_tf32(true);
+    if (o.gemm != GemmMode::Native) gemm_mode() = o.gemm;
     std::size_t free_b = 0, total_b = 0;
     device_memory(o, free_b, total_b);
     // PET_GRAPHS=0 is for profilers that fence around every kernel.

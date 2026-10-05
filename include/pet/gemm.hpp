@@ -9,6 +9,7 @@
 #include "pet/kokkos.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <tuple>
@@ -22,19 +23,37 @@
 
 namespace pet {
 
-// TF32 tensor cores for the fp32 GEMMs: faster, and it changes the answer (by
-// ~0.1 meV/atom, a few meV/A), so it is off unless asked for. Process-global,
-// because cuBLAS fixes a handle's math mode when the handle is created: set it
-// before the first GEMM. PET_TF32=1 sets the initial value.
-inline bool& tf32_flag() {
-  static bool enabled = [] {
-    const char* e = std::getenv("PET_TF32");
-    return e && e[0] == '1';
-  }();
-  return enabled;
+// How the network's GEMMs run. Anything but Native changes the answer, so it is
+// off unless asked for:
+//   Native           fp32 (fp64 in an fp64 build), the reference
+//   TF32             fp32 in and out, the products on TF32 tensor cores
+//   BF16, FP16       operands converted to 16 bits, on tensor cores, fp32
+//                    accumulation and output (gemm_lowp.cpp)
+//   FP8              E4M3 operands, each scaled by its largest entry, on FP8
+//                    tensor cores (Ada, Hopper), fp32 accumulation and output
+//   Ozaki            fp64-accurate products on integer tensor cores, for an
+//                    fp64 build (ozaki.hpp)
+// A mode the build or device cannot do runs Native: all but Native and Ozaki
+// need CUDA and an fp32 network, TF32 and BF16 compute capability 8.0, FP8 8.9;
+// a GEMM the narrow path does not take (a shape cuBLASLt refuses) runs fp32.
+// Process-global,
+// from PET_GEMM=native|tf32|bf16|fp16|fp8|ozaki.
+enum class GemmMode { Native, TF32, BF16, FP16, FP8, Ozaki };
+
+inline GemmMode parse_gemm_mode(const char* s) {
+  const char* names[] = {"native", "tf32", "bf16", "fp16", "fp8", "ozaki"};
+  for (int i = 0; i < 6; ++i)
+    if (std::strcmp(s, names[i]) == 0) return GemmMode(i);
+  throw std::runtime_error(std::string("pet: unknown PET_GEMM mode '") + s + "'");
 }
-inline bool tf32_enabled() { return tf32_flag(); }
-inline void set_tf32(bool on) { tf32_flag() = on; }
+
+inline GemmMode& gemm_mode() {
+  static GemmMode m = [] {
+    const char* e = std::getenv("PET_GEMM");
+    return e && *e ? parse_gemm_mode(e) : GemmMode::Native;
+  }();
+  return m;
+}
 
 #if defined(KOKKOS_ENABLE_CUDA)
 inline cublasHandle_t blas_handle() {
@@ -44,17 +63,28 @@ inline cublasHandle_t blas_handle() {
     cublasHandle_t hh;
     cublasCreate(&hh);
     cublasSetStream(hh, Kokkos::DefaultExecutionSpace().cuda_stream());
-    if (tf32_enabled()) cublasSetMathMode(hh, CUBLAS_TF32_TENSOR_OP_MATH);
     return hh;
   }();
   return h;
+}
+// The compute type for an fp32 GEMM: TF32 tensor cores in that mode. (cuBLAS's
+// "fast" bf16 and fp16 compute types only permit down-conversion, and in
+// practice choose the same TF32 kernels; those modes convert explicitly, in
+// gemm_lowp.cpp.)
+inline cublasComputeType_t fp32_compute_type() {
+  return gemm_mode() == GemmMode::TF32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 }
 // Overloads by scalar type, not `if constexpr`: nvcc type-checks the discarded
 // branch of one in a non-template function.
 inline void vendor_gemm(cublasOperation_t oa, cublasOperation_t ob, int m, int n, int k, float al,
                         const float* A, int lda, const float* B, int ldb, float be, float* C,
                         int ldc) {
-  cublasSgemm(blas_handle(), oa, ob, m, n, k, &al, A, lda, B, ldb, &be, C, ldc);
+  const cublasComputeType_t compute = fp32_compute_type();
+  if (compute == CUBLAS_COMPUTE_32F)
+    cublasSgemm(blas_handle(), oa, ob, m, n, k, &al, A, lda, B, ldb, &be, C, ldc);
+  else
+    cublasGemmEx(blas_handle(), oa, ob, m, n, k, &al, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb, &be, C,
+                 CUDA_R_32F, ldc, compute, CUBLAS_GEMM_DEFAULT);
 }
 inline void vendor_gemm(cublasOperation_t oa, cublasOperation_t ob, int m, int n, int k, double al,
                         const double* A, int lda, const double* B, int ldb, double be, double* C,
@@ -107,14 +137,14 @@ inline bool lt_gemm_bias(bool ta, bool tb, int m, int n, int k, float alpha, con
   constexpr std::size_t kWs = 32u << 20;
   static cublasLtHandle_t lt = [] { cublasLtHandle_t h; cublasLtCreate(&h); return h; }();
   static void* ws = [] { void* p = nullptr; cudaMalloc(&p, kWs); return p; }();
-  static std::map<std::tuple<bool, bool, int, int, int, int, int, int>, Plan> plans;
-  auto [it, fresh] = plans.try_emplace({ta, tb, m, n, k, lda, ldb, ldc});
+  static std::map<std::tuple<int, bool, bool, int, int, int, int, int, int>, Plan> plans;
+  const cublasComputeType_t compute = fp32_compute_type();
+  auto [it, fresh] = plans.try_emplace({int(compute), ta, tb, m, n, k, lda, ldb, ldc});
   Plan& p = it->second;
   if (fresh) {
     const auto opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N, opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
     const auto epi = CUBLASLT_EPILOGUE_BIAS;
-    cublasLtMatmulDescCreate(&p.op, tf32_enabled() ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F,
-                             CUDA_R_32F);
+    cublasLtMatmulDescCreate(&p.op, compute, CUDA_R_32F);
     cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof opA);
     cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof opB);
     cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof epi);
@@ -142,6 +172,15 @@ inline bool lt_gemm_bias(bool, bool, int, int, int, double, const double*, int, 
   return false;
 }
 #endif
+
+// The FP8, BF16 and FP16 modes (gemm_lowp.cpp): C = alpha op(A) op(W) + beta C
+// (+ bias), W a weight, which it converts on first use and keeps. False when it
+// cannot -- another mode, not CUDA, an fp64 network, too old a device, or a
+// shape cuBLASLt does not take -- and the caller runs the GEMM itself.
+bool gemm_lowp(char transA, char transW, Net alpha, const View2D& A, const View2D& W, Net beta,
+               const View2D& C, const View1D& bias = {});
+// Counts moves of its activation scratch: part of a recorded graph's key.
+std::size_t lowp_generation();
 
 inline void gemm(char transA, char transB, Net alpha, const View2D& A, const View2D& B, Net beta,
                  const View2D& C, const View1D& bias = {}) {

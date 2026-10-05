@@ -118,17 +118,33 @@ counts only if it holds both files. `pet-eval --models` prints the list.
   accumulation. What the reference tests are validated against.
 - `fp32`: everything single.
 - `fp64`: everything double, for checking. On GPUs with slow fp64,
-  `PET_GEMM_MODE=ozaki` runs its matrix products to fp64 accuracy on integer
-  tensor cores (the Ozaki scheme).
+  `PET_GEMM=ozaki` runs its matrix products to fp64 accuracy on integer tensor
+  cores (the Ozaki scheme).
 
 **Determinism.** No floating-point atomics feed the energy or forces: neighbour
 slots are assigned in edge-list order, per-edge gradients are gathered through
 the reverse-edge map rather than scattered, and per-structure sums are ordered.
 Repeated runs are bit-identical; `tests/test_determinism.cpp` checks it.
 
-**TF32** tensor-core GEMMs (`PET_TF32=1` or `Options::allow_tf32`) are off by
-default. They are ~15% faster on an RTX 4080 and move energies by ~0.1 meV/atom
-and forces by a few meV/Å.
+**Tensor cores.** The network's matrix products can run in lower precision on
+NVIDIA tensor cores, through `PET_GEMM` or `Options::gemm`. Every mode
+accumulates in fp32 and is off by default. Against the default, pet-mad-s,
+one evaluation with forces on an RTX 4080 SUPER:
+
+| `PET_GEMM` | operands | 648-atom water | 1728-atom diamond | forces, rms (max) | energy |
+|---|---|---|---|---|---|
+| `native` | fp32 | 25.8 ms | 62.5 ms | | |
+| `tf32` | TF32 | 22.8 ms | 54.2 ms | 0.9 (4) meV/Å | 0.2 meV/atom |
+| `fp16` | FP16 | 20.9 ms | 53.7 ms | 0.9 (4) meV/Å | 0.2 meV/atom |
+| `bf16` | BF16 | 20.1 ms | 54.2 ms | 8 (36) meV/Å | 1–4 meV/atom |
+| `fp8` | E4M3, scaled per tensor | 20.2 ms | 58.6 ms | 120 (460) meV/Å | 7–75 meV/atom |
+
+Only the GEMMs change, so the gain is bounded by their share of the time, and
+is larger on data-centre GPUs, whose 16- and 8-bit tensor cores outrun their
+fp32 by more. `fp16` matches `tf32` in accuracy (both carry 10 bits of
+mantissa); `fp8` is coarse enough to be a screening tool, not a force field.
+FP8 needs compute capability 8.9 (Ada, Hopper); on AMD GPUs every mode runs
+`native`.
 
 **Virial convention.** The virial is the symmetric `W = V·σ` in Voigt order
 `[xx, yy, zz, xy, xz, yz]`. A strain-gradient optimizer wants `dE/dε`, whose
@@ -139,12 +155,12 @@ off-diagonals are `2·W_xy`; apply that factor on your side.
 | variable | |
 |---|---|
 | `PET_MODEL_DIR` | extra directories to search for models |
-| `PET_TF32=1` | TF32 GEMMs |
+| `PET_GEMM=native\|tf32\|fp16\|bf16\|fp8\|ozaki` | the GEMM precision (above) |
 | `PET_CUTLASS=0` | plain cuBLAS instead of the fused CUTLASS kernels |
-| `PET_GRAPHS=0` | no CUDA/HIP graph replay (for profilers that time each kernel) |
+| `PET_GRAPHS=0` | no CUDA graph replay (for profilers that time each kernel) |
 | `PET_DEVICE_SEARCH=auto\|cells\|brute` | the device neighbour search |
 | `PET_NEIGHBORS=builtin` | the built-in host search instead of vesin |
-| `PET_GEMM_MODE=ozaki`, `PET_OZAKI_SLICES` | fp64 GEMM emulation (fp64 builds) |
+| `PET_OZAKI_SLICES` | digits in the fp64 GEMM emulation (fp64 builds) |
 | `PET_WS_POISON=1` | fill unwritten scratch with NaN, to catch reads before writes |
 
 The neighbour searches and the cache are all checked against each other in the
@@ -167,6 +183,7 @@ ctest --preset serial          # or openmp / cuda
 | `paths_agree` | yes | host and device neighbour builds, the Verlet cache, a shrinking batch |
 | `edges` | yes | engine neighbour lists: half and full, ghosts, MD stepping, exchange across ranks |
 | `ozaki` | no | fp64 GEMM emulation against native fp64 |
+| `gemm_modes` | no | each tensor-core mode against fp64, within its precision |
 
 Suites that need a model skip when none is installed. Reference values ship
 in `tests/golden/` for four models: pet-mad-xs (v1.0 and v1.6), pbe0-pet, and a

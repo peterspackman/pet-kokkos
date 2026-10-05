@@ -19,6 +19,7 @@
 
 #include "pet/config.hpp"
 #include "pet/device_geometry.hpp"
+#include "pet/gemm.hpp"
 #include "pet/kokkos.hpp"
 #include "pet/model.hpp"
 #include "pet/neighbors.hpp"
@@ -36,9 +37,10 @@ struct Options {
   // stepping the same atoms (MD, a relaxation). See NefCache.
   bool cache_neighbors = false;
 
-  // TF32 tensor-core GEMMs: faster, and ~0.1 meV/atom and a few meV/A off, so
-  // not for reference comparisons. Process-global (see gemm.hpp).
-  bool allow_tf32 = false;
+  // How the network's GEMMs run: Native, or a faster, less exact mode on tensor
+  // cores (TF32, BF16, FP16, FP8; see gemm.hpp). Native leaves PET_GEMM's
+  // choice. Process-global.
+  GemmMode gemm = GemmMode::Native;
 
   // The host neighbour search: vesin's cell list, or the built-in O(N^2) one.
   // Without vesin in the build, the built-in one either way. They agree on the
@@ -57,7 +59,7 @@ struct Options {
 
   // Replay a repeated evaluation (same shapes and buffers, as in a stepping
   // loop) as one CUDA graph: bit-identical, much faster for small structures.
-  // CUDA and HIP; PET_GRAPHS=0 turns it off.
+  // CUDA only; PET_GRAPHS=0 turns it off.
   bool graphs = true;
 
   // A cap on atoms per batch ahead of the memory estimate; 0 = none.

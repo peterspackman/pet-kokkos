@@ -6,15 +6,19 @@
 
 namespace pet {
 
-// Every GEMM goes through gemm_ozaki, which is the vendor GEMM unless the Ozaki
-// path is on. The backward uses the same path as the forward, so a second
-// derivative is not limited by a less accurate backward.
-void linear(View2D out, View2D in, const WeightRef& W, View1D b, Net beta) {
-  gemm_ozaki('N', 'T', Net(1), in, W.v, beta, out, W.for_orientation(true), b);
+// Every GEMM in the network has a weight as its second operand and comes through
+// here: on narrow operands in the FP8, BF16 and FP16 modes where it can, else
+// through gemm_ozaki, which is the vendor GEMM unless the Ozaki path is on. The
+// backward takes the same path as the forward.
+static void weight_gemm(char tw, Net beta, View2D out, View2D in, const WeightRef& W, View1D b = {}) {
+  if (gemm_lowp('N', tw, Net(1), in, W.v, beta, out, b)) return;
+  gemm_ozaki('N', tw, Net(1), in, W.v, beta, out, W.for_orientation(tw == 'T'), b);
 }
 
+void linear(View2D out, View2D in, const WeightRef& W, View1D b, Net beta) { weight_gemm('T', beta, out, in, W, b); }
+
 void linear_bwd(View2D in_adj, View2D out_adj, const WeightRef& W, Net beta) {
-  gemm_ozaki('N', 'N', Net(1), out_adj, W.v, beta, in_adj, W.for_orientation(false));
+  weight_gemm('N', beta, in_adj, out_adj, W);
 }
 
 void linear_silu(View2D out, View2D pre, View2D in, const WeightRef& W, View1D b) {
@@ -125,7 +129,8 @@ void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln, 
 // ---- SwiGLU -------------------------------------------------------------------
 
 void swiglu_in(View2D pre, View2D h, View2D in, const WeightRef& w_in, View1D b_in) {
-  if (!w_in.split && swiglu_in_fused(pre, h, in, w_in.v, b_in)) return;
+  // The fused kernels are fp32 SIMT: only the native mode takes them.
+  if (!w_in.split && gemm_mode() == GemmMode::Native && swiglu_in_fused(pre, h, in, w_in.v, b_in)) return;
   linear(pre, in, w_in, b_in);
   if (!h.data()) return;
   const int F = h.extent(1);
@@ -149,7 +154,7 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
   const int R = out_adj.extent(0), F = pre.extent(1) / 2;
   Workspace::Scope scope(ws);
   View2D pre_adj = ws.tmp(R, 2 * F);
-  if (w_out.split || !swiglu_bwd_fused(pre_adj, out_adj, w_out.v, pre)) {
+  if (w_out.split || gemm_mode() != GemmMode::Native || !swiglu_bwd_fused(pre_adj, out_adj, w_out.v, pre)) {
     View2D h_adj = ws.tmp(R, F);
     linear_bwd(h_adj, out_adj, w_out, 0);
     Kokkos::parallel_for(
@@ -172,7 +177,7 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
 void compress_fwd(View2D out, View2D sav, const CompressFold& f, View2D input_edge,
                   const PackedEdges& pk) {
   const bool gemm = f.wi.extent(0) > 0, save = sav.data() != nullptr;
-  if (gemm) gemm_ozaki('N', 'T', Net(1), input_edge, f.wi.v, Net(0), out, f.wi.for_orientation(true));
+  if (gemm) weight_gemm('T', Net(0), out, input_edge, f.wi);
   const int D = out.extent(1);
   auto wx = f.wx;
   auto b = f.b;

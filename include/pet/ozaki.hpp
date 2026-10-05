@@ -23,11 +23,10 @@
 #include <string>
 #include <vector>
 
+#include "pet/gemm.hpp"
 #include "pet/kokkos.hpp"
 
 namespace pet {
-
-enum class GemmMode { Native, Ozaki };
 
 constexpr int kOzakiSliceBits = 7;  // leaves the sign bit of an int8
 constexpr int kOzakiMaxSlices = 8;  // ceil(53 / 7): a full fp64 mantissa
@@ -53,18 +52,17 @@ struct OzakiSplit {
 // about fp32-and-a-half, 2 a preview. `triangular` keeps only the products with
 // t + v < slices (the rest fall below the precision); off, it is a reference.
 struct OzakiConfig {
-  GemmMode mode = GemmMode::Native;
   int slices = kOzakiMaxSlices;
   bool triangular = true;
 };
 
-// Process-wide, from PET_GEMM_MODE=native|ozaki and PET_OZAKI_SLICES=1..8.
+// Process-wide, from PET_OZAKI_SLICES=1..8. The mode itself is gemm_mode().
 OzakiConfig& ozaki_config();
 
 // Whether this build can run the Ozaki path (CUDA, fp64 Net). Asking for it
 // elsewhere is not an error; it just does nothing.
 bool ozaki_available();
-inline bool ozaki_active() { return ozaki_config().mode == GemmMode::Ozaki && ozaki_available(); }
+inline bool ozaki_active() { return gemm_mode() == GemmMode::Ozaki && ozaki_available(); }
 
 // Split `src` per row, or per column when `by_column` (for an operand that
 // enters transposed: the scale must be constant along the contracted index).
@@ -84,7 +82,5 @@ OzakiSplit ozaki_split_weight(const View2D& src, int n_slices, bool transposed =
 // flight at a time.
 void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View2D& B, Net beta,
                 const View2D& C, const OzakiSplit* bsplit, const View1D& bias = {});
-
-// Bytes that pool holds.
 
 }  // namespace pet
