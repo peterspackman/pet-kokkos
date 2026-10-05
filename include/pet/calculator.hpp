@@ -102,10 +102,11 @@ void resolve_model(const std::string& spec, std::string& json_out, std::string& 
 
 // A single structure goes to the device neighbour path when its raw edge count
 // (every pair within the cutoff) is estimated above this. The host path's cost
-// is its single-threaded work over that list: a 216-atom diamond cell at 8 A
-// (~80k raw edges) is 3x faster on the device, a 64-atom one (~24k) slightly
-// faster on the host.
-constexpr double kDeviceSingleMinRawEdges = 5e4;
+// is its single-threaded work over that list; the device's is mostly fixed. At
+// PET-MAD's 7.5 A raw cutoff a 64-atom diamond cell (~20k raw edges) is 2.4x
+// faster on the device (3.1 vs 7.4 ms, the device search on its cell list), an
+// 8-atom one (~2.5k) 1.5x faster on the host, a molecule far faster there.
+constexpr double kDeviceSingleMinRawEdges = 1e4;
 
 // A loaded model. Reuse one across calls: it holds the scratch pools, caches and
 // recorded graphs that make a stepping loop cheap.

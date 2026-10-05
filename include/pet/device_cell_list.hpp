@@ -23,7 +23,7 @@ namespace pet {
 
 // Which raw search build_nef_device should use.
 enum class DeviceSearch {
-  Auto,       // cell list above a size threshold, brute force below it
+  Auto,       // brute force for small batches of small structures, else the cell list
   CellList,   // always the grid
   BruteForce  // always the O(N^2) search -- the reference the grid is checked against
 };
@@ -31,9 +31,16 @@ enum class DeviceSearch {
 // Process-wide default, from PET_DEVICE_SEARCH=auto|cells|brute.
 DeviceSearch& device_search();
 
-// Atoms in a batch below which Auto keeps the brute-force search: building a
-// grid costs more than it saves there.
+// Auto's choice. The brute force runs a thread per atom, each checking every
+// atom of its structure at every periodic image, so what it costs is the
+// largest of those counts; the grid's setup is a fixed cost. Below
+// kCellListMinAtoms atoms in the batch, Auto takes the grid once some thread
+// would check kCellListMinChecks pairs: with PET's 7.5 A raw cutoff an 8-atom
+// diamond cell (2744 per thread) is a draw, a 64-atom one (8000) twice as fast
+// on the grid, a water molecule (3) twice as fast by brute force. From
+// kCellListMinAtoms up, always the grid.
 constexpr int kCellListMinAtoms = 256;
+constexpr int kCellListMinChecks = 2048;
 
 // The raw COO edge list, as build_nef_device's own search produces it: full and
 // directed, grouped by centre atom, self-pairs excluded.

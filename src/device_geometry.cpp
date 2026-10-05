@@ -108,10 +108,26 @@ Wrapped wrap_positions(Workspace& ws, const DeviceGeom& g) {
 // relative to the wrapped positions.
 RawEdges search(Workspace& ws, const DeviceGeom& g, const Wrapped& w, double radius) {
   const int N = g.Ntot;
-  if (device_search() == DeviceSearch::CellList || (device_search() == DeviceSearch::Auto && N >= kCellListMinAtoms))
-    return build_raw_edges_cells(ws, g, w.posw, w.cinv, radius);
-
   const BruteSearch bs{w.posw, g.scell, g.sid, g.soff, g.scnt, g.sper};
+  bool cells = device_search() == DeviceSearch::CellList;
+  if (device_search() == DeviceSearch::Auto) {
+    cells = N >= kCellListMinAtoms;
+    if (!cells) {  // the brute force's worst thread: atoms x images of its structure (see kCellListMinChecks)
+      auto scnt = g.scnt;
+      int worst = 0;
+      Kokkos::parallel_reduce(
+          "pet_search_work", RangePolicy(0, g.B),
+          KOKKOS_LAMBDA(int b, int& m) {
+            int rng[3];
+            bs.ranges(b, radius, rng);
+            m = Kokkos::max(m, scnt(b) * (2 * rng[0] + 1) * (2 * rng[1] + 1) * (2 * rng[2] + 1));
+          },
+          Kokkos::Max<int>(worst));
+      cells = worst >= kCellListMinChecks;
+    }
+  }
+  if (cells) return build_raw_edges_cells(ws, g, w.posw, w.cinv, radius);
+
   auto sid = g.sid;
   const double r2 = radius * radius;
   RawEdges re;
