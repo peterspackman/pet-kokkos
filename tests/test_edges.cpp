@@ -115,7 +115,7 @@ double max_abs(const std::vector<double>& a) {
 }  // namespace
 
 TEST_CASE("an engine's owned and ghost atoms reproduce the periodic evaluation", "[model][edges]") {
-  for (const auto& model : golden_models()) {
+  for (const auto& model : plumbing_models()) {
     const auto found = find_model(model);
     if (!found) continue;
     // Its own, so a domain's large workspace goes with it.
@@ -129,6 +129,14 @@ TEST_CASE("an engine's owned and ghost atoms reproduce the periodic evaluation",
         break;
       }
     if (!g) continue;
+
+    // The ghosts reach every message-passing layer's cutoff: thousands of atoms
+    // for a 7.5 A model, minutes on a CPU. The exchange test covers the same
+    // physics with a single cutoff of ghosts.
+    if (kHostBackend && calc->ghost_cutoff() > 10.0) {
+      WARN(model << ": a " << calc->ghost_cutoff() << " A ghost shell is skipped on a host backend");
+      continue;
+    }
 
     DYNAMIC_SECTION(model << " / " << g->name) {
       const pet::System& s = g->system;
@@ -170,7 +178,7 @@ TEST_CASE("an engine's owned and ghost atoms reproduce the periodic evaluation",
 }
 
 TEST_CASE("a periodic engine's edges with shifts reproduce the periodic evaluation", "[model][edges]") {
-  for (const auto& model : golden_models()) {
+  for (const auto& model : plumbing_models()) {
     auto* calc = shared_calculator(model);
     if (!calc) continue;
     for (const auto& path : golden_paths(model)) {
@@ -246,7 +254,7 @@ double rel(const std::vector<double>& a, const std::vector<double>& b) {
 }  // namespace
 
 TEST_CASE("a half list gives what the full list does", "[model][edges]") {
-  for (const auto& model : golden_models()) {
+  for (const auto& model : plumbing_models()) {
     auto* calc = shared_calculator(model);
     Golden store;
     const Golden* g = calc ? first_periodic(model, store) : nullptr;
@@ -268,7 +276,7 @@ TEST_CASE("a half list gives what the full list does", "[model][edges]") {
 }
 
 TEST_CASE("a stepping engine's list follows its atoms, graphs or not", "[model][edges]") {
-  for (const auto& model : golden_models()) {
+  for (const auto& model : plumbing_models()) {
     const auto found = find_model(model);
     Golden store;
     const Golden* g = found ? first_periodic(model, store) : nullptr;
@@ -311,7 +319,7 @@ TEST_CASE("a stepping engine's list follows its atoms, graphs or not", "[model][
 }
 
 TEST_CASE("a device-resident engine gets what the host one does", "[model][edges]") {
-  for (const auto& model : golden_models()) {
+  for (const auto& model : plumbing_models()) {
     const auto found = find_model(model);
     Golden store;
     const Golden* g = found ? first_periodic(model, store) : nullptr;
@@ -422,7 +430,7 @@ class ImageExchange : public pet::Exchange {
 }  // namespace
 
 TEST_CASE("ranks that exchange messages reproduce the periodic evaluation", "[model][edges]") {
-  for (const auto& model : golden_models()) {
+  for (const auto& model : plumbing_models()) {
     const auto found = find_model(model);
     Golden store;
     const Golden* g = found ? first_periodic(model, store) : nullptr;

@@ -54,7 +54,7 @@ TEST_CASE("the host and device neighbour builders agree", "[model][paths]") {
   // The builders issue the edge arithmetic differently, and the fp32 network
   // turns a double ulp into an fp32 one: ~3e-8 relative measured. Relative,
   // because the energies span -15 to -8293 eV.
-  for (const auto& model : golden_models()) {
+  for (const auto& model : plumbing_models()) {
     const auto found = find_model(model);
     if (!found) {
       WARN("model '" << model << "' is not installed; skipping its path comparison");
@@ -92,7 +92,7 @@ TEST_CASE("the host and device neighbour builders agree", "[model][paths]") {
 
 TEST_CASE("a freshly built Verlet cache reproduces the uncached search", "[model][paths]") {
   // The same neighbours from the same coordinates: ~4e-16 relative measured.
-  for (const auto& model : golden_models()) {
+  for (const auto& model : plumbing_models()) {
     const auto found = find_model(model);
     if (!found) continue;
     const auto systems = periodic_systems(model);
@@ -123,7 +123,7 @@ TEST_CASE("a reused Verlet cache stays within the network's precision", "[model]
   // The cache states images in unwrapped coordinates (so a stored edge survives
   // an atom crossing a face), the search in wrapped ones: the same vectors,
   // rounded differently. ~9e-9 relative on the energy, ~2e-7 on the forces.
-  for (const auto& model : golden_models()) {
+  for (const auto& model : plumbing_models()) {
     const auto found = find_model(model);
     if (!found) continue;
     auto systems = periodic_systems(model);
@@ -175,7 +175,7 @@ TEST_CASE("staged geometry follows moves, strains and a shrinking batch", "[mode
   // What a relaxation driver does between steps: move atoms and cell in place,
   // and drop finished structures off the end. Each state must match evaluating
   // it from scratch.
-  for (const auto& model : golden_models()) {
+  for (const auto& model : plumbing_models()) {
     const auto found = find_model(model);
     if (!found) continue;
     auto systems = periodic_systems(model);

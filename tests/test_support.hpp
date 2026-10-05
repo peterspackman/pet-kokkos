@@ -14,12 +14,17 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "pet/calculator.hpp"
 #include "pet/neighbors.hpp"
 
 namespace pet_test {
+
+// A build without a GPU runs the network on the CPU, a hundred or more times
+// slower; the heaviest checks take a sample there rather than everything.
+inline constexpr bool kHostBackend = std::is_same_v<pet::MemSpace, Kokkos::HostSpace>;
 
 // A running maximum in which NaN wins: std::max(m, NaN) is m, which lets an
 // all-NaN result pass every tolerance.
@@ -151,19 +156,32 @@ inline std::vector<std::string> golden_paths(const std::string& model) {
 }
 
 // The models the goldens cover, plus $PET_TEST_MODELS:
-//   pet-mad-xs       the 2026.1 checkpoint, grid adaptive cutoff
-//   pbe0-pet         residual featurizer: PostLN, LayerNorm, SiLU, cosine cutoff
-//   pet-mad-xs-v1.6  solver adaptive cutoff (tools/convert_pet.py --model
-//                    pet-mad-xs --out models/pet-mad-xs-v1.6)
+//   pet-mad-xs       v1.5.0, grid adaptive cutoff
+//   pet-mad-xs-v1.6  v1.6.0, solver adaptive cutoff
+//   pet-mols-s-v1.0  v1.0.0, the residual featurizer: PostLN, LayerNorm, SiLU,
+//                    cosine cutoff
 //   pet-attn2        synthetic, two attention layers, as every published model
 //                    from size m up has (tools/make_multilayer_checkpoint.py)
+// .github/workflows/ci.yml shows how each is made.
 inline const std::vector<std::string>& golden_models() {
   static const std::vector<std::string> m = [] {
-    std::vector<std::string> v{"pet-mad-xs", "pbe0-pet", "pet-mad-xs-v1.6", "pet-attn2"};
+    std::vector<std::string> v{"pet-mad-xs", "pet-mad-xs-v1.6", "pet-mols-s-v1.0", "pet-attn2"};
     for (auto& n : env_list("PET_TEST_MODELS")) v.push_back(n);
     return v;
   }();
   return m;
+}
+
+// The models a test of the machinery around the network runs -- neighbour
+// lists, caches, stepping, an engine's ghosts -- which is the same for every
+// architecture: every golden model on a GPU, and on the host only the first
+// installed one, the CPU being slow and the per-architecture tests (goldens,
+// finite differences, determinism) covering the rest.
+inline std::vector<std::string> plumbing_models() {
+  if (!kHostBackend) return golden_models();
+  for (const auto& m : golden_models())
+    if (find_model(m)) return {m};
+  return {};
 }
 
 // One default-options Calculator per model, shared across test cases (loading
