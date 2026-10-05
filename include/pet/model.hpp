@@ -225,6 +225,9 @@ class PetModel {
     return ws_.capacity_breakdown();
   }
   long peak_edge_slots() const { return peak_edge_slots_; }
+  // Device bytes per edge slot with every save kept, from the shapes (as
+  // recompute_tier estimates them), for sizing a batch before any is measured.
+  std::size_t bytes_per_slot() const;
   int peak_max_neighbors() const { return peak_max_neighbors_; }
 
   // Internal, and public only because nvcc refuses a KOKKOS_LAMBDA inside a

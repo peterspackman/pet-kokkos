@@ -5,7 +5,9 @@
 // itself, with TF32 off.
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "pet/calculator.hpp"
@@ -102,6 +104,54 @@ TEST_CASE("a batch gives each structure the same answer as evaluating it alone",
         INFO("max|dF| = " << max_df << " eV/A on max|F| = " << max_f << " eV/A");
         CHECK(max_df <= 1e-4 * std::max(max_f, 1.0));
         foff += alone.forces.size();
+      }
+    }
+  }
+}
+
+TEST_CASE("a batch split to fit memory gives the answer of the whole batch",
+          "[model][determinism]") {
+  // compute() runs a batch too big for the device as consecutive pieces: by
+  // max_batch_atoms, and by a memory budget so small every structure goes alone.
+  // The pieces must come back in order, with struct_id renumbered, each structure
+  // as the whole batch had it (to fp32 noise: a piece pads to its own M).
+  for (const auto& model : plumbing_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+
+    std::vector<pet::System> systems;
+    for (int copy = 0; copy < 3; ++copy)
+      for (const auto& path : golden_paths(model)) {
+        Golden g = load_golden(path);
+        if (g.periodic) systems.push_back(g.system);
+      }
+    if (systems.size() < 4) continue;
+    int most = 0;
+    for (const auto& s : systems) most = std::max(most, s.n_atoms);
+
+    const pet::Results whole = pet::Calculator(found->first, found->second).compute(systems, true);
+    pet::Options by_atoms, by_memory;
+    by_atoms.max_batch_atoms = 2 * most;
+    by_memory.memory_budget_bytes = 1;
+
+    for (const auto& [what, opts] : {std::pair{"max_batch_atoms", by_atoms}, std::pair{"memory budget", by_memory}}) {
+      DYNAMIC_SECTION(model << " / split by " << what) {
+        const pet::Results split = pet::Calculator(found->first, found->second, opts).compute(systems, true);
+        REQUIRE(split.n_atoms == whole.n_atoms);
+        REQUIRE(split.struct_id == whole.struct_id);
+        REQUIRE(split.virial.size() == whole.virial.size());
+        REQUIRE(split.forces.size() == whole.forces.size());
+        for (std::size_t b = 0; b < systems.size(); ++b) {
+          INFO("structure " << b);
+          CHECK(std::abs(split.energy[b] - whole.energy[b]) <= 1e-5 * worst(1.0, std::abs(whole.energy[b])));
+        }
+        double max_f = 0.0, max_df = 0.0;
+        for (std::size_t i = 0; i < whole.forces.size(); ++i) {
+          max_f = worst(max_f, std::abs(whole.forces[i]));
+          max_df = worst(max_df, std::abs(split.forces[i] - whole.forces[i]));
+        }
+        INFO("max|dF| = " << max_df << " eV/A on max|F| = " << max_f << " eV/A");
+        CHECK(max_df <= 1e-4 * std::max(max_f, 1.0));
       }
     }
   }

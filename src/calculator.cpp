@@ -18,9 +18,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #ifndef PET_KOKKOS_MODEL_DIR
@@ -34,13 +36,14 @@ namespace {
 constexpr const char* kDefaultModel = "pet-mad-xs";
 
 // The batch width is the smaller of two ceilings. Memory: the backward's saves
-// are [atoms x neighbours, width], so bytes per edge slot is the model constant
-// (~58 KiB feedforward, ~105 KiB residual), not bytes per atom. Throughput: past
+// are [atoms x neighbours, width], so the cost is bytes per edge slot, a model
+// constant (~60 KiB for pet-mols-s), not bytes per atom. Throughput: past
 // ~kMaxEdgeSlots a bigger batch stops being cheaper per structure.
 //
-// The memory budget is a share of the card (the pool is grow-only, so counting
-// what it already holds as free would let it ratchet itself up forever) with
-// headroom for reallocation peaks, fragmentation and a larger next M.
+// The recommended budget is a share of the card (the pool is grow-only, so
+// counting what it already holds as free would let it ratchet itself up forever)
+// with headroom for reallocation peaks, fragmentation and a larger next M. A
+// batch compute() is given is split only past what the card has.
 constexpr double kMemHeadroom = 0.8;
 constexpr double kMemCardFraction = 0.7;
 constexpr long kMaxEdgeSlots = 131072;
@@ -92,6 +95,14 @@ double raw_edges_estimate(const System& s, double rc) {
   const double vol = std::fabs(c[0] * (c[4] * c[8] - c[5] * c[7]) - c[1] * (c[3] * c[8] - c[5] * c[6]) +
                                c[2] * (c[3] * c[7] - c[4] * c[6]));
   return vol > 0 ? n * n / vol * (4.0 / 3.0) * detail::PET_PI * rc * rc * rc : n * (n - 1);
+}
+
+// The neighbour count a system's rows will be padded to, before its list exists:
+// the mean within the cutoff (the budget's headroom covers the busiest atom), or
+// with an adaptive cutoff at most twice its target.
+double neighbors_estimate(const System& s, const Hypers& h) {
+  const double mean = raw_edges_estimate(s, h.cutoff) / std::max(1, s.n_atoms);
+  return std::max(1.0, h.adaptive() ? std::min(mean, 2.0 * h.num_neighbors_adaptive) : mean);
 }
 
 }  // namespace
@@ -164,6 +175,45 @@ struct Calculator::Impl {
     const bool builtin = o.neighbors == Options::Neighbors::Builtin || (nb && std::string(nb) == "builtin");
     neighbor_backend() = builtin ? NeighborBackend::Builtin : NeighborBackend::Vesin;
   }
+
+  // The edge slots (atoms x neighbours) a batch may take in memory: the budget
+  // over the bytes per slot measured so far, or before there is a sample over
+  // the model's estimate, with a quarter more for what else the pool holds. card_fraction caps the budget at a share of the card: the
+  // recommendation keeps to kMemCardFraction, a split only to what is there.
+  double memory_slots(double card_fraction) const {
+    const std::size_t pool = model.workspace_bytes();
+    const long slots = model.peak_edge_slots();
+    const bool sampled = pool > 0 && slots >= kMinSampleSlots;
+    const double bytes_per_slot = sampled ? double(pool) / double(slots) : 1.25 * double(model.bytes_per_slot());
+    std::size_t free_b = 0, total_b = 0;
+    device_memory(opts, free_b, total_b);
+    const double budget =
+        std::min(double(free_b) + double(pool), double(total_b) * card_fraction) * kMemHeadroom;
+    return budget / bytes_per_slot;
+  }
+
+  // Consecutive runs of the systems, each at least one, whose padded slots fit
+  // memory_slots() and whose atoms fit max_batch_atoms.
+  std::vector<std::pair<std::size_t, std::size_t>> memory_runs(const std::vector<System>& systems) const {
+    const double cap = memory_slots(1.0);
+    const long max_atoms = opts.max_batch_atoms > 0 ? opts.max_batch_atoms : std::numeric_limits<long>::max();
+    std::vector<std::pair<std::size_t, std::size_t>> runs;
+    std::size_t b = 0;
+    long atoms = 0;
+    double m = 0;
+    for (std::size_t i = 0; i < systems.size(); ++i) {
+      const long a = systems[i].n_atoms;
+      const double mi = std::max(m, neighbors_estimate(systems[i], ckpt.hypers));
+      if (i > b && (double(atoms + a) * mi > cap || atoms + a > max_atoms)) {
+        runs.emplace_back(b, i);
+        b = i, atoms = 0, m = 0;
+      }
+      atoms += a;
+      m = std::max(m, neighbors_estimate(systems[i], ckpt.hypers));
+    }
+    runs.emplace_back(b, systems.size());
+    return runs;
+  }
 };
 
 Calculator::Calculator(const std::string& spec, Options opts) {
@@ -228,7 +278,22 @@ Results Calculator::compute(const System& system, bool compute_forces) const {
 Results Calculator::compute(const std::vector<System>& systems, bool compute_forces) const {
   if (systems.empty()) return {};
   if (systems.size() == 1) return compute(systems[0], compute_forces);
-  return compute_batch(systems, compute_forces);
+  // A batch that would outgrow device memory runs as several, joined in order.
+  const auto runs = impl_->memory_runs(systems);
+  if (runs.size() == 1) return compute_batch(systems, compute_forces);
+  Results out;
+  for (const auto& [b, e] : runs) {
+    const Results r = e - b == 1 ? compute(systems[b], compute_forces)
+                                 : compute_batch({systems.begin() + b, systems.begin() + e}, compute_forces);
+    auto append = [](auto& to, const auto& from) { to.insert(to.end(), from.begin(), from.end()); };
+    append(out.energy, r.energy);
+    append(out.per_atom_energy, r.per_atom_energy);
+    append(out.forces, r.forces);
+    append(out.virial, r.virial);
+    append(out.n_atoms, r.n_atoms);
+    for (const int id : r.struct_id) out.struct_id.push_back(id + int(b));
+  }
+  return out;
 }
 
 // A device view into a row-major host vector.
@@ -400,15 +465,8 @@ int Calculator::recommended_batch_atoms() const {
   const long slots = impl_->model.peak_edge_slots();
   if (pool == 0 || slots < kMinSampleSlots) return bootstrap;
 
-  const double bytes_per_slot = double(pool) / double(slots);
   const int m = std::max(1, impl_->model.peak_max_neighbors());
-  std::size_t free_b = 0, total_b = 0;
-  device_memory(impl_->opts, free_b, total_b);
-
-  const double budget =
-      std::min(double(free_b) + double(pool), double(total_b) * kMemCardFraction) * kMemHeadroom;
-
-  const long by_memory = static_cast<long>(budget / (bytes_per_slot * m));
+  const long by_memory = static_cast<long>(impl_->memory_slots(kMemCardFraction) / m);
   const long by_throughput = kMaxEdgeSlots / m;
   long atoms = std::min(by_memory, by_throughput);
   atoms = std::min<long>(std::max<long>(atoms, 256), 65536);

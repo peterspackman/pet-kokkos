@@ -560,6 +560,12 @@ Recompute PetModel::recompute_tier(int N, int S, int E) const {
   return fits(G * layer) ? Recompute::Never : fits(G * (layer - wide)) ? Recompute::Wide : Recompute::Layers;
 }
 
+std::size_t PetModel::bytes_per_slot() const {
+  const std::size_t G = h_.num_gnn_layers, A = h_.num_attention_layers, D = h_.d_pet, Dh = h_.d_head;
+  const std::size_t ew = ffn_pre_width("gnn_layers.0.trans.layers.0.mlp");
+  return sizeof(Net) * (G * (A * (5 * D + ew + D) + 5 * D) + 2 * ew + 6 * D + 4 * Dh);
+}
+
 EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* host_forces,
                                RView2D* dev_forces, RView1D* dev_per_atom, RView2D* dev_virial,
                                RView2D* dev_edge_grad) {

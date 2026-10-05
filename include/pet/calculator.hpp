@@ -125,8 +125,9 @@ class Calculator {
   // (kDeviceSingleMinRawEdges).
   Results compute(const System& system, bool compute_forces = true) const;
   // Several structures as one evaluation. Edges never cross structures, so each
-  // gets the answer it would alone (to the bit on the host path). One structure
-  // goes to the overload above.
+  // gets the answer it would alone (to the bit on the host path). A batch too big
+  // for device memory (or for max_batch_atoms) runs as several, in order; one
+  // structure goes to the overload above.
   Results compute(const std::vector<System>& systems, bool compute_forces = true) const;
   // Structures staged on the device, from this Calculator's pool, for a caller
   // that steps them there (a relaxation, MD): move geom.pos and geom.scell in
