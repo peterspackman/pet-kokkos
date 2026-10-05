@@ -85,74 +85,74 @@
   ],
   "periodic": true,
   "n_atoms": 8,
-  "total_energy": -48.70741271972656,
+  "total_energy": -54.606868743896484,
   "per_atom_energies": [
-    -6.066091537475586,
-    -6.066089630126953,
-    -6.066092014312744,
-    -6.066089630126953,
-    -6.110764026641846,
-    -6.1107611656188965,
-    -6.110762119293213,
-    -6.110762596130371
+    -6.804217338562012,
+    -6.804217338562012,
+    -6.80421781539917,
+    -6.804217338562012,
+    -6.847501754760742,
+    -6.847499370574951,
+    -6.847498893737793,
+    -6.847500324249268
   ],
   "forces": [
     [
-      -0.14340108633041382,
-      0.45857036113739014,
-      0.25102752447128296
+      -0.04666006565093994,
+      0.48219478130340576,
+      0.5222110152244568
     ],
     [
-      -0.1433941125869751,
-      0.4585854411125183,
-      0.2510231137275696
+      -0.04665055871009827,
+      0.4822077751159668,
+      0.5222070217132568
     ],
     [
-      -0.1433933973312378,
-      0.45856964588165283,
-      0.25103116035461426
+      -0.04665714502334595,
+      0.48219573497772217,
+      0.522205650806427
     ],
     [
-      -0.14340081810951233,
-      0.45856860280036926,
-      0.251029372215271
+      -0.04665480554103851,
+      0.48219531774520874,
+      0.522210419178009
     ],
     [
-      0.14340579509735107,
-      -0.45856547355651855,
-      -0.2510279715061188
+      0.04665851593017578,
+      -0.4821879267692566,
+      -0.5222084522247314
     ],
     [
-      0.1433972865343094,
-      -0.4585803747177124,
-      -0.25102508068084717
+      0.04665526747703552,
+      -0.4822048246860504,
+      -0.5222011208534241
     ],
     [
-      0.14339007437229156,
-      -0.4585722088813782,
-      -0.2510245442390442
+      0.04665055871009827,
+      -0.4821956157684326,
+      -0.5222067832946777
     ],
     [
-      0.14339599013328552,
-      -0.4585760831832886,
-      -0.25103363394737244
+      0.04665827751159668,
+      -0.4822050929069519,
+      -0.5222179889678955
     ]
   ],
   "stress": [
     [
-      -0.16655951814221048,
-      -0.046484207252951014,
-      -0.04232275111896291
+      -0.2769829203087226,
+      -0.023030834985283567,
+      -0.04488577518498399
     ],
     [
-      -0.05065427877046466,
-      -0.3076602207432378,
-      -0.028032443358208085
+      -0.025353072214972464,
+      -0.3927475975969362,
+      -0.03196787175343413
     ],
     [
-      -0.04253505203019312,
-      -0.024587227658943816,
-      -0.1666395781696063
+      -0.04606632963226662,
+      -0.02843981441361744,
+      -0.33304185505591044
     ]
   ],
   "virial": null,
@@ -163,5 +163,8 @@
     "forces",
     "stress"
   ],
-  "notes": "SYNTHETIC model: pet-mad-xs-v1.6.0 with num_attention_layers raised to 2 and block 0 duplicated into block 1 with a 5%% per-tensor perturbation, via tools/make_multilayer_checkpoint.py. It exists because every published upet model uses num_attention_layers=1, so the multi-block transformer stack has nothing real to validate against -- while metatrain defaults to 2, so a locally trained model can easily need it. The blocks are deliberately NOT identical, so an implementation reading block 0 weights for every block fails this. Reference produced by metatrain itself, as with every other golden."
+  "notes": "SYNTHETIC model: pet-mad-xs v1.6.0 with num_attention_layers raised to 2 and block 0 copied into block 1 with a 5% per-tensor perturbation (tools/make_multilayer_checkpoint.py pet-mad-xs out.ckpt --version 1.6.0 --layers 2 --distinct 0.05). The blocks differ, so an implementation that read block 0's weights for every block fails this. Reference from metatrain itself, as for every golden.",
+  "model_metadata": {
+    "energy_scale": 2.7246183850344425
+  }
 }

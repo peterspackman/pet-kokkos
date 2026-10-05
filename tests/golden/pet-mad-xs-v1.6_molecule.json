@@ -86,5 +86,8 @@
     "energies",
     "forces"
   ],
-  "notes": "Generated from pet-mad-xs-v1.6.0 (lab-cosmo/upet), which uses adaptive_cutoff_method=solver -- unlike the pet-mad-xs goldens alongside it, which come from a 2026.1-era checkpoint using the legacy grid method. The two schemes choose different per-atom cutoffs, so these are a genuinely different reference, not a regenerated one."
+  "notes": "Generated from pet-mad-xs-v1.6.0 (lab-cosmo/upet), which uses adaptive_cutoff_method=solver -- unlike the pet-mad-xs goldens alongside it, which come from a 2026.1-era checkpoint using the legacy grid method. The two schemes choose different per-atom cutoffs, so these are a genuinely different reference, not a regenerated one.",
+  "model_metadata": {
+    "energy_scale": 2.7246183850344425
+  }
 }

@@ -10,6 +10,14 @@
 #     "huggingface_hub",
 #     "safetensors",
 # ]
+#
+# [tool.uv.sources]
+# torch = { index = "pytorch-cpu" }
+#
+# [[tool.uv.index]]
+# name = "pytorch-cpu"
+# url = "https://download.pytorch.org/whl/cpu"
+# explicit = true
 # ///
 """Convert a upet PET model into a libtorch-free checkpoint for pet-kokkos.
 
@@ -22,14 +30,15 @@ at evaluation time.
 
 Two model sources are supported:
 
-  * a named upet model downloaded from HuggingFace (lab-cosmo/upet):
+  * a named upet model downloaded from HuggingFace (lab-cosmo/upet), the latest
+    version or a given one:
       uv run tools/convert_pet.py --model pet-mad-xs --out models/pet-mad-xs
+      uv run tools/convert_pet.py --model pet-mols-s --version 1.0.0 --out models/pet-mols-s-v1.0
 
   * a local metatrain checkpoint (.ckpt), optionally selecting one of several
     energy *variants* trained on the same backbone (e.g. a model with both an
     `energy` (PBE) and an `energy/pbe0` head):
-      uv run tools/convert_pet.py --ckpt pbe0-pet.ckpt --variant pbe0 \
-                                  --out models/pbe0-pet
+      uv run tools/convert_pet.py --ckpt my-model.ckpt --variant pbe0 --out models/my-model
 
 `--variant pbe0` selects the `energy/pbe0` output (the same thing
 `MetatomicCalculator(model, variants={"energy": "pbe0"})` does at eval time) and
@@ -126,8 +135,9 @@ def strip_backend_prefix(name: str) -> str:
     return name[len("backend."):] if name.startswith("backend.") else name
 
 
-def download_upet_checkpoint(model_name: str) -> str:
-    """Resolve a named upet model to a local checkpoint path.
+def download_upet_checkpoint(model_name: str, version: str = "latest") -> str:
+    """Resolve a named upet model, at `version` ("1.5.0", or "latest"), to a
+    local checkpoint path.
 
     `model_name` is the full name including the size suffix, e.g. "pet-mad-xs"
     or "pet-omat-s". Everything before the last "-" is the model family and the
@@ -147,14 +157,16 @@ def download_upet_checkpoint(model_name: str) -> str:
     try:
         from upet._models import _resolve_and_download_checkpoint
 
-        _, _, path = _resolve_and_download_checkpoint(family, size, "latest")
+        _, _, path = _resolve_and_download_checkpoint(family, size, version)
         return path
     except ImportError:
         pass
 
     from upet._models import upet_resolve_model
 
-    resolved_size, version = upet_resolve_model(model=family, requested_size=size)
+    resolved_size, latest = upet_resolve_model(model=family, requested_size=size)
+    if version == "latest":
+        version = latest
     return hf_hub_download(
         repo_id="lab-cosmo/upet",
         filename=f"{family}-{resolved_size}-v{version}.ckpt",
@@ -162,12 +174,12 @@ def download_upet_checkpoint(model_name: str) -> str:
     )
 
 
-def load_named_model(model_name: str):
+def load_named_model(model_name: str, version: str = "latest"):
     """Load a named upet model: download its checkpoint, then load it through
     metatrain so the raw PET backbone (with composition + scaler attached) is
     what comes back -- not the TorchScripted AtomisticModel `upet.get_upet`
     hands out, whose internals this converter cannot reach."""
-    return load_local_model(download_upet_checkpoint(model_name))
+    return load_local_model(download_upet_checkpoint(model_name, version))
 
 
 def extract_composition(model, target: str, n_species: int):
@@ -191,6 +203,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None,
                     help="named upet model (downloaded from HuggingFace)")
+    ap.add_argument("--version", default="latest",
+                    help="with --model: which published version, e.g. 1.5.0")
     ap.add_argument("--ckpt", default=None,
                     help="path to a local metatrain .ckpt")
     ap.add_argument("--variant", default=None,
@@ -207,7 +221,7 @@ def main():
     if args.ckpt:
         model = load_local_model(args.ckpt)
     else:
-        model = load_named_model(args.model)
+        model = load_named_model(args.model, args.version)
     model.eval()
 
     h = dict(model.hypers)
@@ -308,8 +322,9 @@ def main():
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    json_path = out.with_suffix(".json")
-    st_path = out.with_suffix(".safetensors")
+    # Appended, not with_suffix: a stem like pet-mols-s-v1.0 has a dot of its own.
+    json_path = out.parent / (out.name + ".json")
+    st_path = out.parent / (out.name + ".safetensors")
 
     json_path.write_text(json.dumps(meta, indent=2))
     save_file(tensors, str(st_path))

@@ -102,7 +102,8 @@ one from a published upet model or a metatrain checkpoint:
 ```bash
 uv run tools/convert_pet.py --model pet-mad-xs --out models/pet-mad-xs
 uv run tools/convert_pet.py --ckpt my-model.ckpt --out models/my-model
-uv run tools/convert_pet.py --ckpt pbe0.ckpt --variant pbe0 --out models/pbe0-pet  # a non-default output head
+uv run tools/convert_pet.py --model pet-mols-s --version 1.0.0 --out models/pet-mols-s-v1.0
+uv run tools/convert_pet.py --ckpt my-model.ckpt --variant pbe0 --out models/my-model  # another output head
 ```
 
 A named model is looked for, in order, in `$PET_MODEL_DIR` (`:`-separated),
@@ -194,10 +195,20 @@ ctest --preset serial          # or openmp / cuda
 | `gemm_modes` | no | each tensor-core mode against fp64, within its precision |
 
 Suites that need a model skip when none is installed. Reference values ship
-in `tests/golden/` for four models: pet-mad-xs (v1.0 and v1.6), pbe0-pet, and a
-synthetic two-attention-layer model built by
-`tools/make_multilayer_checkpoint.py`. `$PET_TEST_MODELS` and
-`$PET_TEST_GOLDEN_EXTRA` add models and golden directories.
+in `tests/golden/` for four models, all made from published checkpoints (CI
+makes them the same way, `.github/workflows/ci.yml`):
+
+```bash
+uv run tools/convert_pet.py --model pet-mad-xs --version 1.5.0 --out models/pet-mad-xs
+uv run tools/convert_pet.py --model pet-mad-xs --version 1.6.0 --out models/pet-mad-xs-v1.6
+uv run tools/convert_pet.py --model pet-mols-s --version 1.0.0 --out models/pet-mols-s-v1.0
+uv run tools/make_multilayer_checkpoint.py pet-mad-xs attn2.ckpt --version 1.6.0 --layers 2 --distinct 0.05
+uv run tools/convert_pet.py --ckpt attn2.ckpt --out models/pet-attn2      # two attention layers
+uv run tools/convert_pet.py --model pet-omol-s --out models/pet-omol-s    # charge and spin
+```
+
+`$PET_TEST_MODELS` and `$PET_TEST_GOLDEN_EXTRA` add models and golden
+directories.
 
 Against the whole published catalogue:
 

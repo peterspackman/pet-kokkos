@@ -55,27 +55,27 @@
   ],
   "periodic": false,
   "n_atoms": 3,
-  "total_energy": -10.332698822021484,
+  "total_energy": -10.279441833496094,
   "per_atom_energies": [
-    -6.220189571380615,
-    -2.0123538970947266,
-    -2.100154399871826
+    -6.065270900726318,
+    -2.0858330726623535,
+    -2.12833833694458
   ],
   "forces": [
     [
-      -0.20168918371200562,
-      0.707471489906311,
-      -0.7571887969970703
+      -0.31179535388946533,
+      0.6071219444274902,
+      -0.5460031032562256
     ],
     [
-      0.1360081136226654,
-      0.3091319799423218,
-      0.5922996401786804
+      0.18678689002990723,
+      -0.06516355276107788,
+      0.4856715202331543
     ],
     [
-      0.06568107008934021,
-      -1.0166034698486328,
-      0.16488921642303467
+      0.1250084489583969,
+      -0.5419583916664124,
+      0.06033158302307129
     ]
   ],
   "stress": null,
@@ -86,5 +86,8 @@
     "energies",
     "forces"
   ],
-  "notes": "SYNTHETIC model: pet-mad-xs-v1.6.0 with num_attention_layers raised to 2 and block 0 duplicated into block 1 with a 5%% per-tensor perturbation, via tools/make_multilayer_checkpoint.py. It exists because every published upet model uses num_attention_layers=1, so the multi-block transformer stack has nothing real to validate against -- while metatrain defaults to 2, so a locally trained model can easily need it. The blocks are deliberately NOT identical, so an implementation reading block 0 weights for every block fails this. Reference produced by metatrain itself, as with every other golden."
+  "notes": "SYNTHETIC model: pet-mad-xs v1.6.0 with num_attention_layers raised to 2 and block 0 copied into block 1 with a 5% per-tensor perturbation (tools/make_multilayer_checkpoint.py pet-mad-xs out.ckpt --version 1.6.0 --layers 2 --distinct 0.05). The blocks differ, so an implementation that read block 0's weights for every block fails this. Reference from metatrain itself, as for every golden.",
+  "model_metadata": {
+    "energy_scale": 2.7246183850344425
+  }
 }

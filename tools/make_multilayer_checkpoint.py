@@ -7,7 +7,16 @@
 #     "upet",
 #     "metatomic-torch",
 #     "huggingface_hub",
+#     "safetensors",
 # ]
+#
+# [tool.uv.sources]
+# torch = { index = "pytorch-cpu" }
+#
+# [[tool.uv.index]]
+# name = "pytorch-cpu"
+# url = "https://download.pytorch.org/whl/cpu"
+# explicit = true
 # ///
 """Build a `num_attention_layers > 1` PET checkpoint from a single-layer one.
 
@@ -30,6 +39,7 @@ copy so that reading block 0's weights for every block would fail.
 import argparse
 import sys
 import warnings
+import zlib
 from pathlib import Path
 
 import torch
@@ -47,10 +57,11 @@ def duplicate_blocks(state_dict, n_layers: int, jitter: float) -> int:
         for a in range(1, n_layers):
             t = v.clone()
             if jitter and t.is_floating_point():
-                # Deterministic per-block perturbation, so the blocks are not
-                # interchangeable and an implementation that used block 0's
-                # weights everywhere would produce a different answer.
-                g = torch.Generator().manual_seed(hash((k, a)) & 0x7FFFFFFF)
+                # Seeded by tensor name and block, so the same command always
+                # writes the same weights: the blocks are not interchangeable,
+                # and an implementation that used block 0's weights everywhere
+                # would produce a different answer.
+                g = torch.Generator().manual_seed(zlib.crc32(f"{k}/{a}".encode()))
                 t += jitter * t.std() * torch.randn(t.shape, generator=g, dtype=t.dtype)
             added[k.replace(".trans.layers.0.", f".trans.layers.{a}.")] = t
     state_dict.update(added)
@@ -61,6 +72,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("model", help="named upet model, or a path to a local .ckpt")
     ap.add_argument("out", help="output checkpoint path")
+    ap.add_argument("--version", default="latest", help="with a named model: which published version")
     ap.add_argument("--layers", type=int, default=2, help="num_attention_layers to produce")
     ap.add_argument("--distinct", type=float, default=0.0, metavar="FRAC",
                     help="perturb each duplicated block by this fraction of its own "
@@ -70,7 +82,7 @@ def main():
     if args.layers < 2:
         ap.error("--layers must be at least 2")
 
-    src = args.model if Path(args.model).exists() else download_upet_checkpoint(args.model)
+    src = args.model if Path(args.model).exists() else download_upet_checkpoint(args.model, args.version)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
         ck = torch.load(src, map_location="cpu", weights_only=False)

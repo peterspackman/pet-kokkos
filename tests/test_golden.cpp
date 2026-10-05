@@ -20,7 +20,7 @@ using namespace pet_test;
 namespace {
 
 // Tolerances for mixed precision. The energy's is relative or absolute: the
-// references are fp32 end to end, and for pbe0's ~-1036 eV/atom one fp32 ulp is
+// references are fp32 end to end, and for pet-mols-s's ~-1036 eV/atom one fp32 ulp is
 // 1.2e-4 eV/atom (tools/make_fp64_golden.py lifts that floor).
 double energy_tolerance(double e_ref) { return std::max(1e-3, 2e-6 * std::fabs(e_ref)); }
 constexpr double kForceTolerance = 1e-2;    // eV/Angstrom

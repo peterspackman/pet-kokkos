@@ -212,8 +212,8 @@ def process(entry, args, structures, xyz, workdir):
         return res
 
     # --- convert -------------------------------------------------------------
-    if not (prefix.with_suffix(".json").exists() and
-            prefix.with_suffix(".safetensors").exists()) or args.force:
+    if not (prefix.parent.joinpath(prefix.name + ".json").exists() and
+            prefix.parent.joinpath(prefix.name + ".safetensors").exists()) or args.force:
         cmd = [sys.executable, str(Path(__file__).parent / "convert_pet.py"),
                "--ckpt", str(ckpt), "--out", str(prefix)]
         p = subprocess.run(cmd, capture_output=True, text=True)

@@ -11,6 +11,14 @@
 #     "huggingface_hub",
 #     "safetensors",
 # ]
+#
+# [tool.uv.sources]
+# torch = { index = "pytorch-cpu" }
+#
+# [[tool.uv.index]]
+# name = "pytorch-cpu"
+# url = "https://download.pytorch.org/whl/cpu"
+# explicit = true
 # ///
 """Generate a "golden" reference output for a metatrain PET model.
 
@@ -39,7 +47,7 @@ from pathlib import Path
 
 import numpy as np
 
-from convert_pet import download_upet_checkpoint
+from convert_pet import download_upet_checkpoint, extract_energy_scale, load_local_model
 
 
 def load_full_model(model_name: str = None, ckpt: str = None):
@@ -132,7 +140,7 @@ def evaluate(calculator, atoms):
     }
 
 
-def make_golden(model_label, calculator, case_name, atoms, out_dir, variant):
+def make_golden(model_label, calculator, case_name, atoms, out_dir, variant, energy_scale):
     ev = evaluate(calculator, atoms)
     pbc = [bool(p) for p in atoms.get_pbc()]
 
@@ -166,6 +174,9 @@ def make_golden(model_label, calculator, case_name, atoms, out_dir, variant):
         "virial": ev["virial"],
         "volume": ev["volume"],
         "result_keys": ev["result_keys"],
+        # A fitted constant, so a fingerprint of the checkpoint: the tests refuse
+        # a model of the same name with another.
+        "model_metadata": {"energy_scale": energy_scale},
     }
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -189,6 +200,7 @@ def main():
         description="Generate golden PET reference output for C++ validation."
     )
     parser.add_argument("--model", default=None, help="named upet model, e.g. pet-mad-xs")
+    parser.add_argument("--version", default="latest", help="with --model: which published version")
     parser.add_argument("--ckpt", default=None, help="local metatrain .ckpt path")
     parser.add_argument("--variant", default=None,
                         help="energy variant, e.g. 'pbe0' -> variants={'energy':'pbe0'}")
@@ -210,7 +222,10 @@ def main():
                else Path(__file__).resolve().parents[1] / "tests" / "golden")
 
     print(f"Loading full atomistic model: {label} ...")
-    atomistic = load_full_model(model_name=args.model, ckpt=args.ckpt)
+    path = args.ckpt or download_upet_checkpoint(args.model, args.version)
+    atomistic = load_full_model(ckpt=path)
+    target = "energy" if not args.variant else f"energy/{args.variant}"
+    energy_scale = extract_energy_scale(load_local_model(path), target)
 
     from metatomic.torch.ase_calculator import MetatomicCalculator
 
@@ -223,7 +238,7 @@ def main():
 
     print(f"Evaluating golden structures (variant={args.variant}):")
     written = [
-        make_golden(label, calculator, name, atoms, out_dir, args.variant)
+        make_golden(label, calculator, name, atoms, out_dir, args.variant, energy_scale)
         for name, atoms in structures.items()
     ]
 
