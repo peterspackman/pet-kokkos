@@ -1,6 +1,6 @@
 # pet-kokkos
 
-A C++ implementation of PET (Point Edge Transformer) machine-learning
+A C++ implementation of [PET](https://arxiv.org/abs/2305.19302) (Point Edge Transformer) machine-learning
 interatomic potentials, the [upet](https://github.com/lab-cosmo/upet) / PET-MAD
 family, built on Kokkos. It computes energies, forces and the virial without
 needing libtorch, and runs on CPUs (serial or OpenMP), NVIDIA GPUs (CUDA) and
@@ -152,14 +152,3 @@ Most tests need models and are skipped without them;
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) shows how to make the
 ones the reference values in `tests/golden/` were computed with.
 `uv run tools/test_all_models.py` checks against every published model.
-
-## Licence
-
-pet-kokkos is BSD 3-Clause, the same as PET and metatrain. The LAMMPS package in
-`lammps/` is GPL-2.0, the same as LAMMPS.
-
-PET is described in [Pozdnyakov & Ceriotti 2023](https://arxiv.org/abs/2305.19302),
-and its reference implementation is
-[metatrain](https://github.com/metatensor/metatrain). pet-kokkos is a separate
-implementation that reads the same checkpoints. It started as part of the
-author's klasp and lammps-pet-kokkos projects.
