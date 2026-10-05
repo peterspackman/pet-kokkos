@@ -12,12 +12,10 @@
 //
 // Each thread holds q and its output accumulator in registers, sized exactly by
 // a compile-time head_dim (16, 32, 48, 64 and 80, the sizes the published models
-// use; anything else takes a generic path sized kMaxHeadDim). The backward holds
-// four such arrays, so from head_dim 48 up it spills to local memory, which is
-// coalesced and still faster than reading the operands in place (a strided
-// access per element).
+// use; anything else takes a generic path sized kMaxHeadDim).
 #include "ops.hpp"
 
+#include <algorithm>
 #include <type_traits>
 
 namespace pet {
@@ -83,103 +81,100 @@ void attention_impl(Workspace& ws, const std::string& key, View2D out, View2D qk
   linear(out, merged, w_out, b_out);
 }
 
-// Three kernels, each owning its output rows, so nothing is atomic:
-//   A, per (atom, head, query): the saved softmax stats plus rowsum(dO * O), and dQ.
-//   B, per (atom, head, key):   dK, dV, and this head's share of the key's cf adjoint.
-//   C, per (atom, key):         those shares summed over heads, in order.
+// The backward in four steps, each owning its outputs, so nothing is atomic:
+//   scores, per (atom, head, query): each key's weight A and score adjoint dS
+//     (pre-scale), into two tables, key-major so that the threads of a warp,
+//     consecutive queries, write consecutive addresses;
+//   dQ, per (atom, head, query, d): sum over keys of dS sc K;
+//   dK, dV, per (atom, head, key, d): sums over queries of dS sc Q and A dO;
+//   cf, per (atom, key): each key's dS, summed over queries then heads.
+// Only the scores step holds per-thread arrays (q and dO); the sums run a
+// thread per output element, reading Q, K and dO along d, coalesced. The tables
+// are built a chunk of atoms at a time, at most kTableBytes.
 template <int HD>
 void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, View2D cf_seq_adj,
                         View2D out_adj, View2D qkv, View2D cf_seq, const WeightRef& w_in,
                         const WeightRef& w_out, int N, int S, int H, int hd, double temperature,
                         Net beta) {
   constexpr int CAP = HD > 0 ? HD : kMaxHeadDim;
+  constexpr std::size_t kTableBytes = std::size_t(128) << 20;
   const int D = H * hd;
   const Net sc = Net(1.0 / (Kokkos::sqrt((double) hd) * temperature));
   Workspace::Scope scope(ws);
   View2D dmerged = ws.tmp(N * S, D);
   linear_bwd(dmerged, out_adj, w_out, 0);
   View2D qkv_adj = ws.tmp(N * S, 3 * D);
-  View2D stats = ws.tmp(N * H * S, 3);  // per query: max, 1/sum, rowsum(dO * O)
-  View2D cfh = ws.tmp(N * S, H);        // per key and head: the cf adjoint's share
+  View2D cfh = ws.tmp(N * S, H);  // per key and head: the cf adjoint's share
   View2D merged = ws.peek2(key + ":merged"), ml = ws.peek2(key + ":ml");
 
-  Kokkos::parallel_for(
-      "attn_bwd_dQ", RangePolicy(0, N * H * S), KOKKOS_LAMBDA(int i) {
-        const int sq = i % S, h = (i / S) % H, n = i / (S * H);
-        const int nd = HD > 0 ? HD : hd;
-        const int row_q = n * S + sq, si = (n * H + h) * S + sq;
-        const int qo = h * hd, ko = D + h * hd, vo = 2 * D + h * hd;
-        const Net m = ml(si, 0), invl = ml(si, 1);
-        if (invl <= Net(0)) {  // padding query: B skips it too
-          for (int d = 0; d < nd; ++d) qkv_adj(row_q, qo + d) = Net(0);
-          stats(si, 0) = stats(si, 1) = stats(si, 2) = Net(0);
-          return;
-        }
-        Net q[CAP], dout[CAP], dq[CAP];
-        Net dot_do_out = Net(0);
-        for (int d = 0; d < nd; ++d) {
-          q[d] = qkv(row_q, qo + d);
-          dout[d] = dmerged(row_q, qo + d);
-          dot_do_out += dout[d] * merged(row_q, qo + d);
-          dq[d] = Net(0);
-        }
-        stats(si, 0) = m, stats(si, 1) = invl, stats(si, 2) = dot_do_out;
-        for (int sk = 0; sk < S; ++sk) {
-          const Net cf = cf_seq(n, sk);
-          if (cf <= Net(0)) continue;
-          const int row_k = n * S + sk;
-          Net dot = Net(0), dA = Net(0);
-          for (int d = 0; d < nd; ++d) {
-            dot += q[d] * qkv(row_k, ko + d);
-            dA += dout[d] * qkv(row_k, vo + d);
-          }
-          const Net A = fast_exp(dot * sc + fast_log(cf) - m) * invl;
-          const Net dscore = A * (dA - dot_do_out);
-          for (int d = 0; d < nd; ++d) dq[d] += dscore * sc * qkv(row_k, ko + d);
-        }
-        for (int d = 0; d < nd; ++d) qkv_adj(row_q, qo + d) = dq[d];
-      });
+  const int chunk = (int) std::max<std::size_t>(1, kTableBytes / (2 * sizeof(Net) * std::size_t(H) * S * S));
+  for (int n0 = 0; n0 < N; n0 += chunk) {
+    const int C = std::min(chunk, N - n0);
+    Workspace::Scope tables(ws);
+    View2D A = ws.tmp(S, C * H * S), dS = ws.tmp(S, C * H * S);  // row key, column (atom, head, query)
 
-  Kokkos::parallel_for(
-      "attn_bwd_dKV", RangePolicy(0, N * H * S), KOKKOS_LAMBDA(int i) {
-        const int sk = i % S, h = (i / S) % H, n = i / (S * H);
-        const int nd = HD > 0 ? HD : hd;
-        const int row_k = n * S + sk;
-        const int qo = h * hd, ko = D + h * hd, vo = 2 * D + h * hd;
-        const Net cf = cf_seq(n, sk);
-        if (cf <= Net(0)) {  // padding key: nothing attends to it
-          for (int d = 0; d < nd; ++d) qkv_adj(row_k, ko + d) = qkv_adj(row_k, vo + d) = Net(0);
-          cfh(row_k, h) = Net(0);
-          return;
-        }
-        const Net logcf = fast_log(cf);
-        Net dk[CAP], dv[CAP], k[CAP], v[CAP];
-        for (int d = 0; d < nd; ++d) {
-          dk[d] = dv[d] = Net(0);
-          k[d] = qkv(row_k, ko + d);
-          v[d] = qkv(row_k, vo + d);
-        }
-        Net cf_acc = Net(0);
-        for (int sq = 0; sq < S; ++sq) {
+    Kokkos::parallel_for(
+        "attn_bwd_scores", RangePolicy(0, C * H * S), KOKKOS_LAMBDA(int i) {
+          const int sq = i % S, h = (i / S) % H, n = n0 + i / (S * H);
+          const int nd = HD > 0 ? HD : hd;
           const int row_q = n * S + sq, si = (n * H + h) * S + sq;
-          const Net m = stats(si, 0), invl = stats(si, 1), dot_do_out = stats(si, 2);
-          if (invl <= Net(0)) continue;
-          Net dot = Net(0), dA = Net(0);
-          for (int d = 0; d < nd; ++d) {
-            dot += qkv(row_q, qo + d) * k[d];
-            dA += dmerged(row_q, qo + d) * v[d];
+          const int qo = h * hd, ko = D + h * hd, vo = 2 * D + h * hd;
+          const Net m = ml(si, 0), invl = ml(si, 1);
+          if (invl <= Net(0)) {  // padding query
+            for (int sk = 0; sk < S; ++sk) A(sk, i) = dS(sk, i) = Net(0);
+            return;
           }
-          const Net A = fast_exp(dot * sc + logcf - m) * invl;
-          const Net dscore = A * (dA - dot_do_out);
+          Net q[CAP], dout[CAP];
+          Net dot_do_out = Net(0);
           for (int d = 0; d < nd; ++d) {
-            dk[d] += dscore * sc * qkv(row_q, qo + d);
-            dv[d] += A * dmerged(row_q, qo + d);
+            q[d] = qkv(row_q, qo + d);
+            dout[d] = dmerged(row_q, qo + d);
+            dot_do_out += dout[d] * merged(row_q, qo + d);
           }
-          cf_acc += dscore;
-        }
-        for (int d = 0; d < nd; ++d) qkv_adj(row_k, ko + d) = dk[d], qkv_adj(row_k, vo + d) = dv[d];
-        cfh(row_k, h) = cf_acc;
-      });
+          for (int sk = 0; sk < S; ++sk) {
+            const Net cf = cf_seq(n, sk);
+            if (cf <= Net(0)) {  // padding key
+              A(sk, i) = dS(sk, i) = Net(0);
+              continue;
+            }
+            const int row_k = n * S + sk;
+            Net dot = Net(0), dA = Net(0);
+            for (int d = 0; d < nd; ++d) {
+              dot += q[d] * qkv(row_k, ko + d);
+              dA += dout[d] * qkv(row_k, vo + d);
+            }
+            const Net a = fast_exp(dot * sc + fast_log(cf) - m) * invl;
+            A(sk, i) = a;
+            dS(sk, i) = a * (dA - dot_do_out);
+          }
+        });
+
+    Kokkos::parallel_for(
+        "attn_bwd_dQ", RangePolicy(0, C * H * S * hd), KOKKOS_LAMBDA(int i) {
+          const int d = i % hd, r = i / hd, sq = r % S, h = (r / S) % H, n = n0 + r / (S * H);
+          const int ko = D + h * hd;
+          Net dq = Net(0);
+          for (int sk = 0; sk < S; ++sk) dq += dS(sk, r) * sc * qkv(n * S + sk, ko + d);
+          qkv_adj(n * S + sq, h * hd + d) = dq;
+        });
+
+    Kokkos::parallel_for(
+        "attn_bwd_dKV", RangePolicy(0, C * H * S * hd), KOKKOS_LAMBDA(int i) {
+          const int d = i % hd, r = i / hd, sk = r % S, h = (r / S) % H, nl = r / (S * H), n = n0 + nl;
+          const int qo = h * hd, row_k = n * S + sk;
+          Net dk = Net(0), dv = Net(0), cf_acc = Net(0);
+          for (int sq = 0; sq < S; ++sq) {
+            const int t = (nl * H + h) * S + sq, row_q = n * S + sq;
+            const Net s = dS(sk, t);
+            dk += s * sc * qkv(row_q, qo + d);
+            dv += A(sk, t) * dmerged(row_q, qo + d);
+            cf_acc += s;
+          }
+          qkv_adj(row_k, D + h * hd + d) = dk;
+          qkv_adj(row_k, 2 * D + h * hd + d) = dv;
+          if (d == 0) cfh(row_k, h) = cf_acc;
+        });
+  }
 
   Kokkos::parallel_for(
       "attn_bwd_cf", RangePolicy(0, N * S), KOKKOS_LAMBDA(int i) {
