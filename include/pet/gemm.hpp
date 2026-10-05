@@ -19,6 +19,9 @@
 #include <cublas_v2.h>
 #elif defined(KOKKOS_ENABLE_HIP)
 #include <rocblas/rocblas.h>
+#if defined(PET_HAVE_HIPBLASLT)
+#include <hipblaslt/hipblaslt.h>
+#endif
 #endif
 
 namespace pet {
@@ -171,6 +174,53 @@ inline bool lt_gemm_bias(bool, bool, int, int, int, double, const double*, int, 
                          double, double*, int, const double*) {
   return false;
 }
+#elif defined(KOKKOS_ENABLE_HIP) && defined(PET_HAVE_HIPBLASLT)
+// The same through hipBLASLt. False where it has no kernel for the shape (its
+// fp32 coverage varies by GPU), and the caller runs rocBLAS and a bias pass.
+inline bool lt_gemm_bias(bool ta, bool tb, int m, int n, int k, float alpha, const float* A,
+                         int lda, const float* B, int ldb, float beta, float* C, int ldc,
+                         const float* bias) {
+  struct Plan {
+    hipblasLtMatmulDesc_t op{};
+    hipblasLtMatrixLayout_t a{}, b{}, c{};
+    hipblasLtMatmulAlgo_t algo{};
+    bool ok = false;
+  };
+  constexpr std::size_t kWs = 32u << 20;
+  static hipblasLtHandle_t lt = [] { hipblasLtHandle_t h; hipblasLtCreate(&h); return h; }();
+  static void* ws = [] { void* p = nullptr; (void) hipMalloc(&p, kWs); return p; }();
+  static auto* plans = new std::map<std::tuple<bool, bool, int, int, int, int, int, int>, Plan>;
+  auto [it, fresh] = plans->try_emplace({ta, tb, m, n, k, lda, ldb, ldc});
+  Plan& p = it->second;
+  if (fresh) {
+    const auto opA = ta ? HIPBLAS_OP_T : HIPBLAS_OP_N, opB = tb ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+    const auto epi = HIPBLASLT_EPILOGUE_BIAS;
+    hipblasLtMatmulDescCreate(&p.op, HIPBLAS_COMPUTE_32F, HIP_R_32F);
+    hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof opA);
+    hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof opB);
+    hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof epi);
+    hipblasLtMatrixLayoutCreate(&p.a, HIP_R_32F, ta ? k : m, ta ? m : k, lda);
+    hipblasLtMatrixLayoutCreate(&p.b, HIP_R_32F, tb ? n : k, tb ? k : n, ldb);
+    hipblasLtMatrixLayoutCreate(&p.c, HIP_R_32F, m, n, ldc);
+    hipblasLtMatmulPreference_t pref;
+    hipblasLtMatmulPreferenceCreate(&pref);
+    hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &kWs, sizeof kWs);
+    hipblasLtMatmulHeuristicResult_t r{};
+    int found = 0;
+    hipblasLtMatmulAlgoGetHeuristic(lt, p.op, p.a, p.b, p.c, p.c, pref, 1, &r, &found);
+    hipblasLtMatmulPreferenceDestroy(pref);
+    p.ok = found > 0;
+    if (p.ok) p.algo = r.algo;
+  }
+  if (!p.ok) return false;
+  hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof bias);
+  return hipblasLtMatmul(lt, p.op, &alpha, A, p.a, B, p.b, &beta, C, p.c, C, p.c, &p.algo, ws, kWs,
+                         ExecSpace().hip_stream()) == HIPBLAS_STATUS_SUCCESS;
+}
+inline bool lt_gemm_bias(bool, bool, int, int, int, double, const double*, int, const double*, int,
+                         double, double*, int, const double*) {
+  return false;
+}
 #endif
 
 // The FP8, BF16 and FP16 modes (gemm_lowp.cpp): C = alpha op(A) op(W) + beta C
@@ -199,6 +249,11 @@ inline void gemm(char transA, char transB, Net alpha, const View2D& A, const Vie
               B.data(), ldb, A.data(), lda, beta, C.data(), ldc);
   if (has_bias) add_bias(C, bias);
 #elif defined(KOKKOS_ENABLE_HIP)
+#if defined(PET_HAVE_HIPBLASLT)
+  if (has_bias && lt_gemm_bias(tb, ta, n, m, k, alpha, B.data(), ldb, A.data(), lda, beta,
+                               C.data(), ldc, bias.data()))
+    return;
+#endif
   vendor_gemm(tb ? rocblas_operation_transpose : rocblas_operation_none,
               ta ? rocblas_operation_transpose : rocblas_operation_none, n, m, k, alpha, B.data(),
               ldb, A.data(), lda, beta, C.data(), ldc);
