@@ -99,3 +99,9 @@ cd examples
 lmp -in in.pet -var data diamond_216 -var model pet-mad-s -var elements C -var nsteps 0
 python3 compare.py diamond_216 /path/to/pet-eval pet-mad-s log.lammps
 ```
+
+## Licence
+
+The files in this directory are part of LAMMPS once installed into it, and like
+LAMMPS are distributed under the GNU General Public License, version 2. The
+pet-kokkos library they link against is BSD-3-Clause, which is compatible.
