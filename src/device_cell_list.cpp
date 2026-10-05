@@ -177,7 +177,7 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
   // order. One warp per bin, each lane placing its atoms at their rank: a big
   // cell at a long cutoff has a few bins of hundreds of atoms.
   Kokkos::parallel_for(
-      "cl_sortbins", TeamPolicy(nbins, 1, 32),
+      "cl_sortbins", TeamPolicy(nbins, 1, kLanes),
       KOKKOS_LAMBDA(const TeamPolicy::member_type& t) {
         const int lo = bstart(t.league_rank()), n = bstart(t.league_rank() + 1) - lo;
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, n), [&](int q) {
@@ -198,7 +198,7 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
   IView1D eoff = ws.i1("cl_eoff", Ntot + 1);
   const CellSearch cs{sid, abin, goff, bstart, batom, gnc, gnr, posw, scell, cutoff2};
   Kokkos::parallel_for(
-      "cl_ecount", Teams(Ntot, 1, 32), KOKKOS_LAMBDA(const Team& t) {
+      "cl_ecount", Teams(Ntot, 1, kLanes), KOKKOS_LAMBDA(const Team& t) {
         const int gi = t.league_rank();
         int e = 0;
         cs.visit(gi, [&](int k0, int nk, const int* sh) {
@@ -231,7 +231,7 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
   // and the fill would overrun into the next atom's edges. Checked, not assumed.
   IView1D wrote = ws.i1("cl_wrote", Ntot);
   Kokkos::parallel_for(
-      "cl_efill", Teams(Ntot, 1, 32), KOKKOS_LAMBDA(const Team& t) {
+      "cl_efill", Teams(Ntot, 1, kLanes), KOKKOS_LAMBDA(const Team& t) {
         const int gi = t.league_rank();
         int e = eoff(gi);
         cs.visit(gi, [&](int k0, int nk, const int* sh) {

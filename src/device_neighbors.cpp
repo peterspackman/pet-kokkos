@@ -15,7 +15,6 @@ namespace {
 
 using AtomTeams = TeamPolicy;  // one warp per atom, lanes on its edges
 using Atom = AtomTeams::member_type;
-constexpr int kLanes = 32;
 
 // The solver adaptive cutoff: Newton-bisection for the r where the smoothed
 // neighbour count n_total(r) = sum_j bump(d_j, r) + target (r/rmax)^3 reaches

@@ -150,9 +150,9 @@ On one GCD of an MI250X (Setonix), one evaluation with forces:
 
 | model | 64-atom diamond | 648-atom water | 1728-atom diamond |
 |---|---|---|---|
-| pet-mad-xs | 4.7 ms | 7.3 ms | 16.7 ms |
-| pet-mad-s | 7.0 ms | 37.8 ms (`bf16`: 33.2) | 87.9 ms (`bf16`: 77.3) |
-| pet-mad-m | 29.5 ms | 268 ms (`bf16`: 239) | 587 ms (`bf16`: 526) |
+| pet-mad-xs | 4.5 ms | 7.2 ms | 15.5 ms |
+| pet-mad-s | 5.9 ms | 27.1 ms (`bf16`: 24.1) | 72.4 ms (`bf16`: 66.3) |
+| pet-mad-m | 16.0 ms | 121 ms (`bf16`: 98.6) | 274 ms (`bf16`: 239) |
 
 **Virial convention.** The virial is the symmetric `W = V·σ` in Voigt order
 `[xx, yy, zz, xy, xz, yz]`. A strain-gradient optimizer wants `dE/dε`, whose

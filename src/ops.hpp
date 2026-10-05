@@ -14,7 +14,6 @@
 namespace pet {
 
 using Team = TeamPolicy::member_type;
-constexpr int kLanes = 32;        // vector lanes per team: one warp per row
 constexpr int kMaxHeadDim = 128;  // attention's per-thread arrays
 
 // ---- ops.cpp ----------------------------------------------------------------

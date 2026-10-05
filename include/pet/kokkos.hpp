@@ -25,6 +25,14 @@ using MemSpace = ExecSpace::memory_space;
 // refuses.
 using RangePolicy = Kokkos::RangePolicy<ExecSpace, Kokkos::Experimental::WorkItemProperty::HintLightWeight_t>;
 using TeamPolicy = Kokkos::TeamPolicy<ExecSpace, Kokkos::Experimental::WorkItemProperty::HintLightWeight_t>;
+
+// Vector lanes in a team that works on one row: a warp on NVIDIA, a wavefront on
+// AMD, so the hardware's whole SIMD width works on the row.
+#if defined(KOKKOS_ENABLE_HIP)
+constexpr int kLanes = 64;
+#else
+constexpr int kLanes = 32;
+#endif
 using LR = Kokkos::LayoutRight;
 
 // Precision, chosen at compile time. Net is the network's type (every GEMM and
