@@ -81,6 +81,14 @@ EdgeData concat_edge_data(const std::vector<EdgeData>& parts, std::vector<int>& 
 enum class NeighborBackend { Builtin, Vesin };
 NeighborBackend& neighbor_backend();
 
+// The model's index for atomic number Z (Checkpoint::species_to_index); throws
+// for an element the model does not know.
+int species_index(const std::vector<int>& species_to_index, int Z);
+
+// The radii the grid adaptive cutoff probes: from 0.5 A to the cutoff, spaced a
+// quarter of its taper width.
+std::vector<double> adaptive_probes(const Hypers& h);
+
 namespace detail {
 
 // The smooth cutoff functions, and the bump's derivative in the cutoff radius.

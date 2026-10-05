@@ -330,11 +330,7 @@ DeviceEdgeData build_device_edge_data(const System& sys, const Hypers& h,
   const int N = sys.n_atoms;
   if (N > detail::PET_KEY_ATOM_MAX) throw std::runtime_error("build_device_edge_data: too many atoms for the edge key");
   std::vector<int> sp(N);
-  for (int i = 0; i < N; ++i) {
-    const int Z = sys.atomic_numbers[i];
-    sp[i] = (Z >= 0 && Z < (int) species_to_index.size()) ? species_to_index[Z] : -1;
-    if (sp[i] < 0) throw std::runtime_error("unsupported atomic number in system");
-  }
+  for (int i = 0; i < N; ++i) sp[i] = species_index(species_to_index, sys.atomic_numbers[i]);
   const auto raw = detail::build_raw_edges(sys, h.cutoff);
   const int E = raw.size();
   std::vector<int> i_(E), j_(E), sh(3 * E);
@@ -360,8 +356,7 @@ DeviceEdgeData build_device_edge_data(const System& sys, const Hypers& h,
   up(sh, IView1D(re_shift.data(), 3 * E));
   up(v, RView1D(re_vec.data(), 3 * E));
 
-  std::vector<double> ph;
-  for (double p = 0.5; p < h.cutoff - 1e-12; p += h.cutoff_width_adaptive / 4.0) ph.push_back(p);
+  const std::vector<double> ph = adaptive_probes(h);
   const int P = ph.size();
   RView1D probes("probes", std::max(P, 1));
   up(ph, RView1D(probes.data(), P));

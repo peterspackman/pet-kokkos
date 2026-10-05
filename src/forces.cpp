@@ -16,22 +16,21 @@ namespace pet {
 
 namespace {
 
-constexpr double kPi = 3.14159265358979323846;
 
 // The smooth cutoff factors' derivatives in the distance, in float like the
 // factors themselves (pet/cutoff.hpp).
 KOKKOS_INLINE_FUNCTION double bump_ddist(double d, double rc, double w) {
   const float x = (float) ((d - (rc - w)) / w);
   if (x <= 0.0f || x >= 1.0f) return 0.0;
-  const float si = Kokkos::sin((float) kPi * x);
-  const float t = Kokkos::tanh(Kokkos::cos((float) kPi * x) / si);
-  const float du = (-(float) kPi / (si * si)) / (float) w;
+  const float si = Kokkos::sin((float) detail::PET_PI * x);
+  const float t = Kokkos::tanh(Kokkos::cos((float) detail::PET_PI * x) / si);
+  const float du = (-(float) detail::PET_PI / (si * si)) / (float) w;
   return 0.5 * (1.0 - (double) (t * t)) * (double) du;
 }
 KOKKOS_INLINE_FUNCTION double cosine_ddist(double d, double rc, double w) {
   const float x = (float) ((d - (rc - w)) / w);
   if (x <= 0.0f || x >= 1.0f) return 0.0;
-  return 0.5 * (double) (-(float) kPi * Kokkos::sin((float) kPi * x)) / w;
+  return 0.5 * (double) (-(float) detail::PET_PI * Kokkos::sin((float) detail::PET_PI * x)) / w;
 }
 KOKKOS_INLINE_FUNCTION double cutoff_ddist(double d, double rc, double w, bool bump) {
   return bump ? bump_ddist(d, rc, w) : cosine_ddist(d, rc, w);

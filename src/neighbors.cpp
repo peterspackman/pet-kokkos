@@ -3,13 +3,28 @@
 // the two to agreement.
 #include "pet/neighbors.hpp"
 
+#include "pet/cutoff.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 
 namespace pet {
+
+int species_index(const std::vector<int>& species_to_index, int Z) {
+  const int s = (Z >= 0 && Z < (int) species_to_index.size()) ? species_to_index[Z] : -1;
+  if (s < 0) throw std::runtime_error("pet: unsupported atomic number " + std::to_string(Z));
+  return s;
+}
+
+std::vector<double> adaptive_probes(const Hypers& h) {
+  std::vector<double> p;
+  for (double r = 0.5; r < h.cutoff - 1e-12; r += h.cutoff_width_adaptive / 4.0) p.push_back(r);
+  return p;
+}
 
 namespace detail {
 
@@ -85,9 +100,7 @@ std::vector<RawEdge> build_raw_edges(const System& sys, double cutoff) {
 std::vector<double> adaptive_cutoffs_solver(int N, const Hypers& h, const std::vector<RawEdgeIn>& edges,
                                             std::vector<double>& out_r, std::vector<double>& out_dn) {
   const double rmax = h.cutoff, inv_rmax = 1.0 / rmax, width = h.cutoff_width_adaptive;
-  const double target = h.num_neighbors_adaptive, lo_bound = rmax / 16.0;
-  constexpr int kIters = 10;
-  constexpr double kDnFloor = 1e-6;
+  const double target = h.num_neighbors_adaptive, lo_bound = rmax * PET_SOLVER_MIN_CUTOFF_FACTOR;
   std::vector<std::vector<double>> dist_of(N);  // grouped by centre, in edge order
   for (const auto& e : edges) dist_of[e.center].push_back(e.dist);
 
@@ -103,15 +116,15 @@ std::vector<double> adaptive_cutoffs_solver(int N, const Hypers& h, const std::v
   out_dn.assign(N, 0.0);
   for (int a = 0; a < N; ++a) {
     double r_lo = 0.0, r_hi = rmax, r = 0.5 * rmax, n, dn;
-    for (int it = 0; it < kIters; ++it) {
+    for (int it = 0; it < PET_SOLVER_ITERS; ++it) {
       count(dist_of[a], r, n, dn);
       const double f = n - target;
       if (f <= 0.0) r_lo = r; else r_hi = r;
-      const double r_newton = r - f / std::max(dn, kDnFloor);
+      const double r_newton = r - f / std::max(dn, PET_SOLVER_DN_FLOOR);
       r = (r_newton >= r_lo && r_newton <= r_hi) ? r_newton : 0.5 * (r_lo + r_hi);
     }
     count(dist_of[a], r, n, dn);
-    const double dn_root = std::max(dn, kDnFloor), adapted = r - (n - target) / dn_root;
+    const double dn_root = std::max(dn, PET_SOLVER_DN_FLOOR), adapted = r - (n - target) / dn_root;
     out[a] = std::min(std::max(adapted, lo_bound), rmax);
     out_r[a] = r;
     out_dn[a] = (adapted > lo_bound && adapted < rmax) ? dn_root : 0.0;  // 0: clamped
@@ -124,8 +137,7 @@ std::vector<double> adaptive_cutoffs_solver(int N, const Hypers& h, const std::v
 // neighbour count is to target.
 std::vector<double> adaptive_cutoffs_grid(int N, const Hypers& h, const std::vector<RawEdgeIn>& edges) {
   const double width = h.cutoff_width_adaptive, target = h.num_neighbors_adaptive;
-  std::vector<double> probes;
-  for (double p = 0.5; p < h.cutoff - 1e-12; p += width / 4.0) probes.push_back(p);
+  const std::vector<double> probes = adaptive_probes(h);
   const int P = probes.size();
   if (P == 0) return std::vector<double>(N, h.cutoff);
 
@@ -233,11 +245,7 @@ EdgeData build_edge_data_from_raw(int N, const std::vector<int>& species, const 
 EdgeData build_edge_data(const System& sys, const Hypers& h, const std::vector<int>& species_to_index) {
   const int N = sys.n_atoms;
   std::vector<int> species(N);
-  for (int i = 0; i < N; ++i) {
-    const int Z = sys.atomic_numbers[i];
-    species[i] = (Z >= 0 && Z < (int) species_to_index.size()) ? species_to_index[Z] : -1;
-    if (species[i] < 0) throw std::runtime_error("unsupported atomic number in system");
-  }
+  for (int i = 0; i < N; ++i) species[i] = species_index(species_to_index, sys.atomic_numbers[i]);
   std::vector<RawEdgeIn> edges;
   for (const auto& r : detail::build_raw_edges_dispatch(sys, h.cutoff))
     edges.push_back({r.i, r.j, r.i, r.j, r.sa, r.sb, r.sc, r.vx, r.vy, r.vz, r.dist});

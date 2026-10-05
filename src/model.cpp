@@ -19,10 +19,8 @@ PetModel::PetModel(const Checkpoint& ckpt)
       species_to_index_(ckpt.species_to_index) {
   load_all(ckpt);
 
-  // The adaptive cutoff's probe grid, spaced by its own taper width. The same
-  // grid as neighbors.hpp and device_neighbors.hpp.
-  std::vector<double> p;
-  for (double r = 0.5; r < h_.cutoff - 1e-12; r += h_.cutoff_width_adaptive / 4.0) p.push_back(r);
+  // The adaptive cutoff's probe grid, on the device.
+  const std::vector<double> p = adaptive_probes(h_);
   n_probes_ = (int) p.size();
   probes_ = RView1D("probes", std::max(n_probes_, 1));
   auto hp = Kokkos::create_mirror_view(probes_);

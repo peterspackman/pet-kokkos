@@ -386,10 +386,8 @@ DeviceGeom stage_systems(Workspace& ws, const std::vector<System>& systems,
     for (int e = 0; e < 9; ++e) scell(b, e) = s.cell[e];
     for (int i = 0; i < s.n_atoms; ++i, ++gi) {
       for (int d = 0; d < 3; ++d) pos(gi, d) = s.positions[3 * i + d];
-      const int Z = s.atomic_numbers[i];
       sid(gi) = b;
-      spec(gi) = (Z >= 0 && Z < (int) species_to_index.size()) ? species_to_index[Z] : -1;
-      if (spec(gi) < 0) throw std::runtime_error("pet: unsupported atomic number " + std::to_string(Z));
+      spec(gi) = species_index(species_to_index, s.atomic_numbers[i]);
     }
   }
   Kokkos::deep_copy(g.pos, pos), Kokkos::deep_copy(g.sid, sid), Kokkos::deep_copy(g.spec, spec);
@@ -410,11 +408,7 @@ void EdgeSession::set(const EdgeListView& v, const std::vector<int>& species_to_
   const int N = v.n_atoms, L = N > 0 ? v.offsets[N] : 0;
   if (N > detail::PET_KEY_ATOM_MAX) throw std::runtime_error("pet: too many atoms for the edge key");
   std::vector<int> sp(N);
-  for (int i = 0; i < N; ++i) {
-    const int Z = v.atomic_numbers[i];
-    sp[i] = (Z >= 0 && Z < (int) species_to_index.size()) ? species_to_index[Z] : -1;
-    if (sp[i] < 0) throw std::runtime_error("pet: unsupported atomic number " + std::to_string(Z));
-  }
+  for (int i = 0; i < N; ++i) sp[i] = species_index(species_to_index, v.atomic_numbers[i]);
   // Directed edges grouped by centre: each atom's listed pairs, then the mirrors
   // of the pairs that list it.
   std::vector<int> off(N + 1, 0);

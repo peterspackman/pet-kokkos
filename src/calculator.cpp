@@ -1,4 +1,5 @@
 #include "pet/calculator.hpp"
+#include "pet/cutoff.hpp"
 
 #include "pet/checkpoint.hpp"
 #include "pet/device_geometry.hpp"
@@ -90,7 +91,7 @@ double raw_edges_estimate(const System& s, double rc) {
   const auto& c = s.cell;
   const double vol = std::fabs(c[0] * (c[4] * c[8] - c[5] * c[7]) - c[1] * (c[3] * c[8] - c[5] * c[6]) +
                                c[2] * (c[3] * c[7] - c[4] * c[6]));
-  return vol > 0 ? n * n / vol * (4.0 / 3.0) * M_PI * rc * rc * rc : n * (n - 1);
+  return vol > 0 ? n * n / vol * (4.0 / 3.0) * detail::PET_PI * rc * rc * rc : n * (n - 1);
 }
 
 }  // namespace
