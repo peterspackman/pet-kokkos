@@ -24,8 +24,7 @@ using LR = Kokkos::LayoutRight;
 //   default          Net=float  Real=double   fp32 network, fp64 geometry
 //   PET_KOKKOS_FP32  Net=float  Real=float    all single, fastest
 //   PET_KOKKOS_FP64  Net=double Real=double   all double, a correctness instrument
-//                    (PET_KOKKOS_DOUBLE_NET is a legacy alias)
-#if defined(PET_KOKKOS_FP64) || defined(PET_KOKKOS_DOUBLE_NET)
+#if defined(PET_KOKKOS_FP64)
 using Net = double;
 using Real = double;
 #elif defined(PET_KOKKOS_FP32)

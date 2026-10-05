@@ -2,9 +2,8 @@
 # machine-learning interatomic potentials: energy, conservative forces and the
 # virial, with no libtorch at run time.
 #
-# Unlike the klasp subdirectory this grew out of, this project OWNS its
-# dependencies: Kokkos, nlohmann/json and the warning set are fetched and
-# configured here.
+# Kokkos and nlohmann/json are fetched here unless the consumer already has
+# them.
 cmake_minimum_required(VERSION 3.18)
 
 project(pet_kokkos
@@ -23,8 +22,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Whether we are the top-level project or a consumer's add_subdirectory/CPM
-# dependency. Tests, apps and installation default OFF for a consumer, which is
-# how klasp will take this once the extraction is finished.
+# dependency. Tests, apps and installation default OFF for a consumer.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(PET_IS_TOP_LEVEL ON)
 else()
@@ -39,15 +37,11 @@ endif()
 
 option(PET_BUILD_TESTS   "Build the test suite"            ${PET_IS_TOP_LEVEL})
 option(PET_BUILD_APPS    "Build the command-line tools"    ${PET_IS_TOP_LEVEL})
-option(PET_BUILD_PYTHON  "Build the nanobind Python module" OFF)
-option(PET_INSTALL       "Generate install/export targets" ${PET_IS_TOP_LEVEL})
-option(PET_BUILD_METATOMIC_PLUGIN
-       "Build the metatomic backend plugin (prototype; needs metatensor + metatomic)" OFF)
+option(PET_INSTALL       "Install the library and headers"  ${PET_IS_TOP_LEVEL})
 
 # Optional vesin backend for the host neighbour search. The built-in search is an
-# O(N^2 x images) brute force, which is fine for small cells and dominates
-# everything else for large ones -- 95% of the runtime on a 1728-atom supercell.
-# vesin's cell list does the same work in O(N).
+# O(N^2 x images) brute force, fine for small cells and the dominant cost for
+# large ones; vesin's cell list does the same work in O(N).
 #
 # AUTO uses it when it can be found (the `vesin` Python wheel ships the header
 # and the library, so a venv counts) and silently does without otherwise; ON
@@ -60,9 +54,9 @@ set_property(CACHE PET_WITH_CUTLASS PROPERTY STRINGS AUTO ON OFF)
 # Tune for the building machine's CPU. A real win on the host kernels, but it
 # bakes THIS machine's instruction set into the objects: turn it off when the
 # build host and the run host may differ, or when objects are cached and reused
-# elsewhere (ccache hashes the literal "-march=native", not its expansion, and
-# will happily reuse an object on a CPU that cannot run it). Never for CUDA --
-# nvcc does not accept the flag.
+# elsewhere (ccache hashes the literal "-march=native", not its expansion, so it
+# can reuse an object on a CPU that cannot run it). Never for CUDA: nvcc does
+# not accept the flag.
 option(PET_ARCH_NATIVE "Optimize for the building machine's CPU (-march=native)" ON)
 
 set(PET_BACKEND "serial" CACHE STRING "Kokkos backend: serial, openmp, cuda, hip")
@@ -115,9 +109,9 @@ include(${CMAKE_BINARY_DIR}/cmake/CPM.cmake)
 # find_package(Kokkos) or reads Kokkos_ENABLE_* cannot see them. Set every flag
 # as a FORCE'd cache var up front so Kokkos and any downstream consumer agree.
 #
-# Only fetch when the consumer has not already provided Kokkos: klasp (and any
-# other Kokkos application) owns one already, and two Kokkos configurations in
-# one build tree do not end well.
+# Only fetch when the consumer has not already provided Kokkos: a Kokkos
+# application owns one already, and two Kokkos configurations cannot share a
+# build tree.
 if(NOT TARGET Kokkos::kokkos)
     set(Kokkos_ENABLE_SERIAL ON  CACHE BOOL "" FORCE)
     set(Kokkos_ENABLE_OPENMP OFF CACHE BOOL "" FORCE)
@@ -225,10 +219,6 @@ if(PET_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-if(PET_BUILD_METATOMIC_PLUGIN)
-    add_subdirectory(plugins/metatomic)
-endif()
-
 # --- summary -----------------------------------------------------------------
 
 message(STATUS "pet-kokkos ${PROJECT_VERSION}")
@@ -237,3 +227,4 @@ message(STATUS "  precision  : ${PET_PRECISION}")
 message(STATUS "  build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  tests      : ${PET_BUILD_TESTS}   apps: ${PET_BUILD_APPS}")
 message(STATUS "  vesin      : ${PET_HAVE_VESIN}")
+message(STATUS "  cutlass    : ${PET_HAVE_CUTLASS}")

@@ -10,7 +10,13 @@
 #   checkpoint.cpp   the model JSON and safetensors weights
 #   neighbors.cpp    the host neighbour list and adaptive cutoff
 #   device_neighbors.cpp  the same on the device
+#   device_geometry.cpp   staged batches, the device search, the Verlet cache
+#   device_cell_list.cpp  the device cell list
+#   vesin_neighbors.cpp   the host search through vesin
+#   calculator.cpp   the public entry point
+#   io/extxyz.cpp    extended XYZ
 #   fused_gemm.cpp   GEMMs with their elementwise neighbours fused (CUTLASS)
+#   ozaki.cpp        fp64-accurate GEMMs on integer tensor cores
 
 add_library(pet_kokkos STATIC
     model.cpp
@@ -89,14 +95,15 @@ endif()
 # In-tree model directory, the last entry in the runtime model search path.
 # Weights are never committed (see README.md); this only lets a developer drop a
 # <name>.json / <name>.safetensors pair into models/ and have it found.
-target_compile_definitions(pet_kokkos PUBLIC
+target_compile_definitions(pet_kokkos PRIVATE
     PET_KOKKOS_MODEL_DIR="${PROJECT_SOURCE_DIR}/models")
 
 # --- install -----------------------------------------------------------------
+# The library and its headers only: no CMake package config, since the fetched
+# dependencies are not installed with it. Consumers take this as a subproject.
 if(PET_INSTALL)
     include(GNUInstallDirs)
-    install(TARGETS pet_kokkos pet_warnings
-            EXPORT pet-kokkos-targets
+    install(TARGETS pet_kokkos
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
     install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/pet

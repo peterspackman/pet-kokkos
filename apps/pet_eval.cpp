@@ -128,6 +128,8 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.report_memory = true;
     } else if (s == "--repeat") {
       a.repeat = std::max(1, std::atoi(next("--repeat").c_str()));
+    } else if (s.rfind("--kokkos-", 0) == 0) {
+      continue;  // Kokkos::initialize's own
     } else if (!s.empty() && s[0] == '-') {
       std::fprintf(stderr, "pet-eval: unknown option '%s' (try --help)\n", s.c_str());
       rc = 2;
@@ -383,8 +385,8 @@ int run(const Args& a) {
   if (a.report_memory) {
     const std::size_t pool = calc.workspace_bytes();
     std::printf("\ndevice scratch pool: %.2f GiB\n", double(pool) / (1024.0 * 1024.0 * 1024.0));
-    // Grouped by label with the layer numbers collapsed ("emlpb_*_*"), so one
-    // buffer per layer shows as one row with a count.
+    // Grouped by label with the numbers collapsed ("ck_node_*"), so one buffer
+    // per layer shows as one row with a count.
     const auto rows = calc.workspace_breakdown();
     std::map<std::string, std::pair<std::size_t, int>> fam;
     for (const auto& [label, bytes] : rows) {

@@ -9,8 +9,7 @@
 
 #include <cstdlib>
 
-#if defined(PET_HAVE_CUTLASS) && defined(KOKKOS_ENABLE_CUDA) && !defined(PET_KOKKOS_FP64) && \
-    !defined(PET_KOKKOS_DOUBLE_NET)
+#if defined(PET_HAVE_CUTLASS) && defined(KOKKOS_ENABLE_CUDA) && !defined(PET_KOKKOS_FP64)
 #define PET_FUSED 1
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/threadblock/default_mma.h>

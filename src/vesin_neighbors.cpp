@@ -1,3 +1,4 @@
+// The host neighbour search through vesin: see vesin_neighbors.hpp.
 #include "pet/vesin_neighbors.hpp"
 
 #include "pet/calculator.hpp"

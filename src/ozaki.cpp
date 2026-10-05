@@ -1,3 +1,4 @@
+// fp64-accurate GEMMs on integer tensor cores: see ozaki.hpp.
 #include "pet/ozaki.hpp"
 
 #include "pet/gemm.hpp"
@@ -208,8 +209,6 @@ Workspace& ozaki_ws() {
   return *ws;
 }
 }  // namespace
-
-std::size_t ozaki_workspace_bytes() { return ozaki_ws().capacity_bytes(); }
 
 #if defined(KOKKOS_ENABLE_CUDA)
 namespace {

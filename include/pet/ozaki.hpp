@@ -86,6 +86,5 @@ void gemm_ozaki(char transA, char transB, Net alpha, const View2D& A, const View
                 const View2D& C, const OzakiSplit* bsplit, const View1D& bias = {});
 
 // Bytes that pool holds.
-std::size_t ozaki_workspace_bytes();
 
 }  // namespace pet

@@ -67,7 +67,7 @@ TEST_CASE("goldens reproduce the reference energy, forces and stress", "[model][
         }
 
         // Stress = W / V. The reference is symmetrized first: autograd's
-        // antisymmetric part is noise, and once dominated the deviation.
+        // antisymmetric part is noise, and large enough to dominate.
         if (g.stress && g.volume > 0.0) {
           REQUIRE(r.virial.size() == 6);
           constexpr int vi[6][2] = {{0, 0}, {1, 1}, {2, 2}, {0, 1}, {0, 2}, {1, 2}};
@@ -170,7 +170,7 @@ TEST_CASE("adaptive_cutoff_method is read, defaulted and validated", "[model][go
 
 TEST_CASE("charge and spin change a conditioned model's answer", "[model][golden]") {
   // A conditioned model must give different energies for different charge and
-  // spin: loaded-but-unwired conditioning once went unnoticed. Runs only where
+  // spin, which conditioning loaded but not applied would not. Runs only where
   // such a model (pet-omol-s) is installed.
   const auto found = find_model("pet-omol-s");
   if (!found) {

@@ -3,8 +3,8 @@
 //   host vs device neighbour lists   same edges and order, fp32 noise
 //   fresh Verlet cache vs uncached   same edges, double round-off
 //   reused cache vs uncached         unwrapped vs wrapped images, fp32 noise
-// The fresh-cache bound is the one a dropped edge cannot pass: the cache once
-// lost edges within 0.1 A of the cutoff, an energy error below the force noise.
+// The fresh-cache bound is tight enough that dropping an edge near the cutoff
+// fails it, an error the force tolerance alone would miss.
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>

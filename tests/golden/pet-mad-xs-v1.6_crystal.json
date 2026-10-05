@@ -2,7 +2,7 @@
   "model": "pet-mad-xs-v1.6",
   "variant": null,
   "case": "crystal",
-  "description": "Golden reference for metatrain PET model 'pet-mad-s-solver', case 'crystal'. Energy in eV, positions in Angstrom, forces in eV/Angstrom. Total energy INCLUDES composition energies and the output scaler.",
+  "description": "Golden reference for metatrain PET model 'pet-mad-xs-v1.6', case 'crystal'. Energy in eV, positions in Angstrom, forces in eV/Angstrom. Total energy INCLUDES composition energies and the output scaler.",
   "evaluation_path": "metatrain.utils.io.load_model(ckpt).export() -> metatomic AtomisticModel; MetatomicCalculator(model, variants={'energy': 'None'}).compute_energy(atoms, compute_forces_and_stresses=True, per_atom=True)",
   "units": {
     "energy": "eV",

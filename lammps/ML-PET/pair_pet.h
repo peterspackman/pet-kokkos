@@ -32,9 +32,10 @@ class Calculator;
 namespace LAMMPS_NS {
 
 // PET machine-learning potentials through pet-kokkos, on LAMMPS's own neighbour
-// list: handed over when LAMMPS rebuilds it, positions every step. Two ways to
-// give it the atoms (see pair_pet.cpp): periodic images of the owned atoms, or
-// ghosts. pet/kk (KOKKOS package) keeps every step on the device.
+// list: handed over when LAMMPS rebuilds it, positions every step. Three ways to
+// give it the atoms (see pair_pet.cpp): periodic images of the owned atoms,
+// ghosts one cutoff deep with rows exchanged between ranks, or a deep ghost
+// shell. pet/kk (KOKKOS package) keeps every step on the device.
 class PairPET : public Pair {
  public:
   PairPET(class LAMMPS *);

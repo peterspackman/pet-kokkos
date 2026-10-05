@@ -6,6 +6,10 @@
    This software is distributed under the GNU General Public License.
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   Contributing author: Peter Spackman
+------------------------------------------------------------------------- */
+
 #include "pair_pet_kokkos.h"
 
 #include "atom_kokkos.h"

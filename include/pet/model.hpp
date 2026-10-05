@@ -72,6 +72,9 @@ struct DeviceEdgeData {
   // raw_off/raw_reverse that backward falls back to atomics.
   IView1D raw_center, raw_neigh;  // [E]
   RView1D raw_dist;               // [E]
+  RView2D raw_vec;                // [E, 3]
+  IView1D raw_off;                // [N+1]
+  IView1D raw_reverse;            // [E]
   IView1D raw_slot;               // [E] the kept edge's slot n*M + m, -1 if dropped
   // Raw edges with no partner -- into a ghost the engine listed no neighbours
   // for -- by target atom: orphan_edge[orphan_off(a), orphan_off(a+1)) point at a.
@@ -80,9 +83,6 @@ struct DeviceEdgeData {
   // edge to a ghost, in the engine's order, as a raw index.
   Exchange* exchange = nullptr;
   IView1D remote_raw;  // [n_remote]
-  RView2D raw_vec;                // [E, 3]
-  IView1D raw_off;                // [N+1]
-  IView1D raw_reverse;            // [E]
 
   // What the adaptive cutoff's forward computed, kept for its backward. Grid:
   // adapt_eff, the smoothed neighbour counts [N, P] (optional; recomputed if
@@ -224,8 +224,6 @@ class PetModel {
   std::vector<std::pair<std::string, std::size_t>> workspace_breakdown() const {
     return ws_.capacity_breakdown();
   }
-  int last_n_atoms() const { return last_n_atoms_; }
-  int last_max_neighbors() const { return last_max_neighbors_; }
   long peak_edge_slots() const { return peak_edge_slots_; }
   int peak_max_neighbors() const { return peak_max_neighbors_; }
 
@@ -289,8 +287,6 @@ class PetModel {
   bool graphs_ = true;
   GraphCache<DeviceOut> graph_;
 
-  int last_n_atoms_ = 0;
-  int last_max_neighbors_ = 0;
   long peak_edge_slots_ = 0;
   int peak_max_neighbors_ = 0;
 };

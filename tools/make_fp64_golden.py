@@ -8,8 +8,8 @@ ulp is 1.2e-4 eV per atom, ~1e-3 eV on the total. That is the floor the C++ is
 being measured against, and it is ~100x coarser than for pet-mad-xs purely because
 pet-mad-xs energies are ~100x smaller.
 
-Output uses the same schema as tools/make_golden.py so tests/pet_smoke.cpp can
-consume it unchanged.
+Output uses the same schema as tools/make_golden.py, so the golden tests read it
+unchanged.
 """
 import argparse, json, warnings
 import numpy as np
@@ -38,7 +38,7 @@ def main():
     pet = load_model(args.ckpt).to(getattr(torch, args.dtype))
     kw = {"variants": {"energy": args.variant}} if args.variant else {}
     calc = MetatomicCalculator(pet.export(), device="cpu", **kw)
-    res = calc.compute_energy(atoms, compute_forces_and_stresses=g["periodic"] or True,
+    res = calc.compute_energy(atoms, compute_forces_and_stresses=True,
                               per_atom=True)
 
     out = dict(g)  # keep geometry/metadata

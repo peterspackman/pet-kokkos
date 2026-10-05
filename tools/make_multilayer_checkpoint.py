@@ -11,24 +11,17 @@
 # ///
 """Build a `num_attention_layers > 1` PET checkpoint from a single-layer one.
 
-Every PET model published on `lab-cosmo/upet` today uses
-`num_attention_layers == 1` -- the larger ones add GNN layers instead. metatrain's
-own default is 2, so a locally trained model can easily have more, and the
-multi-block transformer stack in `PetModel::compute` therefore has to work
-without any published model to check it against.
-
-This makes one. metatrain rebuilds the network from `model_hypers`, so raising
+A small model with several attention layers, for the goldens: the published
+models that have them are large. metatrain rebuilds the network from
+`model_hypers`, so raising
 `num_attention_layers` produces a genuine A-block Transformer, and copying block
 0's weights into the new blocks gives it valid parameters. The result is a real
 metatrain model: it loads, evaluates through metatrain's own code path, and can
 therefore be used as a REFERENCE rather than a self-comparison.
 
-The duplicated weights make the blocks identical to each other, which is fine --
-the point is that A blocks run in sequence, and a stack of identical blocks is
-not an identity map (the outputs differ from A=1 by ~30 eV on the 8-atom test
-crystal). What it does not cover is per-block weight indexing, so a bug that
-read block 0's weights for every block would pass; `--distinct` perturbs each
-copy to close that hole.
+Identical blocks still exercise the stack, since A identical blocks in sequence
+are not one block, but not per-block weight indexing: `--distinct` perturbs each
+copy so that reading block 0's weights for every block would fail.
 
     uv run tools/make_multilayer_checkpoint.py pet-mad-xs out.ckpt --layers 2
     uv run tools/convert_pet.py --ckpt out.ckpt --out models/pet-a2
@@ -95,11 +88,9 @@ def main():
     hypers["num_attention_layers"] = args.layers
 
     total = 0
-    # Both the inner model and the outer wrapper keep a state dict; leaving one
-    # behind means load_model reads the stale single-block copy. `inner is ck`
-    # when the checkpoint has no wrapper, hence the identity check rather than
-    # visiting both unconditionally -- duplicate_blocks is idempotent, but
-    # running it twice would report the count twice and read oddly.
+    # Both the inner model and the outer wrapper keep a state dict, and
+    # load_model would read a stale single-block copy; without a wrapper they
+    # are the same object.
     holders = [inner] if inner is ck else [inner, ck]
     for obj in holders:
         for key in ("model_state_dict", "best_model_state_dict"):

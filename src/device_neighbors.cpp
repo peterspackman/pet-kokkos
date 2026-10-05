@@ -289,8 +289,8 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
   Kokkos::parallel_for(
       "pet_scatter", AtomTeams(NC, 1, kLanes), KOKKOS_LAMBDA(const Atom& t) {
         const int i = t.league_rank(), e0 = roff(i);
-        // A zero-based range, offset by hand: Kokkos 5.0.2's CUDA vector scan
-        // ignores a ThreadVectorRange's begin and walks [0, end).
+        // A zero-based range, offset by hand: the CUDA vector scan of some Kokkos
+        // releases (5.0.x) ignores a ThreadVectorRange's begin.
         Kokkos::parallel_scan(Kokkos::ThreadVectorRange(t, roff(i + 1) - e0), [&](int q, int& s, bool final) {
           const int e = e0 + q;
           if (final && keep(e) && s < M) {

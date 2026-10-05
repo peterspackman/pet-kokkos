@@ -28,8 +28,7 @@
       "inherits": "base",
       "displayName": "CUDA (NVIDIA)",
       "cacheVariables": {
-        "PET_BACKEND": "cuda",
-        "CMAKE_CXX_COMPILER": "${sourceDir}/build-cuda/_deps/kokkos-src/bin/nvcc_wrapper"
+        "PET_BACKEND": "cuda"
       }
     },
     {

@@ -567,8 +567,6 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
                                RView2D* dev_edge_grad) {
   const int N = dev.n_atoms, NS = dev.n_struct;
   const bool grad = host_forces || dev_forces;
-  last_n_atoms_ = N;
-  last_max_neighbors_ = dev.max_neighbors;
   peak_max_neighbors_ = std::max(peak_max_neighbors_, dev.max_neighbors);
   peak_edge_slots_ = std::max(peak_edge_slots_, (long) N * std::max(1, dev.max_neighbors));
 

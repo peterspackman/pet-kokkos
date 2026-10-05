@@ -106,8 +106,8 @@ TEST_CASE("a batch gives each structure the same answer as evaluating it alone",
 
 TEST_CASE("a reused Calculator gives the same batched answer every time",
           "[model][determinism]") {
-  // Repeated evaluation, with and without forces, must not move: a counter left
-  // unzeroed between calls once put every atom of the second call in structure 0.
+  // Repeated evaluation, with and without forces, must not move: state carried
+  // between calls (an unzeroed counter, say) shows up here.
   for (const auto& model : golden_models()) {
     const auto found = find_model(model);
     if (!found) continue;

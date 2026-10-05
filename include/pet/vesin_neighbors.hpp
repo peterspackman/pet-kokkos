@@ -1,5 +1,5 @@
 // The host neighbour search through vesin's cell list (PET_WITH_VESIN), in place
-// of the built-in O(N^2) one: on a 1728-atom cell 14 ms against 450 ms.
+// of the built-in O(N^2 x images) one.
 #pragma once
 
 #ifdef PET_HAVE_VESIN

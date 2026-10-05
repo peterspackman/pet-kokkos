@@ -1,19 +1,19 @@
 # pet-kokkos
 
-Pure C++/Kokkos evaluation of **PET** (Point Edge Transformer) machine-learning
-interatomic potentials: energy, conservative forces and the virial, with **no
-libtorch at run time**. One source tree runs on CPU (serial or OpenMP), NVIDIA
-(CUDA) and AMD (HIP).
+C++/Kokkos evaluation of **PET** (Point Edge Transformer) machine-learning
+interatomic potentials — the [upet](https://github.com/lab-cosmo/upet) /
+PET-MAD family — with energies, analytic forces and the virial, and **no
+libtorch at run time**. One source tree runs on CPUs (serial, OpenMP), NVIDIA
+GPUs (CUDA) and AMD GPUs (HIP).
 
-> **Pre-alpha.** The API will change. See [PLAN.md](PLAN.md) for where this is
-> going.
+> **Pre-release.** The API may still change.
 
 ```bash
-pet-eval pet-mad-xs structure.xyz --forces
-# frame 0: N=8  E = -77.0418057655 eV  (-9.6302257207 eV/atom)
-#   max|F| = 1.58410661e-02 eV/A
+pet-eval pet-mad-xs diamond.xyz --forces
+# frame 0: N=8  E = -77.1825019678 eV  (-9.6478127460 eV/atom)
+#   max|F| = 1.21209333e-02 eV/A
 #   stress (eV/A^3):
-#      1.08528671e-02   2.01368111e-03  -1.55941820e-03
+#      1.71035128e-02  -2.06989277e-03   1.27728266e-03
 #      ...
 ```
 
@@ -22,256 +22,133 @@ pet-eval pet-mad-xs structure.xyz --forces
 
 Kokkos::initialize(argc, argv);
 {
-    pet::Calculator calc("pet-mad-xs");
-    pet::System water;
-    water.n_atoms = 3;
-    water.atomic_numbers = {8, 1, 1};
-    water.positions = {0, 0, 0.11926, 0, 0.76323, -0.47704, 0, -0.76323, -0.47704};
-
-    pet::Results r = calc.compute(water);
-    // r.energy[0] == -15.2855578467 eV;  r.forces is [N*3] eV/Angstrom
+  pet::Calculator calc("pet-mad-xs");
+  pet::System water;
+  water.n_atoms = 3;
+  water.atomic_numbers = {8, 1, 1};
+  water.positions = {0, 0, 0.11926, 0, 0.76323, -0.47704, 0, -0.76323, -0.47704};
+  pet::Results r = calc.compute(water);  // r.energy[0] in eV, r.forces [N*3] in eV/A
 }
 Kokkos::finalize();
 ```
 
-## Why
+## What it does
 
-PET is a non-equivariant transformer over per-atom neighbour environments. It
-has no spherical harmonics, no Clebsch–Gordan products and no irreps: the
-geometry enters through a single `Linear(4 -> d_pet)` on
-`[edge_vector(xyz), distance]`, and everything after that is dense transformer
-math — QKV attention and MLPs. That is what makes a portable Kokkos
-implementation practical, and what this is.
+- **Every published upet model.** All 20 checkpoints on `lab-cosmo/upet` agree
+  with upstream's own evaluation (metatomic) to ~1e-7 relative in energy and
+  ~1e-5 eV/Å in forces: both featurizers, 1–3 attention layers, both adaptive
+  cutoff schemes, charge/spin conditioning. `tools/test_all_models.py` checks it.
+- **Fast.** Against upet 0.3.0 on PyTorch, one evaluation with forces,
+  neighbour list included, on an RTX 4080 SUPER:
 
-The reference implementation is Python on PyTorch
-([`lab-cosmo/upet`](https://github.com/lab-cosmo/upet),
-[`metatensor/metatrain`](https://github.com/metatensor/metatrain)), and their
-LAMMPS integration calls a TorchScript model through libtorch. This evaluates
-the network directly against safetensors weights, with a hand-written analytic
-backward. The two share an architecture and a weight format, not an
-implementation.
+  | model | 64-atom diamond | 648-atom water | 1728-atom diamond |
+  |---|---|---|---|
+  | pet-mad-xs | 3.1 ms (9.1×) | 7.5 ms (4.1×) | 18.4 ms (3.1×) |
+  | pet-mad-s | 4.9 ms (8.5×) | 27.7 ms (2.2×) | 63.6 ms (1.9×) |
+  | pet-omat-l | 23.6 ms (1.7×) | 206 ms (1.6×) | |
 
-What you get for that:
-
-- **No libtorch**, anywhere, at run time. The dependencies are Kokkos and
-  nlohmann/json, both fetched at configure time.
-- **Determinism.** A PET evaluation here is bit-exactly reproducible run to run,
-  on CPU and on GPU. See below — it is not free, and it is not an accident.
-- **Batching.** Many small structures evaluate in one pass, so a GPU is as busy
-  on a thousand 8-atom cells as on one big one.
-- **A device-resident path.** Positions in, forces out, without the geometry
-  ever crossing the bus — which is what a relaxer or an MD driver actually wants.
+- **Batches.** Many structures evaluate in one pass; each gets the answer it
+  would get alone.
+- **MD engines.** An engine can hand over its own neighbour list once per
+  rebuild and step positions on the device, getting forces, per-atom energies,
+  per-atom virials and per-edge gradients back (`set_neighbors`,
+  `compute_step`, `compute_edges`). [`lammps/`](lammps/README.md) is a LAMMPS
+  package built on it: `pair_style pet` and `pet/kk`, across MPI ranks with
+  GPU-aware MPI.
+- **Deterministic.** Repeated evaluations are bit-identical, on CPU and GPU.
 
 ## Building
 
-Needs CMake ≥ 3.18 and a C++20 compiler. Kokkos, nlohmann/json and Catch2 are
-fetched automatically.
+CMake ≥ 3.18 and a C++20 compiler (C++17 when building against Kokkos 4).
+Kokkos 5, nlohmann/json and Catch2 are fetched at configure time.
 
 ```bash
 cmake --preset serial && cmake --build build-serial -j
 ctest --preset serial
 ```
 
-Other backends:
-
 ```bash
 cmake --preset openmp && cmake --build build-openmp -j
-cmake --preset cuda   && cmake --build build-cuda   -j   # needs nvcc on PATH
+cmake --preset cuda   && cmake --build build-cuda   -j   # nvcc on PATH
 cmake --preset hip    && cmake --build build-hip    -j
 ```
 
-For CUDA you may also want your architecture, e.g. `-DKokkos_ARCH_ADA89=ON` for
-an RTX 40-series card. The `cuda` preset points `CMAKE_CXX_COMPILER` at Kokkos'
-`nvcc_wrapper`; on a first configure that file does not exist yet, so configure
-once with the `serial` preset (which fetches Kokkos) or pass an explicit path.
-
-### Options
+For CUDA, set your architecture, e.g. `-DKokkos_ARCH_ADA89=ON` for an RTX 40
+series card. The `cuda` preset uses Kokkos' `nvcc_wrapper` as the compiler, which
+exists only once Kokkos has been fetched: configure once with the `serial`
+preset first, or pass the compiler explicitly.
 
 | option | default | |
 |---|---|---|
-| `PET_BACKEND` | `serial` | `serial` \| `openmp` \| `cuda` \| `hip` |
-| `PET_PRECISION` | `mixed` | `mixed` \| `fp32` \| `fp64` — see below |
-| `PET_BUILD_TESTS` | on if top-level | |
-| `PET_BUILD_APPS` | on if top-level | the `pet-eval` CLI |
-| `PET_ARCH_NATIVE` | `ON` | `-march=native`; turn off if build and run hosts differ |
-| `PET_WITH_VESIN` | `AUTO` | use [vesin](https://github.com/Luthaf/vesin) for the host neighbour list — see below |
+| `PET_BACKEND` | `serial` | `serial`, `openmp`, `cuda`, `hip`; taken from an existing `Kokkos::kokkos` target if there is one |
+| `PET_PRECISION` | `mixed` | `mixed`, `fp32`, `fp64` (below) |
+| `PET_WITH_CUTLASS` | `AUTO` | fused GEMM kernels on CUTLASS, CUDA only |
+| `PET_WITH_VESIN` | `AUTO` | [vesin](https://github.com/Luthaf/vesin) for the host neighbour search |
+| `PET_ARCH_NATIVE` | `ON` | `-march=native`; turn off when build and run hosts differ |
+| `PET_BUILD_TESTS`, `PET_BUILD_APPS` | on when top-level | |
 
-### Neighbour lists
-
-The built-in periodic search is O(N² × images) brute force: fine for small
-cells, and about half the runtime of a 1728-atom supercell evaluation. Building
-with [vesin](https://github.com/Luthaf/vesin) — the neighbour-list library from
-the same ecosystem as metatrain and metatomic — replaces it with an O(N) cell
-list:
-
-| 1728-atom diamond, 7.5 Å cutoff, CUDA | built-in | vesin |
-|---|---|---|
-| pet-mad-xs | 0.441 s | **0.232 s** |
-| pet-mad-s | 0.548 s | **0.341 s** |
-
-`AUTO` uses it when it can be found and does without otherwise. The `vesin`
-Python wheel ships the header and the library, so a venv counts:
-
-```bash
-uv pip install vesin
-cmake --preset serial      # finds it automatically
-```
-
-The two searches find **exactly the same set of edges** — that's a test, not an
-assumption — but in a different order, so results differ in the last bits, the
-same way the host and device builders already do. `PET_NEIGHBORS=builtin` (or
-`Options::neighbors`) forces the built-in one, which is how that agreement gets
-checked; `pet-eval --json` reports which is in use.
-
-This covers the **host** path. The device-resident path has its own cell list,
-below.
-
-Cumulatively, a 1728-atom evaluation with forces went from ~0.44 s to ~0.165 s
-(2.7x): the vesin cell list replacing the brute-force search, then bounding the
-reverse-edge map's scan, which was quadratic by accident and was the largest
-single host cost once the search stopped being.
-
-### Device neighbour search
-
-`build_nef_device` — the path a relaxer or MD driver uses, where geometry never
-leaves the GPU — has its own O(N) cell list, with no external dependency.
-`PET_DEVICE_SEARCH=auto|cells|brute`; `auto` uses it above 256 atoms, below
-which building a grid costs more than the search it replaces.
-
-| atoms (device batch, energy only) | brute | cells | |
-|---|---|---|---|
-| 3 456 | 0.039 s | 0.022 s | 1.8× |
-| 8 192 | 0.091 s | 0.042 s | 2.2× |
-| 16 000 | 0.261 s | 0.078 s | 3.4× |
-| 27 648 | 0.598 s | 0.130 s | **4.6×** |
-
-With forces it is a flatter ~1.45×, because the backward then dominates rather
-than the search. The growing ratio is the O(N²)→O(N) crossover.
-
-Bins are sorted by atom index after binning, so the neighbour order — and hence
-the energy's last bits — is reproducible; an atomic fill alone would make it
-thread-arrival order. `PET_DEVICE_SEARCH=brute` is how the two are checked
-against each other.
-
-As a dependency (`add_subdirectory`, CPM, FetchContent) tests and apps default
-off, and an existing `Kokkos::kokkos` target is reused rather than a second
-Kokkos being fetched.
+As a dependency (`add_subdirectory`, CPM, FetchContent) the tests and apps
+default off and an existing `Kokkos::kokkos` target is used.
 
 ## Models
 
-**Model weights are not in this repository, and must never be committed** — some
+**Model weights are not in this repository and must never be committed**: some
 checkpoints are distributed under terms that do not permit redistribution.
 
-A model is a pair of files, `<name>.json` (hyperparameters, species map,
-composition energies, energy scale) and `<name>.safetensors` (the weights).
-Convert one from a metatrain checkpoint or a named `upet` model:
+A model is a pair of files: `<name>.json` (hyperparameters, species,
+composition energies, energy scale) and `<name>.safetensors` (weights). Convert
+one from a published upet model or a metatrain checkpoint:
 
 ```bash
 uv run tools/convert_pet.py --model pet-mad-xs --out models/pet-mad-xs
-uv run tools/convert_pet.py --ckpt my-model.ckpt --variant pbe0 --out models/my-model
+uv run tools/convert_pet.py --ckpt my-model.ckpt --out models/my-model
+uv run tools/convert_pet.py --ckpt pbe0.ckpt --variant pbe0 --out models/pbe0-pet  # a non-default output head
 ```
 
-`pet-eval --models` prints where a named model is looked for:
+A named model is looked for, in order, in `$PET_MODEL_DIR` (`:`-separated),
+`./models` and `.`, `$XDG_DATA_HOME/pet/models` (else
+`~/.local/share/pet/models`), and this source tree's `models/`. A directory
+counts only if it holds both files. `pet-eval --models` prints the list.
 
-1. `$PET_MODEL_DIR` (`:`-separated) — the knob for batch jobs
-2. `./models` and `.` — a self-contained run directory
-3. `$XDG_DATA_HOME/pet/models`, else `~/.local/share/pet/models`
-4. this source tree's `models/` (git-ignored)
+## Numerics
 
-A directory only matches if it holds **both** halves of the pair.
+**Precision**, fixed at build time by `PET_PRECISION`:
 
-## Architectures supported
+- `mixed` (default): fp32 network, fp64 geometry and energy, force and virial
+  accumulation. What the reference tests are validated against.
+- `fp32`: everything single.
+- `fp64`: everything double, for checking. On GPUs with slow fp64,
+  `PET_GEMM_MODE=ozaki` runs its matrix products to fp64 accuracy on integer
+  tensor cores (the Ozaki scheme).
 
-Two validated families, each covering the opposite branch of every config axis.
-The loader rejects any other mix rather than silently running the wrong path.
+**Determinism.** No floating-point atomics feed the energy or forces: neighbour
+slots are assigned in edge-list order, per-edge gradients are gathered through
+the reverse-edge map rather than scattered, and per-structure sums are ordered.
+Repeated runs are bit-identical; `tests/test_determinism.cpp` checks it.
 
-| | **pet-mad-xs** | **pbe0-pet** | **pet-mad-xs v1.6** | **pet-attn2**¹ |
-|---|---|---|---|---|
-| featurizer | feedforward | residual | feedforward | feedforward |
-| transformer | PreLN | PostLN | PreLN | PreLN |
-| normalization | RMSNorm | LayerNorm | RMSNorm | RMSNorm |
-| activation | SwiGLU | SiLU | SwiGLU | SwiGLU |
-| central token | expanded | non-expanded | expanded | expanded |
-| cutoff | Bump, adaptive **grid** | Cosine, fixed | Bump, adaptive **solver** | Bump, adaptive solver |
-| attention layers | 1 | 2 | 1 | **2** |
+**TF32** tensor-core GEMMs (`PET_TF32=1` or `Options::allow_tf32`) are off by
+default. They are ~15% faster on an RTX 4080 and move energies by ~0.1 meV/atom
+and forces by a few meV/Å.
 
-¹ Synthetic. Every published upet model uses `num_attention_layers = 1` — the
-larger ones add GNN layers instead — while metatrain's *default* is 2, so a
-locally trained model can easily need it and there is nothing real to validate
-against. `tools/make_multilayer_checkpoint.py` builds a genuine two-block
-metatrain model from a one-block one (with the blocks deliberately made
-non-identical, so an implementation that read block 0's weights for every block
-would fail), and its goldens come from metatrain like all the others.
+**Virial convention.** The virial is the symmetric `W = V·σ` in Voigt order
+`[xx, yy, zz, xy, xz, yz]`. A strain-gradient optimizer wants `dE/dε`, whose
+off-diagonals are `2·W_xy`; apply that factor on your side.
 
-Both adaptive-cutoff schemes are implemented — `"grid"` (the legacy
-probe-grid average) and `"solver"` (Newton–bisection root find, metatrain's
-current default). A checkpoint carrying no `adaptive_cutoff_method` predates the
-choice and is read as `"grid"`, which is what the metatrain that produced it
-used; anything else is refused by name rather than defaulted, because the two
-schemes choose different per-atom cutoffs and picking the wrong one is silently
-wrong energies, not an error.
+## Runtime switches
 
-Both featurizers handle any `num_attention_layers >= 1`, and both support
-**charge/spin conditioning** (`system_conditioning`): set `System::charge` and
-`System::spin_multiplicity`, or `pet-eval --charge N --spin N`. The defaults are
-metatrain's own — a neutral singlet — so a model trained with conditioning gives
-the same answer as upet does for a system that says nothing about its electronic
-state.
+| variable | |
+|---|---|
+| `PET_MODEL_DIR` | extra directories to search for models |
+| `PET_TF32=1` | TF32 GEMMs |
+| `PET_CUTLASS=0` | plain cuBLAS instead of the fused CUTLASS kernels |
+| `PET_GRAPHS=0` | no CUDA/HIP graph replay (for profilers that time each kernel) |
+| `PET_DEVICE_SEARCH=auto\|cells\|brute` | the device neighbour search |
+| `PET_NEIGHBORS=builtin` | the built-in host search instead of vesin |
+| `PET_GEMM_MODE=ozaki`, `PET_OZAKI_SLICES` | fp64 GEMM emulation (fp64 builds) |
+| `PET_WS_POISON=1` | fill unwritten scratch with NaN, to catch reads before writes |
 
-Two limits are enforced at load time rather than assumed:
-
-- the residual path has no adaptive-cutoff chain rule, so a residual model with
-  `num_neighbors_adaptive > 0` is rejected — its forces would be silently
-  inconsistent with its energy;
-- `zbl` and long-range models are rejected.
-
-## Precision
-
-Compile-time, via `PET_PRECISION`:
-
-- **mixed** (default) — `float` network, `double` geometry, energy, force and
-  virial accumulation. Matches metatrain's fp32 weights while keeping the
-  conserved quantities in fp64. This is what the goldens are validated against.
-- **fp32** — everything single. Fastest on consumer GPUs.
-- **fp64** — everything double. A correctness instrument: on a GeForce card fp64
-  runs at 1/64 of fp32, so do not read its timings as performance.
-
-## Determinism
-
-A PET evaluation is bit-exactly reproducible run to run, which matters because a
-relaxation is a chaotic map — last-bit force noise grows into multi-kJ/mol
-differences in relaxed energies and reshuffled rankings. Getting there meant
-removing float atomics from every reduction the energy depends on:
-
-- neighbour slots are assigned by a per-atom walk in edge-list order, not by an
-  `atomic_fetch_add` in thread-arrival order (this was by far the largest source);
-- per-edge force gradients are **gathered** per atom through the reverse-edge map
-  instead of scattered with two atomics per edge;
-- the per-structure energy and virial are ordered segmented sums over each
-  structure's contiguous atom range, not atomic scatters;
-- the attention backward's cutoff adjoint is summed over heads in index order in
-  a single thread.
-
-Integer counts are order-independent in value, so the count-plus-scan that
-recovers those ranges is itself safe. `tests/test_determinism.cpp` checks this
-against the model, needing no golden.
-
-TF32 tensor-core GEMMs (`PET_TF32=1`, or `Options::allow_tf32`) are **off by
-default** and must stay off for anything compared against a reference: on the
-8-atom `pet-mad-xs` crystal golden they move the total energy by 0.53 meV and
-the forces by up to 2.3 meV/Å (0.1–0.2 meV/atom and ~3 meV/Å on larger cells) —
-well inside model error, well outside the fp32 noise the goldens pin. They are
-~15% faster on an RTX 4080 and considerably more on data-centre GPUs. The
-setting is process-global, because cuBLAS fixes a handle's math mode when the
-handle is created.
-
-## Virial convention
-
-This library returns the **symmetric** virial in Voigt order
-`[xx, yy, zz, xy, xz, yz]` — the physical `W = V·σ`, which its goldens are
-validated against. A strain-DOF optimizer usually wants `dE/dε`, whose
-off-diagonals are `W_xy + W_yx = 2·W_xy`. Apply that factor at your own seam;
-doing it here would make the returned quantity something other than a stress.
+The neighbour searches and the cache are all checked against each other in the
+tests; they find the same edges and differ only in the last bits.
 
 ## Testing
 
@@ -279,74 +156,39 @@ doing it here would make the returned quantity something other than a stress.
 ctest --preset serial          # or openmp / cuda
 ```
 
-### Against upet itself
-
-The goldens cover a handful of architectures by hand. `tools/test_all_models.py`
-covers the **whole published catalogue**: for every checkpoint on
-`lab-cosmo/upet` it converts the model, evaluates the same structures with
-metatomic (the reference implementation, through PyTorch) and with pet-kokkos,
-and reports the deviation.
-
-```bash
-uv run tools/test_all_models.py                 # the small models (<= 150 MB)
-uv run tools/test_all_models.py --all           # everything, ~15 GB of downloads
-uv run tools/test_all_models.py --models pet-mad-s
-```
-
-```
-      model        architecture                            dE/E        dF   dStress
------------------------------------------------------------------------------------
-PASS  pet-mols-s   resi PostLN G2 A2 d256               1.1e-07   1.0e-05   5.6e-07
-PASS  pet-omad-xs  feed PreLN G2 A1 d128 grid           1.5e-07   1.0e-05   5.1e-07
-PASS  pet-omat-xs  feed PreLN G2 A1 d128 grid           3.2e-07   1.0e-05   6.4e-07
-PASS  pet-mad-xs   feed PreLN G2 A1 d128 solver         2.3e-07   8.8e-06   2.8e-07
-PASS  pet-spice-s  feed PreLN G3 A1 d192                5.2e-08   1.5e-05   4.1e-07
-PASS  pet-omad-s   feed PreLN G3 A1 d256 grid           1.1e-07   1.1e-05   5.7e-07
-PASS  pet-omat-s   feed PreLN G3 A1 d256 grid           3.3e-08   9.1e-06   5.8e-07
-PASS  pet-mad-s    feed PreLN G3 A1 d256 solver         1.5e-07   8.8e-06   2.8e-07
-PASS  pet-omol-s   feed PreLN G3 A1 d256 grid cond      1.3e-07   8.1e-06   4.8e-07
-```
-
-This is worth running against any new upet or metatrain release: a model that
-starts failing is usually an architecture axis that has moved, and the report
-says which. It is how `system_conditioning` was caught — `pet-omol-s` was
-converting happily and evaluating 0.25 eV/A off, because the converter did not
-know the axis existed.
-
-| suite | needs a model? | what it holds |
+| suite | needs a model | |
 |---|---|---|
-| `neighbors` | no | periodic images, NEF packing, the reverse-edge map, adaptive cutoff |
-| `io` | no | extended-XYZ reading and writing |
-| `golden` | yes | energy, per-atom energy, forces and stress against metatrain's own evaluation |
-| `finite_diff` | yes | `F = -dE/dx` and `W = dE/dε` against **this model's** energy — no reference implementation involved |
-| `determinism` | yes | bit-exact repeats; a batch equals the structures evaluated alone |
-| `paths_agree` | yes | host vs device neighbour builds; fresh and reused Verlet cache |
+| `neighbors` | no | periodic images, neighbour packing, the reverse-edge map, adaptive cutoffs |
+| `io` | no | extended XYZ |
+| `cell_list` | yes | the device cell list against the brute-force search, and run to run |
+| `golden` | yes | energies, per-atom energies, forces and stress against metatrain |
+| `finite_diff` | yes | forces and virial against the model's own energy |
+| `determinism` | yes | bit-identical repeats; a batch equals its structures alone |
+| `paths_agree` | yes | host and device neighbour builds, the Verlet cache, a shrinking batch |
+| `edges` | yes | engine neighbour lists: half and full, ghosts, MD stepping, exchange across ranks |
+| `ozaki` | no | fp64 GEMM emulation against native fp64 |
 
-Model-dependent suites **skip** when no model is installed, so a fresh clone is
-green. Put a model on the search path and they start running. Goldens for all
-three architectures above are shipped; reproduce the models with
+Suites that need a model skip when none is installed. Reference values ship
+in `tests/golden/` for four models: pet-mad-xs (v1.0 and v1.6), pbe0-pet, and a
+synthetic two-attention-layer model built by
+`tools/make_multilayer_checkpoint.py`. `$PET_TEST_MODELS` and
+`$PET_TEST_GOLDEN_EXTRA` add models and golden directories.
+
+Against the whole published catalogue:
 
 ```bash
-uv run tools/convert_pet.py --model pet-mad-xs --out models/pet-mad-xs-v1.6
+uv run tools/test_all_models.py           # models up to 150 MB
+uv run tools/test_all_models.py --all     # all 20, ~13 GB of downloads
 ```
 
-`$PET_TEST_MODELS` and `$PET_TEST_GOLDEN_EXTRA` (both `:`-separated) add model
-names and golden directories at run time, for a model whose weights cannot live
-in this tree.
+## Licence
 
-## Provenance and licence
+BSD 3-Clause, as upstream PET and metatrain.
 
-BSD 3-Clause, matching upstream PET/metatrain.
+PET is described in [Pozdnyakov & Ceriotti 2023](https://arxiv.org/abs/2305.19302);
+the reference implementation is [metatrain](https://github.com/metatensor/metatrain).
+This is an independent implementation that reads the same checkpoints.
 
-This code was extracted from [klasp](https://github.com/peterspackman/klasp)'s
-`src/pet`, which began life in `peterspackman/lammps-pet-kokkos` as
-`lib/pet-kokkos`. All of it is the same author's. The GPLv2 on that LAMMPS
-repository attaches to the pair style in its `src/ML-PET`, not to this library,
-which never included a LAMMPS header; klasp is GPL-3 and this is a deliberate
-relicence by its author to match the ecosystem it plugs into.
-
-PET the architecture is published work
-([Pozdnyakov & Ceriotti 2023](https://arxiv.org/abs/2305.19302)), and the
-reference implementation is `metatensor/metatrain` (BSD-3-Clause) — the same
-models `tools/convert_pet.py` converts. Nothing here is a port of their C++,
-because there is none to port.
+This code began inside the author's klasp and lammps-pet-kokkos projects and is
+relicensed here by its sole author. The LAMMPS package under `lammps/` is
+GPL-2.0, as LAMMPS itself.

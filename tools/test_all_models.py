@@ -19,9 +19,9 @@ whole published catalogue: for each checkpoint on `lab-cosmo/upet` it converts
 the model, evaluates the same structures with metatomic (i.e. the reference
 implementation, through PyTorch) and with pet-kokkos, and reports the deviation.
 
-It is the answer to "which models actually work", and it is meant to be run
-against a new release of upet or metatrain -- a model that starts failing here
-is usually an architecture axis that has moved, and the report says which.
+Run it against each new release of upet or metatrain: a model that starts
+failing here usually means an architecture setting has changed, and the report
+says which model.
 
     uv run tools/test_all_models.py                    # small models (<= 150 MB)
     uv run tools/test_all_models.py --all              # everything, ~15 GB
@@ -103,7 +103,7 @@ def list_checkpoints():
 
 
 def build_structures():
-    """The same three cases the shipped goldens use."""
+    """A molecule, a crystal and a rattled crystal, as in the shipped goldens."""
     import ase
     import numpy as np
 
@@ -219,10 +219,8 @@ def process(entry, args, structures, xyz, workdir):
         p = subprocess.run(cmd, capture_output=True, text=True)
         if p.returncode != 0:
             msg = (p.stderr or p.stdout).strip().split("\n")[-1]
-            # The converter refuses architectures the evaluator does not
-            # implement, by name. That is a supported outcome, not a failure --
-            # report it as such so the table distinguishes "we know we can't"
-            # from "it broke".
+            # The converter refuses, by name, architectures the evaluator does
+            # not implement: reported as unsupported, not as an error.
             res.status = "unsupported" if "does not implement" in msg or "not found" in msg else "error"
             res.detail = msg.replace("convert_pet.py: error: ", "")
             return res

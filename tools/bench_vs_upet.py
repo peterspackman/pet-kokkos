@@ -1,16 +1,23 @@
-# Wall-clock comparison against the reference implementation.
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "torch>=2.0.0",
+#     "numpy>=1.24.0",
+#     "ase",
+#     "metatrain",
+#     "upet",
+#     "metatomic-torch",
+#     "huggingface_hub",
+#     "safetensors",
+# ]
+# ///
+# Wall-clock comparison with upet: one energy and forces evaluation of one
+# structure on each side, neighbour list included, best of --repeat after two
+# warmup calls (both sides allocate on the first).
 #
-# Times the same thing on both sides -- one energy+forces evaluation of one
-# structure, neighbour list included -- because that is what a caller actually
-# pays for. Excluding the neighbour search would flatter whichever side has the
-# slower one, and both build their own.
-#
-# Both are given the same warmup treatment. PyTorch needs it (allocator, kernel
-# selection, any lazy init) and so does ours (the workspace pool is grow-only,
-# so the first call allocates everything), and reporting a first call as though
-# it were steady state would misrepresent either.
-#
-#   uv run tools/bench_vs_upet.py --model pet-mad-s --xyz cell.xyz
+#   uv run tools/bench_vs_upet.py --model pet-mad-s --xyz cell.xyz \
+#       [--pet-eval build-cuda/apps/pet-eval] [--model-dir build-models]
 import argparse
 import json
 import os
@@ -31,12 +38,8 @@ def bench_upet(ckpt_path, atoms, repeat, device):
     model = load_model(str(ckpt_path)).export()
     calc = MetatomicCalculator(model, device=device)
 
-    # Each call gets its own displacement. ASE's calculators cache on the
-    # system, so evaluating an unchanged structure repeatedly returns the cached
-    # answer and "times" a dictionary lookup -- the first version of this script
-    # reported 0.1 ms for a 512-atom evaluation, which is what that looks like.
-    # The displacement is far below any physical scale and does not change the
-    # amount of work, only its identity.
+    # Each call gets its own tiny displacement: ASE's calculators cache on the
+    # system and would otherwise return the cached answer without evaluating.
     rng = np.random.default_rng(0)
     base = atoms.get_positions()
 

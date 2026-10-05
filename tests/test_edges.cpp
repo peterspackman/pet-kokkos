@@ -376,7 +376,7 @@ namespace {
 // owner(g) -> (an image of i) with the opposite vector.
 class ImageExchange : public pet::Exchange {
  public:
-  ImageExchange(const Domain& d, int D) : owner_(d.owner), n_local_(d.n_local) {
+  explicit ImageExchange(const Domain& d) : owner_(d.owner), n_local_(d.n_local) {
     struct Edge { int i, j; double v[3]; };
     std::vector<Edge> remote;
     for (int i = 0; i < d.n_local; ++i)
@@ -393,7 +393,6 @@ class ImageExchange : public pet::Exchange {
         if (b.i != owner_[a.j] || owner_[b.j] != a.i) continue;
         if (std::fabs(a.v[0] + b.v[0]) + std::fabs(a.v[1] + b.v[1]) + std::fabs(a.v[2] + b.v[2]) < 1e-9) partner_[r] = q;
       }
-    (void) D;
   }
   void atoms_forward(pet::RView1D a) override {
     auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), a);
@@ -435,7 +434,7 @@ TEST_CASE("ranks that exchange messages reproduce the periodic evaluation", "[mo
       const double rc = calc.cutoff();
       // Ghosts one cutoff (and a skin) deep, and neighbour lists for owned atoms only.
       const Domain d = make_domain(s, rc + 0.5, 0.0, rc + 0.5);
-      ImageExchange x(d, calc.hypers().d_pet);
+      ImageExchange x(d);
       REQUIRE(x.paired());
       pet::EdgeListView v = view(d);
       v.exchange = &x;

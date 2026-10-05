@@ -9,6 +9,7 @@
 #     "metatomic-torch",
 #     "ase",
 #     "huggingface_hub",
+#     "safetensors",
 # ]
 # ///
 """Generate a "golden" reference output for a metatrain PET model.
@@ -38,41 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-
-def download_upet_checkpoint(model_name: str) -> str:
-    """Resolve a named upet model to a local checkpoint path.
-
-    `model_name` is the full name including the size suffix, e.g. "pet-mad-xs"
-    or "pet-omat-s". Everything before the last "-" is the model family and the
-    last segment is the size, which is how `lab-cosmo/upet` names its files.
-
-    upet's own resolver is used where it is available, because it is what knows
-    which versions exist and how "latest" maps onto one; the public
-    `upet_resolve_model` is the fallback, since the underscore-prefixed helper
-    is not API.
-    """
-    from huggingface_hub import hf_hub_download
-
-    family, _, size = model_name.rpartition("-")
-    if not family:
-        raise SystemExit(f"model name '{model_name}' has no size suffix (e.g. pet-mad-xs)")
-
-    try:
-        from upet._models import _resolve_and_download_checkpoint
-
-        _, _, path = _resolve_and_download_checkpoint(family, size, "latest")
-        return path
-    except ImportError:
-        pass
-
-    from upet._models import upet_resolve_model
-
-    resolved_size, version = upet_resolve_model(model=family, requested_size=size)
-    return hf_hub_download(
-        repo_id="lab-cosmo/upet",
-        filename=f"{family}-{resolved_size}-v{version}.ckpt",
-        subfolder="models",
-    )
+from convert_pet import download_upet_checkpoint
 
 
 def load_full_model(model_name: str = None, ckpt: str = None):

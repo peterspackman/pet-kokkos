@@ -122,7 +122,7 @@ inline std::vector<std::string> golden_dirs() {
 }
 
 // Refuse a golden made from a different checkpoint of the same name (pet-mad-xs
-// here and on HuggingFace today differ). energy_scale, a fitted constant, is the
+// has several published versions). energy_scale, a fitted constant, is the
 // fingerprint.
 inline void require_matching_model(const Golden& g, const pet::Calculator& calc) {
   if (!g.model_energy_scale) return;  // an older golden with no fingerprint

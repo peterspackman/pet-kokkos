@@ -6,6 +6,10 @@
    This software is distributed under the GNU General Public License.
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   Contributing author: Peter Spackman
+------------------------------------------------------------------------- */
+
 // pair_style pet MODEL [mode images|exchange|ghosts] [gpu_aware auto|yes|no]
 // pair_coeff * * ELEMENT...        (one element symbol per atom type)
 //
@@ -13,7 +17,7 @@
 // path prefix to MODEL.json and MODEL.safetensors. Units metal, newton pair on.
 //
 // PET passes messages over its GNN layers, so an owned atom's energy depends on
-// atoms several cutoffs away. Two ways to give it that:
+// atoms several cutoffs away. Three ways to give it that:
 //
 //   images (the default on one MPI rank): every ghost is a periodic image of an
 //     owned atom, so pet-kokkos sees only the owned atoms, with each edge to an

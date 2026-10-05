@@ -1,9 +1,7 @@
 # Locate an installed vesin (https://github.com/Luthaf/vesin).
 #
 # vesin ships a C API (vesin.h) and a shared library. The Python wheel carries
-# both, so a venv with `pip install vesin` is a perfectly good source -- which is
-# convenient, because the same environment is already needed for the model
-# converter and the whole-catalogue sweep.
+# both, so a venv with `pip install vesin` will do.
 #
 # Sets: Vesin_FOUND, Vesin_INCLUDE_DIR, Vesin_LIBRARY, and the imported target
 # vesin::vesin.

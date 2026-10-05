@@ -2,7 +2,7 @@ ML-PET: PET machine-learning interatomic potentials (Point Edge Transformer,
 the upet / PET-MAD family) through pet-kokkos, a C++/Kokkos implementation
 with analytic forces and no libtorch.
 
-  pair_style pet MODEL [mode images|ghosts]
+  pair_style pet MODEL [mode images|exchange|ghosts] [gpu_aware auto|yes|no]
   pair_coeff * * ELEMENT...
 
 pair_style pet/kk (KOKKOS package) keeps each step on the GPU.

@@ -2,7 +2,7 @@
 //
 // Per GNN layer L: the node is re-embedded from species; the edge tokens are
 //   et = compress(input_edge, geometry, species);
-// A PostLN transformer blocks run over each atom's tokens [node; et]; every
+// a PostLN transformer of A blocks runs over each atom's tokens [node; et]; every
 // layer is read out, and the readouts summed; and message passing sets
 //   input_edge = 0.5 * (input_edge + out_edge of the reverse edge)
 // for the next layer.

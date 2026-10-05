@@ -36,9 +36,8 @@ struct Options {
   // stepping the same atoms (MD, a relaxation). See NefCache.
   bool cache_neighbors = false;
 
-  // TF32 tensor-core GEMMs: faster (~15% on an RTX 4080, more on A100/H100),
-  // and ~0.1 meV/atom and a few meV/A off -- so never for a reference
-  // comparison or a determinism check. Process-global (see gemm.hpp).
+  // TF32 tensor-core GEMMs: faster, and ~0.1 meV/atom and a few meV/A off, so
+  // not for reference comparisons. Process-global (see gemm.hpp).
   bool allow_tf32 = false;
 
   // The host neighbour search: vesin's cell list, or the built-in O(N^2) one.
@@ -66,8 +65,7 @@ struct Options {
 
   // compute_step: size every step between neighbour-list rebuilds to one fixed
   // capacity, so each replays one CUDA graph. It pads every atom to the largest
-  // neighbour count plus a margin, which costs more than replay saves wherever
-  // measured (64-atom crystal: equal; 648-atom water: 32.6 vs 27.5 ms/step).
+  // neighbour count plus a margin, which has so far cost more than replay saves.
   bool md_fixed_shapes = false;
 };
 

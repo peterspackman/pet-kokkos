@@ -59,9 +59,9 @@ KEEP_PREFIXES = (
 # Head sub-trees: keep only the selected energy target.
 HEAD_ROOTS = ("node_heads", "edge_heads", "node_last_layers", "edge_last_layers")
 
-# Adaptive-cutoff schemes the C++ evaluator implements. Keep in step with
-# parse_acm() in include/pet/checkpoint.hpp -- this is the Python half of the
-# same gate, and it is the half that gives an actionable message.
+# Adaptive-cutoff schemes the C++ evaluator implements; the loader in
+# src/checkpoint.cpp refuses any other, and this refuses them earlier, with a
+# message that says what to do.
 SUPPORTED_ADAPTIVE_METHODS = {"grid", "solver"}
 
 
@@ -120,10 +120,8 @@ def pet_backbone(model):
 def strip_backend_prefix(name: str) -> str:
     """Undo metatrain 2026.4's `backend.` state_dict prefix.
 
-    The names beneath it are unchanged, so removing it is the whole migration --
-    and it keeps the C++ loader, which spells these names literally, working
-    against checkpoints from either metatrain. (This is the fragility the v2
-    model format's tensor manifest is meant to end; see PLAN.md section 3.)
+    The names beneath it are unchanged, so removing it keeps the C++ loader,
+    which spells these names literally, working with checkpoints from either.
     """
     return name[len("backend."):] if name.startswith("backend.") else name
 
@@ -237,11 +235,9 @@ def main():
 
     nna = h.get("num_neighbors_adaptive", None)
 
-    # Refuse, here, anything the C++ evaluator does not implement -- a converted
-    # model that loads and returns a wrong number is far worse than one that
-    # refuses to convert. metatrain's adaptive_cutoff_method default changed from
-    # "grid" to "solver", and the two choose different per-atom cutoffs, so this
-    # is not a cosmetic difference: it is an energy.
+    # Refuse what the C++ evaluator does not implement rather than convert a
+    # model that would load and return wrong energies: the adaptive-cutoff
+    # schemes choose different per-atom cutoffs.
     adaptive_method = str(h.get("adaptive_cutoff_method", "grid"))
     if nna is not None and adaptive_method not in SUPPORTED_ADAPTIVE_METHODS:
         ap.error(
@@ -249,9 +245,7 @@ def main():
             f"pet-kokkos does not implement (it has: "
             f"{', '.join(sorted(SUPPORTED_ADAPTIVE_METHODS))}).\n"
             "Converting it anyway would produce a model that loads and returns "
-            "silently wrong energies and forces. Retrain or re-export with "
-            "adaptive_cutoff_method='grid', or wait for solver support "
-            "(see PLAN.md section 5)."
+            "silently wrong energies and forces."
         )
 
     meta = {

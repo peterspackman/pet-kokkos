@@ -91,8 +91,7 @@
     "energy_scale": 2.4699176680573274,
     "cutoff": 7.5,
     "cutoff_function": "Bump",
-    "featurizer_type": "feedforward",
-    "converted_model_json": "models/pet-mad-xs.json"
+    "featurizer_type": "feedforward"
   },
   "notes": "total_energy = energy_scale * sum_i(E_backbone_i) + sum_i(composition_energy[Z_i]). forces = energy_scale * F_backbone (composition energies are constant per type and do not contribute to forces). See the converted model JSON for energy_scale and composition_energies."
 }

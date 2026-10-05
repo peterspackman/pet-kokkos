@@ -157,9 +157,11 @@ struct Calculator::Impl {
     const char* g = std::getenv("PET_GRAPHS");
     model.set_graphs(o.graphs && !(g && g[0] == '0'));
     model.set_memory_policy(std::size_t(double(total_b) * kMemCardFraction * kMemHeadroom), o.recompute);
-    // Process-global, as the two searches are meant to agree.
-    neighbor_backend() = (o.neighbors == Options::Neighbors::Vesin) ? NeighborBackend::Vesin
-                                                                    : NeighborBackend::Builtin;
+    // Process-global, as the two searches are meant to agree. PET_NEIGHBORS=builtin
+    // overrides the option, to check one against the other without rebuilding.
+    const char* nb = std::getenv("PET_NEIGHBORS");
+    const bool builtin = o.neighbors == Options::Neighbors::Builtin || (nb && std::string(nb) == "builtin");
+    neighbor_backend() = builtin ? NeighborBackend::Builtin : NeighborBackend::Vesin;
   }
 };
 
@@ -390,7 +392,7 @@ std::vector<std::pair<std::string, std::size_t>> Calculator::workspace_breakdown
 int Calculator::recommended_batch_atoms() const {
   if (impl_->opts.max_batch_atoms > 0) return impl_->opts.max_batch_atoms;
 
-  // Before the first evaluation M is unknown: measured safe sizes on 16 GiB.
+  // Before the first evaluation M is unknown: sizes that fit a 16 GiB card.
   const int bootstrap =
       (impl_->ckpt.hypers.featurizer_type == FeaturizerType::Residual) ? 2048 : 4096;
 

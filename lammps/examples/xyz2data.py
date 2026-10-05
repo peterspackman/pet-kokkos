@@ -5,7 +5,7 @@ can evaluate exactly what LAMMPS does.
 
     xyz2data.py in.xyz out-prefix [rattle-A] [seed]
 """
-import random, re, sys
+import os, random, re, sys
 
 src, out = sys.argv[1], sys.argv[2]
 rattle = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
@@ -20,7 +20,7 @@ for l in lines[2:2 + n]:
     atoms.append((s, [float(x) + random.uniform(-rattle, rattle) for x in (x, y, z)]))
 elements = sorted({s for s, _ in atoms})
 with open(out + ".data", "w") as f:
-    f.write(f"{src} rattled {rattle} A\n\n{n} atoms\n{len(elements)} atom types\n\n")
+    f.write(f"{os.path.basename(src)} rattled {rattle} A\n\n{n} atoms\n{len(elements)} atom types\n\n")
     for d, L in zip("xyz", (lat[0], lat[4], lat[8])):
         f.write(f"0.0 {L} {d}lo {d}hi\n")
     mass = {"H": 1.008, "C": 12.011, "N": 14.007, "O": 15.999, "Si": 28.085}

@@ -13,8 +13,9 @@
 // Each thread holds q and its output accumulator in registers, sized exactly by
 // a compile-time head_dim (16, 32, 48, 64 and 80, the sizes the published models
 // use; anything else takes a generic path sized kMaxHeadDim). The backward holds
-// four such arrays, so from head_dim 48 up it spills to local memory -- which
-// still beats reading the operands in place (see PLAN.md).
+// four such arrays, so from head_dim 48 up it spills to local memory, which is
+// coalesced and still faster than reading the operands in place (a strided
+// access per element).
 #include "ops.hpp"
 
 #include <type_traits>

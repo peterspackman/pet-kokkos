@@ -98,7 +98,6 @@ TEST_CASE("the Ozaki GEMM reproduces DGEMM as slices increase", "[ozaki]") {
         Kokkos::deep_copy(C, (pet::Net) 0.0);
         pet::gemm_ozaki(c.ta, c.tb, (pet::Net) 1.0, A, B, (pet::Net) 0.0, C, nullptr);
         const double err = max_rel_diff(C, Cref);
-        std::printf("    slices=%d  max relative error = %.3e\n", s, err);
         INFO("slices = " << s << ", error " << err << ", previous " << prev);
         CHECK(err < prev);
         prev = err;
@@ -196,7 +195,6 @@ TEST_CASE("Ozaki against DGEMM: throughput", "[ozaki][!benchmark]") {
       time_it([&] { pet::gemm('N', 'T', (pet::Net) 1.0, A, B, (pet::Net) 0.0, C); });
   std::printf("    DGEMM                  %8.3f ms\n", t_native * 1e3);
 
-  pet::OzakiSplit wsplit = pet::ozaki_split_weight(B, pet::kOzakiMaxSlices);
   for (int s : {2, 4, 6, 8}) {
     guard.use(s);
     pet::OzakiSplit ws_s = pet::ozaki_split_weight(B, s);
@@ -206,6 +204,5 @@ TEST_CASE("Ozaki against DGEMM: throughput", "[ozaki][!benchmark]") {
     std::printf("    Ozaki slices=%d         %8.3f ms   (%.2fx vs DGEMM)\n", s, t * 1e3,
                 t_native / t);
   }
-  (void) wsplit;
   SUCCEED();
 }
