@@ -92,10 +92,6 @@ class PairPET : public Pair {
   void set_exchange(const List &l);
   void cell_rows(double cell[9]) const;
 
- private:
-  void allocate();
-  void set(int n, bool half);
-
   // Mode exchange. Atom values ride LAMMPS's forward and reverse comm (which
   // relay through ghosts of ghosts); edge rows go straight to the rank owning
   // the ghost, grouped by rank (MPI_Alltoallv). Once per rebuild, every edge to
@@ -103,6 +99,7 @@ class PairPET : public Pair {
   // q-th row arriving is for. Once per evaluation (set_live), the edges PET
   // keeps: only their rows cross, and where each lands is worked out then, so
   // each layer's swap is one pack, one MPI_Alltoallv and one unpack.
+  int n_remote = 0;                                // edges to ghosts
   std::vector<int> send_order, recv_map;           // remote edges by destination; arrival -> edge
   std::vector<int> send_counts, send_displs, recv_counts, recv_displs;  // per rank, in rows
   pet::IView1D d_send_order, d_recv_map;            // the same, on the device
@@ -126,8 +123,13 @@ class PairPET : public Pair {
   } link{this};
   void alltoallv_device(const void *out, void *in, int width, const std::vector<int> &sc,
                         const std::vector<int> &sd, const std::vector<int> &rc, const std::vector<int> &rd);
+  void exchange_views();  // what set_live works in, sized for n_remote
   void alltoall_rows(const char *out, int width, char *in);
   void forward_atoms();
+
+ private:
+  void allocate();
+  void set(int n, bool half);
 };
 
 }    // namespace LAMMPS_NS

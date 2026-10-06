@@ -237,7 +237,7 @@ void PairPET::set_exchange(const List &l)
   std::vector<int> remote_of(off[nall], -1);
   std::vector<std::vector<int>> to_rank(nprocs);
   std::vector<double> key;
-  int n_remote = 0;
+  n_remote = 0;
   for (int i = 0; i < nlocal; ++i)
     for (int e = off[i]; e < off[i + 1]; ++e) {
       const int j = nbr[e];
@@ -306,9 +306,15 @@ void PairPET::set_exchange(const List &l)
   Kokkos::deep_copy(d_send_block, HostI(block.data(), n_remote));
   Kokkos::deep_copy(d_send_displs, HostI(sdisp.data(), nprocs + 1));
   Kokkos::deep_copy(d_recv_displs, HostI(recv_displs.data(), nprocs));
+  exchange_views();
+  set(nall, false);
+}
+
+void PairPET::exchange_views()
+{
+  const int nprocs = comm->nprocs;
   d_row = pet::IView1D("pet:row", n_remote), d_live_at = pet::IView1D("pet:live_at", n_remote + 1);
   d_live_counts = pet::IView1D("pet:live_counts", nprocs), d_arrive = pet::IView1D("pet:arrive", nprocs + 1);
-  set(nall, false);
 }
 
 // Rows of `width` bytes to each rank, in send_order; what arrives, in rank order.
@@ -356,7 +362,7 @@ void PairPET::alltoallv_device(const void *out, void *in, int width, const std::
 void PairPET::set_live(pet::IView1D live)
 {
   using Range = Kokkos::RangePolicy<pet::ExecSpace>;
-  const int nprocs = comm->nprocs, n_send = send_order.size(), n_live = live.extent(0);
+  const int nprocs = comm->nprocs, n_send = n_remote, n_live = live.extent(0);
   auto row = d_row, order = d_send_order, at = d_live_at, displs = d_send_displs, counts = d_live_counts;
   Kokkos::deep_copy(row, -1);
   Kokkos::parallel_for("pet_live_rows", Range(0, n_live), KOKKOS_LAMBDA(int l) { row(live(l)) = l; });

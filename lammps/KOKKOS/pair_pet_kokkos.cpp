@@ -24,6 +24,9 @@
 
 #include "pet/calculator.hpp"
 
+#include <Kokkos_Sort.hpp>
+#include <cstdint>
+
 #include <type_traits>
 #include <vector>
 
@@ -59,25 +62,11 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::init_style()
 
 // At a neighbour-list rebuild: LAMMPS's device list, handed to pet-kokkos where
 // it is, with each atom's element and, in mode images, the owned atom each ghost
-// is an image of (by tag). Mode exchange still matches edges across ranks on the
-// host, so there the list is copied down once.
+// is an image of (by tag); in mode exchange, routed between ranks on the device
+// too (route_on_device).
 template <class DeviceType> void PairPETKokkos<DeviceType>::rebuild()
 {
   auto k_list = static_cast<NeighListKokkos<DeviceType> *>(list);
-  if (mode == Mode::Exchange) {
-    atomKK->sync(Host, X_MASK | TAG_MASK | TYPE_MASK);
-    auto ilist = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k_list->d_ilist);
-    auto numneigh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k_list->d_numneigh);
-    auto neighbors = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k_list->d_neighbors);
-    List l;
-    l.n = list->inum;
-    l.ilist = ilist.data(), l.numneigh = numneigh.data();
-    l.neighbor = [&](int i, int k) { return neighbors(i, k) & NEIGHMASK; };
-    set_exchange(l);
-    listed = true;
-    return;
-  }
-
   atomKK->sync(execution_space, X_MASK | TAG_MASK | TYPE_MASK);
   const int nlocal = atom->nlocal, nall = nlocal + atom->nghost, ntypes = atom->ntypes;
   using Range = Kokkos::RangePolicy<DeviceType>;
@@ -111,12 +100,156 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::rebuild()
     cell_rows(cell);
     v.image_of = d_image_of.data(), v.positions = positions(), v.cell = cell;
   }
+  if (mode == Mode::Exchange) {
+    route_on_device(v);
+    v.exchange = &link;
+  }
   try {
     calc->set_neighbors(v);
   } catch (std::exception &e) {
     error->one(FLERR, "pair_style pet/kk: {}", e.what());
   }
   listed = true;
+}
+
+// Mode exchange's routing, as PairPET::set_exchange does it on the host, here on
+// the device: the edges to ghosts numbered in the list's order (atom order, then
+// each atom's neighbours in turn, as pet-kokkos numbers them), grouped by the
+// rank owning the ghost; each sent with a key (the ghost's tag, this atom's tag,
+// the edge vector) by which the owning rank finds the partner edge among its own.
+template <class DeviceType> void PairPETKokkos<DeviceType>::route_on_device(const pet::DeviceEdgeListView &v)
+{
+  using Range = Kokkos::RangePolicy<DeviceType>;
+  using Team = Kokkos::TeamPolicy<DeviceType>;
+  using U64 = Kokkos::View<uint64_t *, DeviceType>;
+  using IV = Kokkos::View<int *, DeviceType>;
+  const int nlocal = atom->nlocal, nall = nlocal + atom->nghost, nprocs = comm->nprocs, me = comm->me;
+  const int NC = v.n_centres;
+  const int *ilist = v.ilist, *numneigh = v.numneigh, *nbr = v.neighbors;
+  const long si = v.stride_i, sk = v.stride_k;
+  auto tag = atomKK->k_tag.template view<DeviceType>();
+  const double *x = positions();
+
+  tagint max_tag = 0;
+  Kokkos::parallel_reduce(
+      "pet_max_tag", Range(0, nall), KOKKOS_LAMBDA(int i, tagint &m) { m = tag(i) > m ? tag(i) : m; },
+      Kokkos::Max<tagint>(max_tag));
+  if (int64_t(max_tag) >= (int64_t(1) << 31)) error->one(FLERR, "pair_style pet/kk mode exchange: atom IDs past 2^31");
+
+  // Each ghost's owner: every rank's own number, forward to its ghosts.
+  pet::RView1D owner("pet:owner", nall);
+  Kokkos::parallel_for("pet_me", Range(0, nlocal), KOKKOS_LAMBDA(int i) { owner(i) = me; });
+  atoms_forward(owner);
+
+  // The edges to ghosts, in pet-kokkos's numbering: each atom's range, then its
+  // pairs in list order, those to ghosts counted off by a scan.
+  IV count("pet:count", nall + 1), off("pet:off", nall + 1);
+  Kokkos::parallel_for("pet_ex_count", Range(0, NC), KOKKOS_LAMBDA(int ii) {
+    const int i = ilist[ii];
+    int c = 0;
+    for (int k = 0; k < numneigh[i]; ++k) c += (nbr[i * si + k * sk] & NEIGHMASK) >= nlocal;
+    count(i) = c;
+  });
+  Kokkos::parallel_scan("pet_ex_off", Range(0, nall + 1), KOKKOS_LAMBDA(int i, int &c, bool final) {
+    if (final) off(i) = c;
+    if (i < nall) c += count(i);
+  });
+  int R = 0;
+  Kokkos::deep_copy(R, Kokkos::subview(off, nall));
+  n_remote = R;
+  IV rem_i("pet:rem_i", R), rem_j("pet:rem_j", R);
+  Kokkos::parallel_for("pet_ex_remote", Range(0, NC), KOKKOS_LAMBDA(int ii) {
+    const int i = ilist[ii];
+    int r = off(i);
+    for (int k = 0; k < numneigh[i]; ++k) {
+      const int j = nbr[i * si + k * sk] & NEIGHMASK;
+      if (j >= nlocal) rem_i(r) = i, rem_j(r) = j, ++r;
+    }
+  });
+
+  // Grouped by destination, in that order within each: a sort of (rank, index).
+  U64 by_rank("pet:by_rank", R);
+  Kokkos::parallel_for("pet_ex_dest", Range(0, R), KOKKOS_LAMBDA(int r) {
+    by_rank(r) = uint64_t(int(owner(rem_j(r)))) << 32 | uint32_t(r);
+  });
+  Kokkos::sort(by_rank);
+  d_send_order = pet::IView1D("pet:send_order", R), d_send_block = pet::IView1D("pet:send_block", R);
+  d_send_displs = pet::IView1D("pet:send_displs", nprocs + 1);
+  auto order = d_send_order, block = d_send_block, displs = d_send_displs;
+  Kokkos::parallel_for("pet_ex_displs", Range(0, nprocs + 1), KOKKOS_LAMBDA(int p) {
+    int lo = 0, hi = R;  // the first entry for rank p or beyond
+    while (lo < hi) {
+      const int mid = (lo + hi) / 2;
+      if (int(by_rank(mid) >> 32) < p) lo = mid + 1;
+      else hi = mid;
+    }
+    displs(p) = lo;
+  });
+  Kokkos::parallel_for("pet_ex_order", Range(0, R), KOKKOS_LAMBDA(int q) {
+    order(q) = int(by_rank(q) & 0xffffffffu);
+    block(q) = displs(int(by_rank(q) >> 32));
+  });
+  std::vector<int> sd(nprocs + 1);
+  Kokkos::deep_copy(Kokkos::View<int *, Kokkos::HostSpace>(sd.data(), nprocs + 1), displs);
+  send_counts.resize(nprocs), send_displs.assign(sd.begin(), sd.end() - 1), recv_counts.resize(nprocs);
+  for (int p = 0; p < nprocs; ++p) send_counts[p] = sd[p + 1] - sd[p];
+  MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, world);
+  recv_displs.assign(nprocs, 0);
+  for (int p = 1; p < nprocs; ++p) recv_displs[p] = recv_displs[p - 1] + recv_counts[p - 1];
+  const int n_recv = recv_displs[nprocs - 1] + recv_counts[nprocs - 1];
+  d_recv_displs = pet::IView1D("pet:recv_displs", nprocs);
+  Kokkos::deep_copy(d_recv_displs, Kokkos::View<const int *, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(recv_displs.data(), nprocs));
+
+  // The keys, across.
+  Kokkos::View<double *, DeviceType> keys_out("pet:keys_out", 5 * std::size_t(R)), keys_in("pet:keys_in", 5 * std::size_t(n_recv));
+  Kokkos::parallel_for("pet_ex_keys", Range(0, R), KOKKOS_LAMBDA(int q) {
+    const int r = order(q), i = rem_i(r), j = rem_j(r);
+    double *k = &keys_out(5 * std::size_t(q));
+    k[0] = tag(j), k[1] = tag(i);
+    for (int c = 0; c < 3; ++c) k[2 + c] = x[3 * j + c] - x[3 * i + c];
+  });
+  alltoallv_device(keys_out.data(), keys_in.data(), 5 * sizeof(double), send_counts, send_displs, recv_counts,
+                   recv_displs);
+
+  // Each arriving key's partner among this rank's edges to ghosts: sorted by
+  // (atom's tag, ghost's tag), found by binary search, told apart by the vector
+  // where a small cell holds several images of one ghost.
+  U64 mine("pet:mine", R);
+  IV mine_r("pet:mine_r", R);
+  Kokkos::parallel_for("pet_ex_mine", Range(0, R), KOKKOS_LAMBDA(int r) {
+    mine(r) = uint64_t(tag(rem_i(r))) << 32 | uint64_t(tag(rem_j(r))), mine_r(r) = r;
+  });
+  if (R > 0) Kokkos::Experimental::sort_by_key(typename DeviceType::execution_space(), mine, mine_r);
+  d_recv_map = pet::IView1D("pet:recv_map", n_recv);
+  auto map = d_recv_map;
+  int unmatched = 0;
+  Kokkos::parallel_reduce(
+      "pet_ex_match", Range(0, n_recv),
+      KOKKOS_LAMBDA(int q, int &u) {
+        const double *k = &keys_in(5 * std::size_t(q));
+        const uint64_t want = uint64_t(k[0]) << 32 | uint64_t(k[1]);
+        int lo = 0, hi = R;
+        while (lo < hi) {
+          const int mid = (lo + hi) / 2;
+          if (mine(mid) < want) lo = mid + 1;
+          else hi = mid;
+        }
+        int found = -1;
+        for (int a = lo; a < R && mine(a) == want && found < 0; ++a) {
+          const int r = mine_r(a), o = rem_i(r), h = rem_j(r);
+          double d = 0;
+          for (int c = 0; c < 3; ++c) d += Kokkos::fabs(x[3 * h + c] - x[3 * o + c] + k[2 + c]);
+          if (d < 1e-6) found = r;
+        }
+        map(q) = found;
+        u += found < 0;
+      },
+      unmatched);
+  int all = 0;
+  MPI_Allreduce(&unmatched, &all, 1, MPI_INT, MPI_SUM, world);
+  if (all && comm->me == 0)
+    error->warning(FLERR, "pair_style pet mode exchange: {} edge rows found no partner edge", all);
+  exchange_views();
 }
 
 // LAMMPS's positions as pet-kokkos takes them: [n, 3] row-major doubles.

@@ -21,6 +21,10 @@ PairStyle(pet/kk/device,PairPETKokkos<LMPDeviceType>);
 #include "pair_kokkos.h"
 #include "pair_pet.h"
 
+namespace pet {
+struct DeviceEdgeListView;
+}
+
 namespace LAMMPS_NS {
 
 // pair_style pet on LAMMPS's KOKKOS package: pet-kokkos shares LAMMPS's Kokkos
@@ -48,6 +52,7 @@ template <class DeviceType> class PairPETKokkos : public PairPET, public KokkosB
 
   // Public only because nvcc refuses a device lambda inside a private member.
   void rebuild();
+  void route_on_device(const pet::DeviceEdgeListView &v);
   const double *positions();
 
  private:
