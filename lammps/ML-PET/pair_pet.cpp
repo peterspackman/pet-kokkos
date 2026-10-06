@@ -577,6 +577,11 @@ void PairPET::settings(int narg, char **arg)
   pet::Options opts;
   const int devices = std::max(1, Kokkos::num_devices());
   opts.device_share = (node_ranks + devices - 1) / devices;
+  // Mode images on a small system: every step between rebuilds the same shapes,
+  // recorded and replayed as one graph. It pays where launches dominate (~2000
+  // atoms or fewer on an RTX 4080); past that the headroom the shapes need costs
+  // more than the launches it saves. PET_MD_FIXED=0|1 decides instead.
+  opts.md_fixed_shapes = mode == Mode::Images && atom->natoms <= 2000;
   try {
     calc = std::make_unique<pet::Calculator>(arg[0], opts);
   } catch (std::exception &e) {
