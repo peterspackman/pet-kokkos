@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -572,7 +573,14 @@ void EdgeSession::finish(int N, int n_local, IView1D species, IView1D re_i, IVie
     dev.exchange = exchange;
     dev.remote_raw = remote;
   }
-  M = 0, valid = true;
+  M = 0, E_cap = 0, valid = true;
+}
+
+bool EdgeSession::overflowed() const {
+  if (dev.overflow.extent(0) == 0) return false;
+  int over = 0;
+  Kokkos::deep_copy(over, Kokkos::subview(dev.overflow, 0));
+  return over != 0;
 }
 
 const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device, const double* cell,
@@ -590,10 +598,9 @@ const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device,
   } else if (N) {
     Kokkos::deep_copy(pos, Kokkos::View<const double**, Kokkos::LayoutRight, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(positions, N, 3));
   }
-  double hc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
-  if (cell) std::copy(cell, cell + 9, hc);
-  const double h0 = hc[0], h1 = hc[1], h2 = hc[2], h3 = hc[3], h4 = hc[4], h5 = hc[5], h6 = hc[6], h7 = hc[7],
-               h8 = hc[8];
+  set_cell(cell);
+  Kokkos::deep_copy(ExecSpace(), d_cell, h_cell);
+  auto hc = d_cell;
   auto re_i = dev.raw_center, re_j = dev.raw_neigh;
   auto vec = dev.raw_vec;
   auto dist = dev.raw_dist;
@@ -601,9 +608,9 @@ const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device,
   Kokkos::parallel_for(
       "md_vectors", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
         const int i = re_i(e), j = re_j(e), a = sh(e, 0), b = sh(e, 1), c = sh(e, 2);
-        const double x = pos(j, 0) + (a * h0 + b * h3 + c * h6) - pos(i, 0);
-        const double y = pos(j, 1) + (a * h1 + b * h4 + c * h7) - pos(i, 1);
-        const double z = pos(j, 2) + (a * h2 + b * h5 + c * h8) - pos(i, 2);
+        const double x = pos(j, 0) + (a * hc(0) + b * hc(3) + c * hc(6)) - pos(i, 0);
+        const double y = pos(j, 1) + (a * hc(1) + b * hc(4) + c * hc(7)) - pos(i, 1);
+        const double z = pos(j, 2) + (a * hc(2) + b * hc(5) + c * hc(8)) - pos(i, 2);
         const double d2 = x * x + y * y + z * z;
         vec(e, 0) = x, vec(e, 1) = y, vec(e, 2) = z;
         dist(e) = d2 > 1e-24 ? Kokkos::sqrt(d2) : 1e30;  // a coincident pair weighs nothing
@@ -613,20 +620,21 @@ const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device,
     edge_geometry(ws, dev, h, probes, P, m_high, 0, IView1D());
     return dev;
   }
-  // A capacity from this geometry's largest count, with room to move.
-  auto size_to_fit = [&] {
+  // Capacities from this geometry's largest count and kept edges, with room to
+  // move. Whether they held is in dev.overflow, read with the step's results:
+  // the caller grows them (grow) and redoes the step.
+  if (M == 0) {
     edge_geometry(ws, dev, h, probes, P, m_high, 0, IView1D());
-    M = dev.max_neighbors + std::max(2, dev.max_neighbors / 8);
-  };
-  if (M == 0) size_to_fit();
-  IView1D overflow = ws.i1("md:overflow", 1);
-  edge_geometry(ws, dev, h, probes, P, m_high, M, overflow);
-  int over = 0;
-  Kokkos::deep_copy(over, Kokkos::subview(overflow, 0));
-  if (over) {
-    size_to_fit();
-    edge_geometry(ws, dev, h, probes, P, m_high, M, overflow);
+    // Room for a few more neighbours and 5% more edges: a capacity outgrown before
+    // the next rebuild (which sizes them afresh) costs a step and a recapture.
+    const int dm = 2, de = std::max(64, dev.n_edges / 20);
+    M = dev.max_neighbors + dm;
+    E_cap = dev.n_edges + de;
+    sized = true;
   }
+  IView1D overflow = ws.i1("md:overflow", 1);
+  Kokkos::deep_copy(ExecSpace(), overflow, 0);
+  edge_geometry(ws, dev, h, probes, P, m_high, M, overflow, E_cap);
   return dev;
 }
 

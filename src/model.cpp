@@ -375,11 +375,31 @@ PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
         if (final && n == N - 1) off(N) = upd;
       });
   if (N == 0) Kokkos::deep_copy(ExecSpace(), off, 0);
+  // A capacity: what does not fit is flagged and cut off (the caller redoes the
+  // step with more room), and the rows past the kept edges are dead -- no atom's,
+  // no partner, zero weight -- so they move nothing.
+  const int E = p.E;
+  if (d.edge_capacity) {
+    auto overflow = d.overflow;
+    Kokkos::parallel_for(
+        "pk_capacity", RangePolicy(0, N + 1), KOKKOS_LAMBDA(int n) {
+          if (n == N && off(N) > E) overflow(0) = 1;
+          if (off(n) > E) off(n) = E;
+        });
+    Kokkos::parallel_for(
+        "pk_dead", RangePolicy(0, E), KOKKOS_LAMBDA(int k) {
+          if (k < off(N)) return;
+          center(k) = 0, species(k) = 0, reverse(k) = -1;
+          for (int c = 0; c < 3; ++c) vec(k, c) = 0.0;
+          dist(k) = 1.0, pcut(k) = 1.0, cut(k) = Net(0);
+        });
+  }
   Kokkos::parallel_for(
       "pk_edges", RangePolicy(0, N * M), KOKKOS_LAMBDA(int k) {
         const int n = k / M;
         if (mask(k) <= 0.0) return (void) (pos(k) = -1);
         const int e = off(n) + kept(n, k % M);
+        if (e >= off(n + 1)) return (void) (pos(k) = -1);  // past a capacity
         pos(k) = e, center(e) = n, species(e) = nsp(k);
         for (int c = 0; c < 3; ++c) vec(e, c) = ev(k, c);
         dist(e) = dd(k), pcut(e) = dpc(k), cut(e) = dcut(k);
@@ -511,9 +531,11 @@ void PetModel::readout_bwd(const ReadoutSaves& sav, int i, const PackedEdges& pk
   const int nl = pk.n_local;  // ghosts shape the energy but are not in it
   Kokkos::parallel_for(
       "ro_seed_n", RangePolicy(0, N), KOKKOS_LAMBDA(int n) { npa(n, 0) = n < nl ? Net(1) : Net(0); });
+  auto off = pk.off;
+  const int nc = pk.off.extent(0) - 1;
   Kokkos::parallel_for(
       "ro_seed_e", RangePolicy(0, E), KOKKOS_LAMBDA(int k) {
-        const bool own = center(k) < nl;
+        const bool own = k < off(nc) && center(k) < nl;  // a capacity's dead rows: no one's
         epa(k, 0) = own ? cut(k) : Net(0);
         const Net ep = own ? epred(k, 0) : Net(0);
         cutoff_adj(k) = acc ? cutoff_adj(k) + ep : ep;

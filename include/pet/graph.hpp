@@ -74,8 +74,11 @@ class GraphCache {
   GraphCache& operator=(const GraphCache&) = delete;
   ~GraphCache() { reset(); }
 
+  // capture_now: record on first sight rather than running eagerly first, for a
+  // caller that has just run the same shapes (so nothing allocates). If that
+  // capture fails, the key is run eagerly and recorded the next time.
   template <class F>
-  Out run(const Key& key, F&& work) {
+  Out run(const Key& key, F&& work, bool capture_now = false) {
 #if defined(PET_HAVE_GRAPHS)
     if (broken_) return work();
     ++tick_;
@@ -85,10 +88,11 @@ class GraphCache {
         gpu::launch(g.exec);
         return g.out;
       }
-    if (std::find(seen_.begin(), seen_.end(), key) == seen_.end()) {  // first sight: run eagerly
+    const bool seen = std::find(seen_.begin(), seen_.end(), key) != seen_.end();
+    if (!seen) {
       if (seen_.size() >= 2 * kKeep) seen_.erase(seen_.begin());
       seen_.push_back(key);
-      return work();
+      if (!capture_now) return work();  // first sight: run eagerly
     }
     gpu::Graph graph = nullptr;
     gpu::Exec exec = nullptr;
@@ -109,6 +113,7 @@ class GraphCache {
       if (graph) gpu::destroy(graph);
     }
     gpu::clear_error();  // the failed capture's sticky error
+    if (!seen) return work();  // an early attempt: eagerly now, recorded next time
     broken_ = true;
     return work();
 #else

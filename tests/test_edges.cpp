@@ -586,3 +586,51 @@ TEST_CASE("a list set on the device gives what the same list set from the host d
     }
   }
 }
+
+TEST_CASE("a device-resident engine's recorded steps are its eager ones", "[model][edges]") {
+  // Fixed shapes record the whole step (geometry, network, totals) as one graph
+  // and replay it: every step must be the same shapes run eagerly, to the bit,
+  // through moves, a compression that outgrows the capacities, and a new cell.
+  for (const auto& model : plumbing_models()) {
+    const auto found = find_model(model);
+    Golden store;
+    const Golden* g = found ? first_periodic(model, store) : nullptr;
+    if (!g) continue;
+    DYNAMIC_SECTION(model) {
+      pet::Options fixed, eager;
+      fixed.md_fixed_shapes = eager.md_fixed_shapes = true;
+      eager.graphs = false;
+      pet::Calculator a(found->first, found->second, fixed), b(found->first, found->second, eager);
+      pet::System s = g->system;
+      const int n = s.n_atoms;
+      const PeriodicList list = periodic_list(s, a.cutoff() + 1.0, true);
+      a.set_neighbors(list.view(s));
+      b.set_neighbors(list.view(s));
+      using D2 = Kokkos::View<double**, Kokkos::LayoutRight, pet::MemSpace>;
+      D2 x("x", n, 3), fa("fa", n, 3), fb("fb", n, 3);
+      const pet::System s0 = s;
+      for (int step = 0; step < 8; ++step) {
+        const double scale = step == 5 ? 0.97 : 1.0;
+        for (std::size_t i = 0; i < s.positions.size(); ++i)
+          s.positions[i] = scale * s0.positions[i] + 0.02 * std::sin(1.3 * i + step);
+        for (int k = 0; k < 9; ++k) s.cell[k] = scale * s0.cell[k];
+        Kokkos::deep_copy(x, Kokkos::View<const double**, Kokkos::LayoutRight, Kokkos::HostSpace,
+                                          Kokkos::MemoryUnmanaged>(s.positions.data(), n, 3));
+        Kokkos::deep_copy(fa, 0.0), Kokkos::deep_copy(fb, 0.0);
+        pet::Calculator::DeviceArrays da, db;
+        da.positions = db.positions = x.data();
+        da.forces = fa.data(), db.forces = fb.data();
+        const pet::Calculator::Totals ta = a.compute_step(da, s.cell.data()), tb = b.compute_step(db, s.cell.data());
+        auto ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), fa);
+        auto hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), fb);
+        INFO("step " << step);
+        CHECK(ta.energy == tb.energy);
+        for (int k = 0; k < 6; ++k) CHECK(ta.virial[k] == tb.virial[k]);
+        bool same = true;
+        for (int i = 0; i < n; ++i)
+          for (int c = 0; c < 3; ++c) same = same && ha(i, c) == hb(i, c);
+        CHECK(same);
+      }
+    }
+  }
+}

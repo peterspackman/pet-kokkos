@@ -141,7 +141,15 @@ struct EdgeSession {
   IView2D shift;                  // [E, 3] each directed edge's image shift
   std::vector<int> src;           // [E] each directed edge's pair in the engine's list (empty: the same)
   std::vector<signed char> dir;   // [E] +1 as listed, -1 its mirror
-  int n_pairs = 0, M = 0;
+  int n_pairs = 0, M = 0, E_cap = 0;  // fixed: the capacities, 0 until a step sizes them
+  bool sized = false;                  // the last step sized them (and so allocated for them)
+  // The cell, read by the step's kernels from device memory (copied there from
+  // pinned host memory each step), so a recorded step follows it.
+  RView1D d_cell{"md:cell", 9};
+  Kokkos::View<double*, Kokkos::SharedHostPinnedSpace> h_cell{"md:h_cell", 9};
+  void set_cell(const double* cell) {
+    for (int k = 0; k < 9; ++k) h_cell(k) = cell ? cell[k] : 0.0;
+  }
   bool shifted = false, valid = false;
 
   void set(const EdgeListView& v, const std::vector<int>& species_to_index);
@@ -151,6 +159,9 @@ struct EdgeSession {
   // positions: host, or device when on_device.
   const DeviceEdgeData& step(const double* positions, bool on_device, const double* cell, const Hypers& h,
                              RView1D probes, int P, bool fixed);
+  // After a fixed step overflowed: size the capacities afresh at the next.
+  bool overflowed() const;
+  void grow() { M = 0, E_cap = 0; }
 };
 
 // Stage host structures into views from `ws`: species through

@@ -329,8 +329,14 @@ void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdg
   auto off = pk.off, center = pk.center, rev = pk.reverse;
   auto vec = pk.vec;
   auto dist = pk.dist, pcut = pk.pcut;
+  const int nc = pk.off.extent(0) - 1;
   Kokkos::parallel_for(
       "edge_grad", RangePolicy(0, E), KOKKOS_LAMBDA(int k) {
+        if (k >= off(nc)) {  // a capacity's dead row
+          for (int c = 0; c < 3; ++c) grad(k, c) = 0.0;
+          if (adaptive) pc_adj(k) = 0.0;
+          return;
+        }
         const int n = center(k), m = k - off(n);
         const double cutoff_total = cutoff_adj(k) + cf_seq_adj(n, 1 + m);
         const double dcut_dd = cutoff_ddist(dist(k), pcut(k), width, bump);

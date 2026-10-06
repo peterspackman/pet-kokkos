@@ -65,9 +65,11 @@ struct Options {
   // A cap on atoms per batch ahead of the memory estimate; 0 = none.
   int max_batch_atoms = 0;
 
-  // compute_step: size every step between neighbour-list rebuilds to one fixed
-  // capacity, so each replays one CUDA graph. It pads every atom to the largest
-  // neighbour count plus a margin, which has so far cost more than replay saves.
+  // compute_step: give every step between neighbour-list rebuilds the same
+  // shapes -- capacities for the kept edges and the neighbour count, sized with
+  // room to move and grown (the step redone) when outgrown -- so each replays
+  // one CUDA/HIP graph instead of launching ~200 kernels. PET_MD_FIXED=0|1
+  // overrides it.
   bool md_fixed_shapes = false;
 };
 

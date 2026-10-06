@@ -206,7 +206,7 @@ void edge_topology(Workspace& ws, EdgeMap& edge_map, DeviceEdgeData& dev, int N,
 }
 
 void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D probes, int P, int& m_high,
-                   int m_fixed, IView1D overflow) {
+                   int m_fixed, IView1D overflow, int e_fixed) {
   const bool adaptive = h.adaptive(), bump = h.cutoff_function == CutoffFunction::Bump;
   const double width = h.cutoff_width, cutoff = h.cutoff;
   const int N = dev.n_atoms, NC = dev.centres(), E = dev.n_raw;
@@ -248,7 +248,8 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
   // `overflow` for the caller to grow M and redo.
   int M = m_fixed;
   if (m_fixed > 0) {
-    dev.n_edges = NC * M, dev.padded = true;
+    if (e_fixed > 0) dev.n_edges = e_fixed, dev.padded = false, dev.edge_capacity = true, dev.overflow = overflow;
+    else dev.n_edges = NC * M, dev.padded = true;
     Kokkos::parallel_for(
         "pet_overflow", RangePolicy(0, NC), KOKKOS_LAMBDA(int a) {
           if (count(a) > m_fixed) overflow(0) = 1;

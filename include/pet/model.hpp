@@ -50,6 +50,11 @@ struct DeviceEdgeData {
   int n_raw = 0;          // raw (pre-adaptive-cutoff) edges
   int n_edges = -1;       // kept edges; -1 = unknown, counted when needed
   bool padded = false;    // every slot is an edge row, padding zero-weight: fixed shapes
+  // n_edges is a capacity: the kept edges are packed into its first rows (their
+  // count is the packed offsets' last), the rest are dead, and more than fit
+  // set overflow(0). Fixed shapes without padding every atom to M.
+  bool edge_capacity = false;
+  IView1D overflow;
   int n_centres = -1;     // atoms [0, n_centres) have neighbourhoods and are the
                           // model's rows; the rest are only neighbours (over
                           // several ranks, the ghosts). -1 = all
@@ -217,6 +222,8 @@ class PetModel {
   void set_memory_policy(std::size_t budget_bytes, Recompute r) { mem_budget_ = budget_bytes, recompute_ = r; }
   // Replay repeated evaluations as one CUDA graph (graph.hpp). On by default.
   void set_graphs(bool on) { graphs_ = on; }
+  bool graphs() const { return graphs_; }
+  std::size_t ws_generation() const { return ws_.generation(); }
 
   // What evaluations have cost, for sizing batches: the pool, largest buffers
   // first, and the largest shapes seen so far (the pool is grow-only, so it

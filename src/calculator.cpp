@@ -5,6 +5,8 @@
 #include "pet/device_geometry.hpp"
 #include "pet/device_neighbors.hpp"
 #include "pet/gemm.hpp"
+#include "pet/graph.hpp"
+#include "pet/ozaki.hpp"
 #include "pet/model.hpp"
 #include "pet/neighbors.hpp"
 
@@ -16,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
@@ -154,6 +157,12 @@ struct Calculator::Impl {
   EdgeMap nbr_edge_map{16};
   int nbr_m_high = 0;
   NefCache cache;
+  // compute_step's totals -- energy, virial, whether fixed shapes held -- in one
+  // small copy to pinned host memory.
+  RView1D totals{"pet:totals", 8};
+  Kokkos::View<double*, Kokkos::SharedHostPinnedSpace> h_totals{"pet:h_totals", 8};
+  // With fixed shapes, a whole step -- geometry, network, totals -- as one graph.
+  GraphCache<BatchResult> step_graph;
   EdgeSession md;  // an engine's list (compute_edges, set_neighbors)
 
   std::vector<int> atomic_types;
@@ -163,6 +172,7 @@ struct Calculator::Impl {
     for (int z = 0; z < (int) ckpt.species_to_index.size(); ++z)
       if (ckpt.species_to_index[z] >= 0) atomic_types.push_back(z);
     if (o.gemm != GemmMode::Native) gemm_mode() = o.gemm;
+    if (const char* f = std::getenv("PET_MD_FIXED")) opts.md_fixed_shapes = f[0] == '1';
     std::size_t free_b = 0, total_b = 0;
     device_memory(o, free_b, total_b);
     // PET_GRAPHS=0 is for profilers that fence around every kernel.
@@ -375,16 +385,65 @@ void Calculator::set_neighbors(const DeviceEdgeListView& list) { impl_->md.set(l
 Results Calculator::compute_step(const double* positions, const double* cell, bool compute_forces,
                                  bool edge_gradients) const {
   auto& I = *impl_;
-  const DeviceEdgeData& dev =
-      I.md.step(positions, false, cell, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), I.opts.md_fixed_shapes);
-  return session_results(dev, compute_forces, edge_gradients);
+  for (;;) {
+    const DeviceEdgeData& dev = I.md.step(positions, false, cell, I.ckpt.hypers, I.model.probes(),
+                                          I.model.n_probes(), I.opts.md_fixed_shapes);
+    Results r = session_results(dev, compute_forces, edge_gradients);
+    if (!I.md.overflowed()) return r;
+    I.md.grow();  // the capacities did not hold: again, with more room
+  }
 }
 
 Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double* cell) const {
   auto& I = *impl_;
-  const DeviceEdgeData& dev = I.md.step(a.positions, true, cell, I.ckpt.hypers, I.model.probes(),
-                                        I.model.n_probes(), I.opts.md_fixed_shapes);
-  const BatchResult br = I.model.energy_forces_batch(dev, a.forces != nullptr);
+  // The totals first, with whether fixed shapes held: if not, again with more
+  // room, before anything is added into the engine's arrays.
+  Totals t;
+  BatchResult br;
+  const bool forces = a.forces != nullptr;
+  auto work = [&]() -> BatchResult {
+    const DeviceEdgeData& dev = I.md.step(a.positions, true, cell, I.ckpt.hypers, I.model.probes(),
+                                          I.model.n_probes(), I.opts.md_fixed_shapes);
+    BatchResult r = I.model.energy_forces_batch(dev, forces);
+    auto tot = I.totals, energy = r.energy;
+    auto virial = r.virial;
+    auto over = dev.overflow;
+    const bool has_virial = forces && virial.extent(0) > 0, has_over = over.extent(0) > 0;
+    Kokkos::parallel_for(
+        "md_totals", RangePolicy(0, 1), KOKKOS_LAMBDA(int) {
+          tot(0) = energy(0);
+          for (int k = 0; k < 6; ++k) tot(1 + k) = has_virial ? virial(0, k) : 0.0;
+          tot(7) = has_over ? over(0) : 0;
+        });
+    Kokkos::deep_copy(ExecSpace(), I.h_totals, tot);
+    return r;
+  };
+  for (;;) {
+    // Recorded once the capacities are sized (sizing reads counts back), and not
+    // over several ranks (the exchange calls the engine mid-step). The cell
+    // reaches a replay through set_cell.
+    const bool record = I.opts.md_fixed_shapes && I.model.graphs() && I.md.M > 0 && !I.md.dev.exchange &&
+                        !ozaki_active();
+    if (record) {
+      I.md.set_cell(cell);
+      const GraphCache<BatchResult>::Key key{
+          (std::uintptr_t) forces, (std::uintptr_t) a.positions, (std::uintptr_t) I.md.dev.n_atoms,
+          (std::uintptr_t) I.md.dev.n_raw, (std::uintptr_t) I.md.M, (std::uintptr_t) I.md.E_cap,
+          I.md.ws.generation(), I.model.ws_generation(), lowp_generation(), (std::uintptr_t) gemm_mode()};
+      I.model.set_graphs(false);  // one graph: the model's own is inside it
+      const bool just_sized = I.md.sized;  // the last step ran these shapes: nothing left to allocate
+      I.md.sized = false;
+      br = I.step_graph.run(key, work, just_sized);
+      I.model.set_graphs(true);
+    } else {
+      br = work();
+    }
+    ExecSpace().fence("pet: compute_step totals");
+    if (I.h_totals(7) == 0.0) break;
+    I.md.grow();  // the capacities did not hold: again, with more room
+  }
+  t.energy = I.h_totals(0);
+  const DeviceEdgeData& dev = I.md.dev;
   const int N = dev.n_atoms;
   using Out = Kokkos::View<double**, Kokkos::LayoutRight, MemSpace, Kokkos::MemoryUnmanaged>;
   if (a.forces) {
@@ -429,12 +488,8 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
           for (int k = 0; k < 6; ++k) w(i, k) += scale * s[k];
         });
   }
-  Totals t;
-  auto e = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), br.energy);
-  t.energy = e(0);
   if (!a.forces) return t;
-  auto w = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), br.virial);
-  for (int k = 0; k < 6; ++k) t.virial[k] = w(0, k);
+  for (int k = 0; k < 6; ++k) t.virial[k] = I.h_totals(1 + k);
   return t;
 }
 

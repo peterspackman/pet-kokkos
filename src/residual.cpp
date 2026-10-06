@@ -154,7 +154,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     Kokkos::parallel_for(
         "reb_et", RangePolicy(0, E * D), KOKKOS_LAMBDA(int i) {
           const int k = i / D, d = i % D, n = center(k);
-          et_adj(k, d) = tokens_adj(n * S + 1 + k - off(n), d);
+          et_adj(k, d) = k < off(N) ? tokens_adj(n * S + 1 + k - off(n), d) : Net(0);  // past: a capacity's dead rows
           ie_next(k, d) = has_msg ? Net(0.5) * ie_adj(k, d) : Net(0);
         });
     linear_bwd(cpre_adj, et_adj, mat(g + ".compress.2.weight"));
