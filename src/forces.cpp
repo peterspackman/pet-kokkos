@@ -172,12 +172,19 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
           if (r == P - 2) B += -Cq(a, P - 1);
           diff_adj(a, r) += B;
         });
+    // bump_ddist(d, probe) is 0 unless the probe lies in (d, d + width): on the
+    // uniform grid that is a few probes, found directly (one more each side
+    // against rounding; those come out 0). An edge past the cutoff -- the
+    // engine's skin -- touches none.
     Kokkos::parallel_for(
         "ad_gmag_grid", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
           const double d = dist(e);
           if (d <= 0.0) return (void) (gmag(e) = 0.0);
+          const double p0 = probes(0), dp = P > 1 ? probes(1) - probes(0) : 1.0;
+          const int lo = Kokkos::max((int) Kokkos::floor((d - p0) / dp), 0);
+          const int hi = Kokkos::min((int) Kokkos::ceil((d + width - p0) / dp) + 1, P);
           double da = 0.0;
-          for (int p = 0; p < P; ++p) da += diff_adj(center(e), p) * bump_ddist(d, probes(p), width);
+          for (int p = lo; p < hi; ++p) da += diff_adj(center(e), p) * bump_ddist(d, probes(p), width);
           gmag(e) = scale * da / d;
         });
   }
