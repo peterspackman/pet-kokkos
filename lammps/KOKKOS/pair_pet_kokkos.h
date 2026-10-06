@@ -46,11 +46,15 @@ template <class DeviceType> class PairPETKokkos : public PairPET, public KokkosB
   int pack_reverse_comm_kokkos(int, int, DAT::tdual_xfloat_1d &) override;
   void unpack_reverse_comm_kokkos(int, DAT::tdual_int_1d, DAT::tdual_xfloat_1d &) override;
 
+  // Public only because nvcc refuses a device lambda inside a private member.
+  void rebuild();
+  const double *positions();
+
  private:
   typename AT::tdual_efloat_1d k_eatom;
   typename AT::tdual_virial_array k_vatom;
   Kokkos::View<double *[3], Kokkos::LayoutRight, DeviceType> x_rows;  // x, if LAMMPS's is not row-major
-  void rebuild();
+  Kokkos::View<int *, DeviceType> d_type_z, d_z, d_owned_by_tag, d_image_of;  // for a rebuild on the device
   bool mpi_gpu_aware() const override;
   pet::RView1D d_atom;  // what the device comm hooks move
 };

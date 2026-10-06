@@ -155,6 +155,8 @@ class Calculator {
   // drift past the cutoff weigh nothing; pairs past the list's own reach are the
   // engine's to rebuild for, as with any Verlet list. See md_fixed_shapes.
   void set_neighbors(const EdgeListView& list);
+  // A list already on the device (DeviceEdgeListView), set without a host copy.
+  void set_neighbors(const DeviceEdgeListView& list);
   Results compute_step(const double* positions, const double* cell = nullptr, bool compute_forces = true,
                        bool edge_gradients = false) const;
 

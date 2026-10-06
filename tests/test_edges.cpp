@@ -476,3 +476,113 @@ TEST_CASE("ranks that exchange messages reproduce the periodic evaluation", "[mo
     }
   }
 }
+
+namespace {
+
+// A domain's list as LAMMPS's KOKKOS package holds it on the device: ilist,
+// numneigh by atom, and a 2-D neighbour array, column-major (as on CUDA) and
+// with a bit above the index that the mask must drop.
+struct DeviceList {
+  using IV = Kokkos::View<int*, pet::MemSpace>;
+  IV ilist, numneigh, neighbors, z, image_of;
+  Kokkos::View<double*, pet::MemSpace> pos;
+  int n_all = 0, width = 0;
+  static constexpr int kSpecial = 1 << 30, kMask = (1 << 29) - 1;
+
+  explicit DeviceList(const Domain& d, int centres) {
+    n_all = d.z.size();
+    for (int i = 0; i < centres; ++i) width = std::max(width, d.off[i + 1] - d.off[i]);
+    std::vector<int> il(centres), nn(n_all, 0), nb(std::size_t(n_all) * std::max(width, 1), -1);
+    for (int i = 0; i < centres; ++i) {
+      il[i] = i, nn[i] = d.off[i + 1] - d.off[i];
+      for (int k = 0; k < nn[i]; ++k) nb[i + std::size_t(k) * n_all] = d.nbr[d.off[i] + k] | kSpecial;
+    }
+    ilist = upload(il), numneigh = upload(nn), neighbors = upload(nb), z = upload(d.z), image_of = upload(d.owner);
+    pos = Kokkos::View<double*, pet::MemSpace>("pos", d.pos.size());
+    Kokkos::deep_copy(pos, Kokkos::View<const double*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(d.pos.data(), d.pos.size()));
+  }
+  pet::DeviceEdgeListView view(int n_atoms, int n_local, int centres) const {
+    pet::DeviceEdgeListView v;
+    v.n_atoms = n_atoms, v.n_local = n_local, v.n_centres = centres;
+    v.ilist = ilist.data(), v.numneigh = numneigh.data(), v.neighbors = neighbors.data();
+    v.stride_i = 1, v.stride_k = n_all, v.mask = kMask;
+    v.atomic_numbers = z.data();
+    return v;
+  }
+  static IV upload(const std::vector<int>& h) {
+    IV d("v", h.size());
+    Kokkos::deep_copy(d, Kokkos::View<const int*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(h.data(), h.size()));
+    return d;
+  }
+};
+
+void require_same(const pet::Results& a, const pet::Results& b) {
+  REQUIRE(a.energy == b.energy);
+  REQUIRE(a.forces == b.forces);
+  REQUIRE(a.virial == b.virial);
+  REQUIRE(a.per_atom_energy == b.per_atom_energy);
+}
+
+}  // namespace
+
+TEST_CASE("a list set on the device gives what the same list set from the host does", "[model][edges]") {
+  for (const auto& model : plumbing_models()) {
+    const auto found = find_model(model);
+    Golden store;
+    const Golden* g = found ? first_periodic(model, store) : nullptr;
+    if (!g) continue;
+    pet::Calculator calc(found->first, found->second);
+    const pet::System& s = g->system;
+    const double rc = calc.cutoff();
+    const Domain d = make_domain(s, rc + 0.5, 0.0, rc + 0.5);  // lists for the owned atoms only
+    const DeviceList dl(d, d.n_local);
+
+    DYNAMIC_SECTION(model << " / images") {
+      // The host side: each ghost replaced by its owner, with the shift between them.
+      double inv[9];
+      const double* c = s.cell.data();
+      const double det = c[0] * (c[4] * c[8] - c[5] * c[7]) - c[1] * (c[3] * c[8] - c[5] * c[6]) + c[2] * (c[3] * c[7] - c[4] * c[6]);
+      const double adj[9] = {c[4] * c[8] - c[5] * c[7], c[2] * c[7] - c[1] * c[8], c[1] * c[5] - c[2] * c[4],
+                             c[5] * c[6] - c[3] * c[8], c[0] * c[8] - c[2] * c[6], c[2] * c[3] - c[0] * c[5],
+                             c[3] * c[7] - c[4] * c[6], c[1] * c[6] - c[0] * c[7], c[0] * c[4] - c[1] * c[3]};
+      for (int k = 0; k < 9; ++k) inv[k] = adj[k] / det;
+      std::vector<int> nbr, shifts;
+      for (int i = 0; i < d.n_local; ++i)
+        for (int e = d.off[i]; e < d.off[i + 1]; ++e) {
+          const int j = d.nbr[e], o = d.owner[j];
+          double r[3];
+          for (int x = 0; x < 3; ++x) r[x] = d.pos[3 * j + x] - d.pos[3 * o + x];
+          nbr.push_back(o);
+          for (int x = 0; x < 3; ++x)
+            shifts.push_back((int) std::lround(r[0] * inv[x] + r[1] * inv[3 + x] + r[2] * inv[6 + x]));
+        }
+      pet::EdgeListView hv;
+      hv.n_atoms = d.n_local, hv.positions = d.pos.data(), hv.atomic_numbers = d.z.data();
+      hv.offsets = d.off.data(), hv.neighbors = nbr.data(), hv.shifts = shifts.data(), hv.cell = c;
+      calc.set_neighbors(hv);
+      const pet::Results host = calc.compute_step(d.pos.data(), c, true, true);
+
+      pet::DeviceEdgeListView dv = dl.view(d.n_local, -1, d.n_local);
+      dv.image_of = dl.image_of.data(), dv.positions = dl.pos.data(), dv.cell = c;
+      calc.set_neighbors(dv);
+      const pet::Results device = calc.compute_step(d.pos.data(), c, true, true);
+      require_same(host, device);
+      REQUIRE(host.edge_gradient == device.edge_gradient);
+    }
+
+    DYNAMIC_SECTION(model << " / exchange") {
+      if (calc.hypers().featurizer_type != pet::FeaturizerType::FeedForward) continue;
+      ImageExchange x(d);
+      pet::EdgeListView hv = view(d);
+      hv.exchange = &x;
+      calc.set_neighbors(hv);
+      const pet::Results host = calc.compute_step(d.pos.data(), nullptr, true, false);
+
+      pet::DeviceEdgeListView dv = dl.view(d.z.size(), d.n_local, d.n_local);
+      dv.exchange = &x;
+      calc.set_neighbors(dv);
+      const pet::Results device = calc.compute_step(d.pos.data(), nullptr, true, false);
+      require_same(host, device);
+    }
+  }
+}

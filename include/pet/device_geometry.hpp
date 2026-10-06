@@ -105,6 +105,31 @@ struct EdgeListView {
   Exchange* exchange = nullptr;
 };
 
+// The same, for an engine whose full list is already on the device (LAMMPS's
+// KOKKOS package): every pointer is device memory, and the list never visits
+// the host. Centre ilist[ii], ii < n_centres, has numneigh[i] neighbours,
+// neighbors[i * stride_i + k * stride_k] & mask (strides, so either layout of
+// the engine's 2-D array will do; the mask drops bits the engine keeps above
+// the index). The pairs are taken in atom order, each atom's in list order.
+//
+// Periodic images instead of ghosts: with image_of, a neighbour j is replaced by
+// the owned atom image_of[j] and the lattice shift between them, worked out from
+// `positions` and `cell` as they are at the call.
+struct DeviceEdgeListView {
+  int n_atoms = 0, n_local = -1, n_centres = 0;
+  const int* ilist = nullptr;           // [n_centres]
+  const int* numneigh = nullptr;        // indexed by atom
+  const int* neighbors = nullptr;
+  long stride_i = 0, stride_k = 1;
+  int mask = ~0;
+  const int* atomic_numbers = nullptr;  // [n_atoms]
+  const int* image_of = nullptr;        // [n_atoms], optional
+  const double* positions = nullptr;    // [n_atoms, 3], row-major; with image_of
+  const double* cell = nullptr;         // [9] lattice vectors as rows (host); with image_of
+  int charge = 0, spin_multiplicity = 1;
+  Exchange* exchange = nullptr;         // as EdgeListView's
+};
+
 // An engine's list on the device between its rebuilds: the topology once (set),
 // the geometry per step. A half list is mirrored here, each atom's own pairs
 // first. With `fixed`, M is a capacity chosen at the first step, so every step
@@ -114,12 +139,15 @@ struct EdgeSession {
   EdgeMap map{16};
   DeviceEdgeData dev;
   IView2D shift;                  // [E, 3] each directed edge's image shift
-  std::vector<int> src;           // [E] each directed edge's pair in the engine's list
+  std::vector<int> src;           // [E] each directed edge's pair in the engine's list (empty: the same)
   std::vector<signed char> dir;   // [E] +1 as listed, -1 its mirror
   int n_pairs = 0, M = 0;
   bool shifted = false, valid = false;
 
   void set(const EdgeListView& v, const std::vector<int>& species_to_index);
+  void set(const DeviceEdgeListView& v, const std::vector<int>& species_to_index);
+  void finish(int N, int n_local, IView1D species, IView1D re_i, IView1D re_j, IView2D re_shift, int E, int charge,
+              int spin, Exchange* exchange);
   // positions: host, or device when on_device.
   const DeviceEdgeData& step(const double* positions, bool on_device, const double* cell, const Hypers& h,
                              RView1D probes, int P, bool fixed);

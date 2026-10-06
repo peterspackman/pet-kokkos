@@ -353,6 +353,8 @@ Results Calculator::session_results(const DeviceEdgeData& dev, bool compute_forc
   if (br.edge_grad.extent(0) > 0) {
     std::vector<double> g;
     to_host(g, br.edge_grad);
+    if (s.src.empty())  // a list set on the device: the edges are the engine's pairs, as listed
+      for (std::size_t k = 0; k < out.edge_gradient.size() && k < g.size(); ++k) out.edge_gradient[k] = g[k];
     for (std::size_t e = 0; e < s.src.size(); ++e)
       for (int c = 0; c < 3; ++c) out.edge_gradient[std::size_t(s.src[e]) * 3 + c] += s.dir[e] * g[e * 3 + c];
   }
@@ -368,6 +370,7 @@ Results Calculator::compute_edges(const EdgeListView& edges, bool compute_forces
 }
 
 void Calculator::set_neighbors(const EdgeListView& list) { impl_->md.set(list, impl_->ckpt.species_to_index); }
+void Calculator::set_neighbors(const DeviceEdgeListView& list) { impl_->md.set(list, impl_->ckpt.species_to_index); }
 
 Results Calculator::compute_step(const double* positions, const double* cell, bool compute_forces,
                                  bool edge_gradients) const {

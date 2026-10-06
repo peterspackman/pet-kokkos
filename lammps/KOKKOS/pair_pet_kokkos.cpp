@@ -57,23 +57,79 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::init_style()
   request->set_kokkos_device(std::is_same_v<DeviceType, LMPDeviceType>);
 }
 
-// At a neighbour-list rebuild: LAMMPS's device list, copied to the host once, in
-// pet-kokkos's form.
+// At a neighbour-list rebuild: LAMMPS's device list, handed to pet-kokkos where
+// it is, with each atom's element and, in mode images, the owned atom each ghost
+// is an image of (by tag). Mode exchange still matches edges across ranks on the
+// host, so there the list is copied down once.
 template <class DeviceType> void PairPETKokkos<DeviceType>::rebuild()
 {
-  atomKK->sync(Host, X_MASK | TAG_MASK | TYPE_MASK);
   auto k_list = static_cast<NeighListKokkos<DeviceType> *>(list);
-  auto ilist = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k_list->d_ilist);
-  auto numneigh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k_list->d_numneigh);
-  auto neighbors = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k_list->d_neighbors);
-  List l;
-  l.n = list->inum + (mode == Mode::Ghosts ? list->gnum : 0);
-  l.ilist = ilist.data(), l.numneigh = numneigh.data();
-  l.neighbor = [&](int i, int k) { return neighbors(i, k) & NEIGHMASK; };
-  if (mode == Mode::Images) set_images(l, false);
-  else if (mode == Mode::Exchange) set_exchange(l);
-  else set_ghosts(l);
+  if (mode == Mode::Exchange) {
+    atomKK->sync(Host, X_MASK | TAG_MASK | TYPE_MASK);
+    auto ilist = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k_list->d_ilist);
+    auto numneigh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k_list->d_numneigh);
+    auto neighbors = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k_list->d_neighbors);
+    List l;
+    l.n = list->inum;
+    l.ilist = ilist.data(), l.numneigh = numneigh.data();
+    l.neighbor = [&](int i, int k) { return neighbors(i, k) & NEIGHMASK; };
+    set_exchange(l);
+    listed = true;
+    return;
+  }
+
+  atomKK->sync(execution_space, X_MASK | TAG_MASK | TYPE_MASK);
+  const int nlocal = atom->nlocal, nall = nlocal + atom->nghost, ntypes = atom->ntypes;
+  using Range = Kokkos::RangePolicy<DeviceType>;
+  if ((int) d_type_z.extent(0) != ntypes + 1) {
+    d_type_z = decltype(d_type_z)("pet:type_z", ntypes + 1);
+    Kokkos::deep_copy(d_type_z, Kokkos::View<const int *, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(type_z.data(), ntypes + 1));
+  }
+  if ((int) d_z.extent(0) < nall) d_z = decltype(d_z)("pet:z", nall), d_image_of = decltype(d_image_of)("pet:image_of", nall);
+  auto type = atomKK->k_type.template view<DeviceType>();
+  auto tag = atomKK->k_tag.template view<DeviceType>();
+  auto z = d_z, type_z_d = d_type_z;
+  Kokkos::parallel_for("pet_z", Range(0, nall), KOKKOS_LAMBDA(int i) { z(i) = type_z_d(type(i)); });
+
+  pet::DeviceEdgeListView v;
+  v.n_atoms = mode == Mode::Images ? nlocal : nall, v.n_local = nlocal;
+  v.n_centres = list->inum + (mode == Mode::Ghosts ? list->gnum : 0);
+  v.ilist = k_list->d_ilist.data(), v.numneigh = k_list->d_numneigh.data(), v.neighbors = k_list->d_neighbors.data();
+  v.stride_i = k_list->d_neighbors.stride(0), v.stride_k = k_list->d_neighbors.stride(1), v.mask = NEIGHMASK;
+  v.atomic_numbers = d_z.data();
+  double cell[9];
+  if (mode == Mode::Images) {  // one rank: every ghost an image of an owned atom, found by its tag
+    tagint max_tag = 0;
+    Kokkos::parallel_reduce(
+        "pet_max_tag", Range(0, nall), KOKKOS_LAMBDA(int i, tagint &m) { m = tag(i) > m ? tag(i) : m; },
+        Kokkos::Max<tagint>(max_tag));
+    if ((tagint) d_owned_by_tag.extent(0) <= max_tag) d_owned_by_tag = decltype(d_owned_by_tag)("pet:owned_by_tag", max_tag + 1);
+    auto by_tag = d_owned_by_tag, image_of = d_image_of;
+    Kokkos::deep_copy(by_tag, -1);
+    Kokkos::parallel_for("pet_owned_by_tag", Range(0, nlocal), KOKKOS_LAMBDA(int i) { by_tag(tag(i)) = i; });
+    Kokkos::parallel_for("pet_image_of", Range(0, nall), KOKKOS_LAMBDA(int j) { image_of(j) = by_tag(tag(j)); });
+    cell_rows(cell);
+    v.image_of = d_image_of.data(), v.positions = positions(), v.cell = cell;
+  }
+  try {
+    calc->set_neighbors(v);
+  } catch (std::exception &e) {
+    error->one(FLERR, "pair_style pet/kk: {}", e.what());
+  }
   listed = true;
+}
+
+// LAMMPS's positions as pet-kokkos takes them: [n, 3] row-major doubles.
+template <class DeviceType> const double *PairPETKokkos<DeviceType>::positions()
+{
+  auto x = atomKK->k_x.template view<DeviceType>();
+  if constexpr (std::is_same_v<typename decltype(x)::array_layout, Kokkos::LayoutRight>) {
+    return x.data();
+  } else {
+    if (x_rows.extent(0) < x.extent(0)) x_rows = decltype(x_rows)("pet:x_rows", x.extent(0));
+    Kokkos::deep_copy(Kokkos::subview(x_rows, std::make_pair(size_t(0), size_t(x.extent(0))), Kokkos::ALL), x);
+    return x_rows.data();
+  }
 }
 
 template <class DeviceType> void PairPETKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
@@ -91,16 +147,9 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::compute(int eflag_in
   atomKK->sync(execution_space, X_MASK | F_MASK | TYPE_MASK);
   if (neighbor->ago == 0 || !listed) rebuild();
 
-  auto x = atomKK->k_x.template view<DeviceType>();
   auto f = atomKK->k_f.template view<DeviceType>();
   pet::Calculator::DeviceArrays a;
-  if constexpr (std::is_same_v<typename decltype(x)::array_layout, Kokkos::LayoutRight>) {
-    a.positions = x.data();
-  } else {
-    if (x_rows.extent(0) < x.extent(0)) x_rows = decltype(x_rows)("pet:x_rows", x.extent(0));
-    Kokkos::deep_copy(Kokkos::subview(x_rows, std::make_pair(size_t(0), size_t(x.extent(0))), Kokkos::ALL), x);
-    a.positions = x_rows.data();
-  }
+  a.positions = positions();
   a.forces = energy_only(0) ? nullptr : f.data();  // no forces: no backward pass
   a.per_atom_energy = eflag_atom ? k_eatom.template view<DeviceType>().data() : nullptr;
   a.per_atom_virial = vflag_atom && a.forces ? k_vatom.template view<DeviceType>().data() : nullptr;

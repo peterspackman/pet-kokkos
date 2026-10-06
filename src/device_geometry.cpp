@@ -3,6 +3,8 @@
 #include "pet/device_geometry.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -407,6 +409,7 @@ DeviceEdgeData build_device_batch(const std::vector<System>& systems, const Hype
 void EdgeSession::set(const EdgeListView& v, const std::vector<int>& species_to_index) {
   const int N = v.n_atoms, L = N > 0 ? v.offsets[N] : 0;
   if (N > detail::PET_KEY_ATOM_MAX) throw std::runtime_error("pet: too many atoms for the edge key");
+  if (v.exchange && v.half) throw std::runtime_error("pet: an exchanged list must be full");
   std::vector<int> sp(N);
   for (int i = 0; i < N; ++i) sp[i] = species_index(species_to_index, v.atomic_numbers[i]);
   // Directed edges grouped by centre: each atom's listed pairs, then the mirrors
@@ -444,26 +447,132 @@ void EdgeSession::set(const EdgeListView& v, const std::vector<int>& species_to_
     Kokkos::deep_copy(re_i, HostI(ri.data(), E)), Kokkos::deep_copy(re_j, HostI(rj.data(), E));
     Kokkos::deep_copy(re_shift, Kokkos::View<const int**, Kokkos::LayoutRight, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(sh.data(), E, 3));
   }
+  finish(N, v.n_local, species, re_i, re_j, re_shift, E, v.charge, v.spin_multiplicity, v.exchange);
+  n_pairs = L, shifted = v.shifts != nullptr;
+}
+
+void EdgeSession::set(const DeviceEdgeListView& v, const std::vector<int>& species_to_index) {
+  const int N = v.n_atoms, NC = v.n_centres;
+  if (N > detail::PET_KEY_ATOM_MAX) throw std::runtime_error("pet: too many atoms for the edge key");
+  const int *ilist = v.ilist, *numneigh = v.numneigh, *nbr = v.neighbors, *z = v.atomic_numbers, *image = v.image_of;
+  const long si = v.stride_i, sk = v.stride_k;
+  const int mask = v.mask;
+
+  // Each atom's range: the centres' counts, scanned (atoms without a list have none).
+  IView1D off = ws.i1("md:off", N + 1), count = ws.i1("md:count", N);
+  Kokkos::deep_copy(ExecSpace(), count, 0);
+  Kokkos::parallel_for(
+      "md_dev_count", RangePolicy(0, NC), KOKKOS_LAMBDA(int ii) { count(ilist[ii]) = numneigh[ilist[ii]]; });
+  Kokkos::parallel_scan(
+      "md_dev_off", RangePolicy(0, N + 1), KOKKOS_LAMBDA(int i, int& c, bool final) {
+        if (final) off(i) = c;
+        if (i < N) c += count(i);
+      });
+  int E = 0;
+  Kokkos::deep_copy(E, Kokkos::subview(off, N));
+
+  // Species through the model's table.
+  const int T = species_to_index.size();
+  IView1D table = ws.i1("md:species_table", T), species = ws.i1("md:species", N);
+  Kokkos::deep_copy(table, Kokkos::View<const int*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(species_to_index.data(), T));
+  int bad = 0;
+  Kokkos::parallel_reduce(
+      "md_dev_species", RangePolicy(0, N),
+      KOKKOS_LAMBDA(int i, int& b) {
+        const int s = z[i] >= 0 && z[i] < T ? table(z[i]) : -1;
+        species(i) = s;
+        b += s < 0;
+      },
+      bad);
+  if (bad) throw std::runtime_error("pet: " + std::to_string(bad) + " atoms have elements the model does not cover");
+
+  // The pairs, a warp per centre. With images, each neighbour becomes the owned
+  // atom it is an image of, with the shift between them in fractional terms.
+  double inv[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  if (image) {
+    if (!v.cell || !v.positions) throw std::runtime_error("pet: images need the positions and the cell");
+    const double* c = v.cell;
+    const double det = c[0] * (c[4] * c[8] - c[5] * c[7]) - c[1] * (c[3] * c[8] - c[5] * c[6]) + c[2] * (c[3] * c[7] - c[4] * c[6]);
+    if (std::fabs(det) < 1e-12) throw std::runtime_error("pet: images need a cell with volume");
+    // inv such that f = d . inv for d = f . cell (cell rows the lattice vectors).
+    inv[0] = (c[4] * c[8] - c[5] * c[7]) / det, inv[1] = (c[2] * c[7] - c[1] * c[8]) / det, inv[2] = (c[1] * c[5] - c[2] * c[4]) / det;
+    inv[3] = (c[5] * c[6] - c[3] * c[8]) / det, inv[4] = (c[0] * c[8] - c[2] * c[6]) / det, inv[5] = (c[2] * c[3] - c[0] * c[5]) / det;
+    inv[6] = (c[3] * c[7] - c[4] * c[6]) / det, inv[7] = (c[1] * c[6] - c[0] * c[7]) / det, inv[8] = (c[0] * c[4] - c[1] * c[3]) / det;
+  }
+  const double i0 = inv[0], i1 = inv[1], i2 = inv[2], i3 = inv[3], i4 = inv[4], i5 = inv[5], i6 = inv[6], i7 = inv[7], i8 = inv[8];
+  const double* x = v.positions;
+  IView1D re_i = ws.i1("md:re_i", E), re_j = ws.i1("md:re_j", E);
+  IView2D re_shift = ws.i2("md:re_shift", E, 3);
+  int worst = 0;
+  Kokkos::parallel_reduce(
+      "md_dev_pairs", TeamPolicy(NC, 1, kLanes),
+      KOKKOS_LAMBDA(const TeamPolicy::member_type& t, int& w) {
+        const int i = ilist[t.league_rank()], e0 = off(i);
+        int tw = 0;
+        Kokkos::parallel_reduce(
+            Kokkos::ThreadVectorRange(t, numneigh[i]),
+            [&](int k, int& lw) {
+              const int j = nbr[i * si + k * sk] & mask, e = e0 + k;
+              int o = j, a = 0, b = 0, c = 0;
+              if (image) {
+                o = image[j];
+                if (o < 0) {
+                  lw = Kokkos::max(lw, 1 << 30);
+                  o = j;
+                } else {
+                  const double d0 = x[3 * j] - x[3 * o], d1 = x[3 * j + 1] - x[3 * o + 1], d2 = x[3 * j + 2] - x[3 * o + 2];
+                  a = (int) Kokkos::round(d0 * i0 + d1 * i3 + d2 * i6);
+                  b = (int) Kokkos::round(d0 * i1 + d1 * i4 + d2 * i7);
+                  c = (int) Kokkos::round(d0 * i2 + d1 * i5 + d2 * i8);
+                  lw = Kokkos::max(lw, Kokkos::max(Kokkos::abs(a), Kokkos::max(Kokkos::abs(b), Kokkos::abs(c))));
+                }
+              }
+              re_i(e) = i, re_j(e) = o;
+              re_shift(e, 0) = a, re_shift(e, 1) = b, re_shift(e, 2) = c;
+            },
+            Kokkos::Max<int>(tw));
+        Kokkos::single(Kokkos::PerTeam(t), [&] { w = Kokkos::max(w, tw); });
+      },
+      Kokkos::Max<int>(worst));
+  if (worst == (1 << 30)) throw std::runtime_error("pet: a neighbour is not an image of an owned atom");
+  if (worst > detail::PET_KEY_SHIFT_BIAS) throw std::runtime_error("pet: cell shift too large for the edge key");
+  finish(N, v.n_local, species, re_i, re_j, re_shift, E, v.charge, v.spin_multiplicity, v.exchange);
+  src.clear(), dir.clear();
+  n_pairs = E, shifted = image != nullptr;
+}
+
+// What both kinds of list end with: the topology, and over several ranks the
+// edges to ghosts, in the engine's order.
+void EdgeSession::finish(int N, int n_local, IView1D species, IView1D re_i, IView1D re_j, IView2D re_shift, int E,
+                         int charge, int spin, Exchange* exchange) {
   dev = DeviceEdgeData();
   edge_topology(ws, map, dev, N, species, re_i, re_j, re_shift, ws.r2("md:re_vec", E, 3), ws.r1("md:re_dist", E), E);
   dev.n_struct = 1;
-  dev.n_local = v.n_local < 0 ? N : v.n_local;
-  dev.n_centres = v.exchange ? dev.n_local : N;  // over several ranks, ghosts are only neighbours
+  dev.n_local = n_local < 0 ? N : n_local;
+  dev.n_centres = exchange ? dev.n_local : N;  // over several ranks, ghosts are only neighbours
   dev.struct_id = ws.i1("md:sid", N);  // zero-filled
   shift = re_shift;
   dev.charge = ws.i1("md:charge", 1), dev.spin_multiplicity = ws.i1("md:spin", 1);
-  Kokkos::deep_copy(dev.charge, v.charge), Kokkos::deep_copy(dev.spin_multiplicity, v.spin_multiplicity);
-  // Over several ranks, the edges to ghosts, in the engine's order.
-  if (v.exchange) {
-    if (v.half) throw std::runtime_error("pet: an exchanged list must be full");
-    std::vector<int> remote;
-    for (int e = 0; e < E; ++e)
-      if (rj[e] >= dev.n_local) remote.push_back(e);
-    dev.exchange = v.exchange;
-    dev.remote_raw = ws.i1("md:remote", remote.size());
-    if (!remote.empty()) Kokkos::deep_copy(dev.remote_raw, HostI(remote.data(), remote.size()));
+  Kokkos::deep_copy(dev.charge, charge), Kokkos::deep_copy(dev.spin_multiplicity, spin);
+  if (exchange) {
+    const int nl = dev.n_local;
+    IView1D at = ws.i1("md:remote_at", E + 1);
+    Kokkos::parallel_scan(
+        "md_remote_scan", RangePolicy(0, E + 1), KOKKOS_LAMBDA(int e, int& c, bool final) {
+          if (final) at(e) = c;
+          if (e < E) c += re_j(e) >= nl;
+        });
+    int R = 0;
+    Kokkos::deep_copy(R, Kokkos::subview(at, E));
+    IView1D remote = ws.i1("md:remote", R);
+    Kokkos::parallel_for(
+        "md_remote", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
+          if (re_j(e) >= nl) remote(at(e)) = e;
+        });
+    dev.exchange = exchange;
+    dev.remote_raw = remote;
   }
-  n_pairs = L, M = 0, shifted = v.shifts != nullptr, valid = true;
+  M = 0, valid = true;
 }
 
 const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device, const double* cell,
