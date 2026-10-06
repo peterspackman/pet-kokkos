@@ -244,14 +244,23 @@ IView1D structure_offsets(Workspace& ws, const std::string& key, IView1D sid, in
   return soff;
 }
 
+// A warp per (structure, column): lane l sums every kLanes-th atom from the
+// structure's l-th, in order, and the lanes combine in the reduction's fixed
+// tree. No atomics, so the same bits every run.
 void sum_by_structure(RView2D x, IView1D soff, RView2D out, bool acc) {
   const int T = x.extent(1);
   Kokkos::parallel_for(
-      "struct_sum", RangePolicy(0, out.extent(0) * T), KOKKOS_LAMBDA(int i) {
-        const int b = i / T, t = i % T;
+      "struct_sum", TeamPolicy(out.extent(0) * T, 1, kLanes), KOKKOS_LAMBDA(const TeamPolicy::member_type& m) {
+        const int b = m.league_rank() / T, t = m.league_rank() % T;
+        const int a0 = soff(b), a1 = soff(b + 1);
         double s = 0.0;
-        for (int a = soff(b); a < soff(b + 1); ++a) s += x(a, t);
-        out(b, t) = acc ? out(b, t) + s : s;
+        Kokkos::parallel_reduce(
+            Kokkos::ThreadVectorRange(m, kLanes),
+            [&](int l, double& part) {
+              for (int a = a0 + l; a < a1; a += kLanes) part += x(a, t);
+            },
+            s);
+        Kokkos::single(Kokkos::PerTeam(m), [&] { out(b, t) = acc ? out(b, t) + s : s; });
       });
 }
 

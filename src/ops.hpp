@@ -89,7 +89,7 @@ void attention_bwd(Workspace& ws, const std::string& key, View2D in_adj, View2D 
 // soff(b) = the first atom of structure b, soff(NS) = N. A structure's atoms are
 // contiguous; sid may be empty when NS == 1.
 IView1D structure_offsets(Workspace& ws, const std::string& key, IView1D sid, int N, int NS);
-// out(b, :) (+)= the sum of x over structure b's atoms, in atom order.
+// out(b, :) (+)= the sum of x over structure b's atoms, in a fixed order.
 void sum_by_structure(RView2D x, IView1D soff, RView2D out, bool acc);
 
 // Forces and virial from the adjoints the network leaves on each edge: x4_adj
