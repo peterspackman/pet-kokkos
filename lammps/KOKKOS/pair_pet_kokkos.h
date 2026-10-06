@@ -53,6 +53,7 @@ template <class DeviceType> class PairPETKokkos : public PairPET, public KokkosB
   // Public only because nvcc refuses a device lambda inside a private member.
   void rebuild();
   void route_on_device(const pet::DeviceEdgeListView &v);
+  void atoms_map(const pet::RView1D &owner);
   const double *positions();
 
  private:
@@ -62,6 +63,16 @@ template <class DeviceType> class PairPETKokkos : public PairPET, public KokkosB
   Kokkos::View<int *, DeviceType> d_type_z, d_z, d_owned_by_tag, d_image_of;  // for a rebuild on the device
   bool mpi_gpu_aware() const override;
   pet::RView1D d_atom;  // what the device comm hooks move
+  // Mode exchange's atom values, point to point with the owners rather than by
+  // LAMMPS's swaps (atoms_map, at each rebuild): this rank's ghosts grouped by
+  // owning rank (gh_order, gh_sc/gh_sd per rank), the owned atoms each rank asks
+  // this one for (srv_idx, srv_sc/srv_sd), and for the reverse each owned atom's
+  // arrivals in a fixed order (rev_off/rev_pos), summed without atomics.
+  bool p2p_atoms = false;
+  pet::IView1D d_gh_order, d_srv_idx, d_rev_off, d_rev_pos;
+  pet::RView1D d_val_out, d_val_in;
+  std::vector<int> gh_sc, gh_sd, srv_sc, srv_sd;
+  void lammps_forward(pet::RView1D a);
 };
 
 }    // namespace LAMMPS_NS

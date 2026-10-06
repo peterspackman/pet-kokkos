@@ -316,6 +316,7 @@ void PairPET::exchange_views()
   const int nprocs = comm->nprocs;
   d_row = pet::IView1D("pet:row", n_remote), d_live_at = pet::IView1D("pet:live_at", n_remote + 1);
   d_live_counts = pet::IView1D("pet:live_counts", nprocs), d_arrive = pet::IView1D("pet:arrive", nprocs + 1);
+  h_arrive = decltype(h_arrive)("pet:h_arrive", nprocs + 1);
 }
 
 // Rows of `width` bytes to each rank, in send_order; what arrives, in rank order.
@@ -351,10 +352,12 @@ void PairPET::exchange_rows(const void *out, void *in, int width, const std::vec
   char *o = (char *) out, *i = (char *) in;
   const auto bytes = [width](int rows) { return std::size_t(rows) * width; };
   if (got) got->assign(comm->nprocs, 0);
-  if (sc[me] > 0) Kokkos::deep_copy(Bytes(i + bytes(rd[me]), bytes(sc[me])), Bytes(o + bytes(sd[me]), bytes(sc[me])));
+  const pet::ExecSpace exec;
+  if (sc[me] > 0)  // in stream order, like everything around it
+    Kokkos::deep_copy(exec, Bytes(i + bytes(rd[me]), bytes(sc[me])), Bytes(o + bytes(sd[me]), bytes(sc[me])));
   if (got) (*got)[me] = sc[me];
-  Kokkos::fence();  // MPI does not follow the stream
   if (peers.empty()) return;
+  exec.fence("pet: rows ready for MPI");  // MPI does not follow the stream
 
   std::size_t n_out = 0, n_in = 0;
   for (int p : peers) n_out = std::max(n_out, bytes(sd[p] + sc[p])), n_in = std::max(n_in, bytes(rd[p] + rc[p]));
@@ -362,7 +365,8 @@ void PairPET::exchange_rows(const void *out, void *in, int width, const std::vec
   if (!gpu_aware) {
     if (h_send.extent(0) < n_out) h_send = decltype(h_send)("pet:h_send", n_out);
     if (h_recv.extent(0) < n_in) h_recv = decltype(h_recv)("pet:h_recv", n_in);
-    Kokkos::deep_copy(Kokkos::subview(h_send, std::make_pair(std::size_t(0), n_out)), Bytes(o, n_out));
+    Kokkos::deep_copy(exec, Kokkos::subview(h_send, std::make_pair(std::size_t(0), n_out)), Bytes(o, n_out));
+    exec.fence("pet: rows staged for MPI");
     so = h_send.data(), si = h_recv.data();
   }
   const int np = peers.size();
@@ -385,8 +389,11 @@ void PairPET::exchange_rows(const void *out, void *in, int width, const std::vec
       (*got)[p] = n / width;
     }
     if (!gpu_aware && n > 0)
-      Kokkos::deep_copy(Bytes(i + bytes(rd[p]), n), Kokkos::subview(h_recv, std::make_pair(bytes(rd[p]), bytes(rd[p]) + n)));
+      Kokkos::deep_copy(exec, Bytes(i + bytes(rd[p]), n),
+                        Kokkos::subview(h_recv, std::make_pair(bytes(rd[p]), bytes(rd[p]) + n)));
   }
+  // The staged rows reach the device in stream order; h_recv is not reused
+  // before the next exchange's fence.
 }
 
 // The edges PET keeps this evaluation (pet::Exchange::set_live): their rows in
@@ -398,9 +405,13 @@ void PairPET::set_live(pet::IView1D live)
 {
   using Range = Kokkos::RangePolicy<pet::ExecSpace>;
   const int nprocs = comm->nprocs, n_send = n_remote, n_live = live.extent(0);
+  const pet::ExecSpace exec;
   auto row = d_row, order = d_send_order, at = d_live_at, displs = d_send_displs, counts = d_live_counts;
-  Kokkos::deep_copy(row, -1);
-  Kokkos::parallel_for("pet_live_rows", Range(0, n_live), KOKKOS_LAMBDA(int l) { row(live(l)) = l; });
+  Kokkos::deep_copy(exec, row, -1);
+  Kokkos::parallel_for(
+      "pet_live_rows", Range(0, n_live), KOKKOS_LAMBDA(int l) {
+        if (live(l) >= 0) row(live(l)) = l;  // -1: a capacity's padding
+      });
   Kokkos::parallel_scan(
       "pet_live_scan", Range(0, n_send + 1), KOKKOS_LAMBDA(int q, int &c, bool final) {
         if (final) at(q) = c;
@@ -409,7 +420,10 @@ void PairPET::set_live(pet::IView1D live)
   Kokkos::parallel_for(
       "pet_live_counts", Range(0, nprocs), KOKKOS_LAMBDA(int p) { counts(p) = at(displs(p + 1)) - at(displs(p)); });
   live_sc.resize(nprocs), live_sd.assign(nprocs, 0), live_rd.assign(nprocs + 1, 0);
-  Kokkos::deep_copy(Kokkos::View<int *, Kokkos::HostSpace>(live_sc.data(), nprocs), counts);
+  if (h_counts.extent(0) < (size_t) nprocs + 1) h_counts = decltype(h_counts)("pet:h_counts", nprocs + 1);
+  Kokkos::deep_copy(exec, Kokkos::subview(h_counts, std::make_pair(0, nprocs)), counts);
+  exec.fence("pet: live counts");  // the one wait set_live needs: MPI sizes come from these
+  for (int p = 0; p < nprocs; ++p) live_sc[p] = h_counts(p);
   for (int p = 1; p < nprocs; ++p) live_sd[p] = live_sd[p - 1] + live_sc[p - 1];
   n_live_send = live_sd[nprocs - 1] + live_sc[nprocs - 1];
 
@@ -429,7 +443,8 @@ void PairPET::set_live(pet::IView1D live)
   n_live_arrive = live_rd[nprocs];
 
   if (d_arrive_row.extent(0) < (size_t) n_live_arrive) d_arrive_row = pet::IView1D("pet:arrive_row", n_live_arrive);
-  Kokkos::deep_copy(d_arrive, Kokkos::View<const int *, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(live_rd.data(), nprocs + 1));
+  for (int p = 0; p <= nprocs; ++p) h_arrive(p) = live_rd[p];
+  Kokkos::deep_copy(exec, d_arrive, Kokkos::subview(h_arrive, std::make_pair(0, nprocs + 1)));
   auto map = d_recv_map, rdisp = d_recv_displs, arrive = d_arrive, tag = d_recv_tag_all, arrive_row = d_arrive_row;
   Kokkos::parallel_for(
       "pet_live_arrive", Range(0, n_live_arrive), KOKKOS_LAMBDA(int a) {
@@ -456,7 +471,7 @@ void PairPET::edges(pet::View2D out, pet::View2D in)
       "pet_send_rows", Range(0, std::size_t(n_live_send) * D),
       KOKKOS_LAMBDA(std::size_t i) { send(i / D, i % D) = out(send_row(i / D), i % D); });
   exchange_rows(send.data(), recv.data(), D * sizeof(pet::Net), live_sc, live_sd, live_rc, live_rd);
-  Kokkos::deep_copy(in, pet::Net(0));  // a row with no partner (warned of at the rebuild) stays zero
+  Kokkos::deep_copy(pet::ExecSpace(), in, pet::Net(0));  // a row with no partner (warned of at the rebuild) stays zero
   Kokkos::parallel_for(
       "pet_recv_rows", Range(0, std::size_t(n_live_arrive) * D), KOKKOS_LAMBDA(std::size_t i) {
         const int r = arrive_row(i / D);

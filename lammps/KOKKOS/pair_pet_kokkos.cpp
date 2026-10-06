@@ -25,6 +25,7 @@
 #include "pet/calculator.hpp"
 
 #include <Kokkos_Sort.hpp>
+#include <algorithm>
 #include <cstdint>
 
 #include <type_traits>
@@ -139,7 +140,7 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::route_on_device(cons
   // Each ghost's owner: every rank's own number, forward to its ghosts.
   pet::RView1D owner("pet:owner", nall);
   Kokkos::parallel_for("pet_me", Range(0, nlocal), KOKKOS_LAMBDA(int i) { owner(i) = me; });
-  atoms_forward(owner);
+  lammps_forward(owner);
 
   // The edges to ghosts, in pet-kokkos's numbering: each atom's range, then its
   // pairs in list order, those to ghosts counted off by a scan.
@@ -250,7 +251,91 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::route_on_device(cons
   MPI_Allreduce(&unmatched, &all, 1, MPI_INT, MPI_SUM, world);
   if (all && comm->me == 0)
     error->warning(FLERR, "pair_style pet mode exchange: {} edge rows found no partner edge", all);
+  atoms_map(owner);
   exchange_views();
+}
+
+// The point-to-point maps for atoms_forward/atoms_reverse: this rank's ghosts
+// grouped by owner, and, told their tags, the owned atoms each rank asks for.
+template <class DeviceType> void PairPETKokkos<DeviceType>::atoms_map(const pet::RView1D &owner)
+{
+  using Range = Kokkos::RangePolicy<DeviceType>;
+  using U64 = Kokkos::View<uint64_t *, DeviceType>;
+  using IV = Kokkos::View<int *, DeviceType>;
+  const int nlocal = atom->nlocal, nall = nlocal + atom->nghost, nprocs = comm->nprocs, G = nall - nlocal;
+  auto tag = atomKK->k_tag.template view<DeviceType>();
+  // Lower bound of `v` in the high words of sorted keys: each rank's first entry.
+  auto bounds = [](U64 keys, int n, IV out, int count) {
+    Kokkos::parallel_for(
+        "pet_bounds", Kokkos::RangePolicy<DeviceType>(0, count), KOKKOS_LAMBDA(int v) {
+          int lo = 0, hi = n;
+          while (lo < hi) {
+            const int mid = (lo + hi) / 2;
+            if (int(keys(mid) >> 32) < v) lo = mid + 1;
+            else hi = mid;
+          }
+          out(v) = lo;
+        });
+  };
+
+  U64 key("pet:gh_key", G);
+  Kokkos::parallel_for(
+      "pet_gh_key", Range(0, G),
+      KOKKOS_LAMBDA(int q) { key(q) = uint64_t(int(owner(nlocal + q))) << 32 | uint32_t(nlocal + q); });
+  if (G > 0) Kokkos::sort(key);
+  d_gh_order = pet::IView1D("pet:gh_order", G);
+  IV gd("pet:gh_displs", nprocs + 1);
+  bounds(key, G, gd, nprocs + 1);
+  auto gh = d_gh_order;
+  Kokkos::parallel_for("pet_gh_order", Range(0, G), KOKKOS_LAMBDA(int q) { gh(q) = int(key(q) & 0xffffffffu); });
+  std::vector<int> h(nprocs + 1);
+  Kokkos::deep_copy(Kokkos::View<int *, Kokkos::HostSpace>(h.data(), nprocs + 1), gd);
+  gh_sd.assign(h.begin(), h.end() - 1), gh_sc.resize(nprocs), srv_sc.resize(nprocs), srv_sd.assign(nprocs, 0);
+  for (int p = 0; p < nprocs; ++p) gh_sc[p] = h[p + 1] - h[p];
+  MPI_Alltoall(gh_sc.data(), 1, MPI_INT, srv_sc.data(), 1, MPI_INT, world);
+  for (int p = 1; p < nprocs; ++p) srv_sd[p] = srv_sd[p - 1] + srv_sc[p - 1];
+  const int S = srv_sd[nprocs - 1] + srv_sc[nprocs - 1];
+  for (int p = 0; p < nprocs; ++p)  // the owners, and those this one owns for, alongside the edge peers
+    if (p != comm->me && (gh_sc[p] > 0 || srv_sc[p] > 0) && std::find(peers.begin(), peers.end(), p) == peers.end())
+      peers.push_back(p);
+  std::sort(peers.begin(), peers.end());
+
+  IV tags_out("pet:gh_tags", G), tags_in("pet:srv_tags", S);
+  Kokkos::parallel_for("pet_gh_tags", Range(0, G), KOKKOS_LAMBDA(int q) { tags_out(q) = int(tag(gh(q))); });
+  exchange_rows(tags_out.data(), tags_in.data(), sizeof(int), gh_sc, gh_sd, srv_sc, srv_sd);
+
+  tagint max_tag = 0;
+  Kokkos::parallel_reduce(
+      "pet_max_tag", Range(0, nlocal), KOKKOS_LAMBDA(int i, tagint &m) { m = tag(i) > m ? tag(i) : m; },
+      Kokkos::Max<tagint>(max_tag));
+  IV by_tag("pet:by_tag", max_tag + 1);
+  Kokkos::deep_copy(by_tag, -1);
+  Kokkos::parallel_for("pet_by_tag", Range(0, nlocal), KOKKOS_LAMBDA(int i) { by_tag(tag(i)) = i; });
+  d_srv_idx = pet::IView1D("pet:srv_idx", S);
+  auto idx = d_srv_idx;
+  int missing = 0;
+  Kokkos::parallel_reduce(
+      "pet_srv_idx", Range(0, S),
+      KOKKOS_LAMBDA(int q, int &m) {
+        const int t = tags_in(q);
+        idx(q) = t >= 0 && t <= max_tag ? by_tag(t) : -1;
+        m += idx(q) < 0;
+        if (idx(q) < 0) idx(q) = 0;
+      },
+      missing);
+  if (missing) error->one(FLERR, "pair_style pet/kk: {} ghosts asked of this rank are not its atoms", missing);
+
+  // The reverse: each owned atom's arrivals, in arrival order.
+  U64 rk("pet:rev_key", S);
+  Kokkos::parallel_for(
+      "pet_rev_key", Range(0, S), KOKKOS_LAMBDA(int q) { rk(q) = uint64_t(idx(q)) << 32 | uint32_t(q); });
+  if (S > 0) Kokkos::sort(rk);
+  d_rev_off = pet::IView1D("pet:rev_off", nlocal + 1), d_rev_pos = pet::IView1D("pet:rev_pos", S);
+  bounds(rk, S, d_rev_off, nlocal + 1);
+  auto pos = d_rev_pos;
+  Kokkos::parallel_for("pet_rev_pos", Range(0, S), KOKKOS_LAMBDA(int k) { pos(k) = int(rk(k) & 0xffffffffu); });
+  d_val_out = pet::RView1D("pet:val_out", S), d_val_in = pet::RView1D("pet:val_in", G);
+  p2p_atoms = true;
 }
 
 // LAMMPS's positions as pet-kokkos takes them: [n, 3] row-major doubles.
@@ -319,7 +404,20 @@ template <class DeviceType> bool PairPETKokkos<DeviceType>::mpi_gpu_aware() cons
 
 // On the device through LAMMPS's device comm, unless it is set to the classic
 // (host) one: then the host hooks.
+// Each ghost's value from its owner: point to point once atoms_map has run,
+// else LAMMPS's forward comm.
 template <class DeviceType> void PairPETKokkos<DeviceType>::atoms_forward(pet::RView1D a)
+{
+  if (!p2p_atoms) return lammps_forward(a);
+  using Range = Kokkos::RangePolicy<DeviceType>;
+  auto out = d_val_out, in = d_val_in;
+  auto idx = d_srv_idx, gh = d_gh_order;
+  Kokkos::parallel_for("pet_atoms_out", Range(0, idx.extent(0)), KOKKOS_LAMBDA(int q) { out(q) = a(idx(q)); });
+  exchange_rows(out.data(), in.data(), sizeof(double), srv_sc, srv_sd, gh_sc, gh_sd);
+  Kokkos::parallel_for("pet_atoms_in", Range(0, gh.extent(0)), KOKKOS_LAMBDA(int q) { a(gh(q)) = in(q); });
+}
+
+template <class DeviceType> void PairPETKokkos<DeviceType>::lammps_forward(pet::RView1D a)
 {
   if (lmp->kokkos->forward_pair_comm_classic) return PairPET::atoms_forward(a);
   d_atom = a;
@@ -328,10 +426,26 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::atoms_forward(pet::R
 
 template <class DeviceType> void PairPETKokkos<DeviceType>::atoms_reverse(pet::RView1D a)
 {
+  const int nlocal = atom->nlocal;
+  using Range = Kokkos::RangePolicy<DeviceType>;
+  if (p2p_atoms) {  // each ghost's value to its owner, summed there in a fixed order
+    auto out = d_val_in, in = d_val_out;
+    auto gh = d_gh_order, off = d_rev_off, pos = d_rev_pos;
+    Kokkos::parallel_for("pet_atoms_back", Range(0, gh.extent(0)), KOKKOS_LAMBDA(int q) { out(q) = a(gh(q)); });
+    exchange_rows(out.data(), in.data(), sizeof(double), gh_sc, gh_sd, srv_sc, srv_sd);
+    Kokkos::parallel_for(
+        "pet_atoms_sum", Range(0, nlocal), KOKKOS_LAMBDA(int i) {
+          double s = 0.0;
+          for (int k = off(i); k < off(i + 1); ++k) s += in(pos(k));
+          a(i) += s;
+        });
+    Kokkos::parallel_for(
+        "pet_zero_ghosts", Range(nlocal, a.extent(0)), KOKKOS_LAMBDA(int i) { a(i) = 0; });
+    return;
+  }
   if (lmp->kokkos->reverse_pair_comm_classic) return PairPET::atoms_reverse(a);
   d_atom = a;
   comm->reverse_comm(this);
-  const int nlocal = atom->nlocal;
   Kokkos::parallel_for(
       "pet_zero_ghosts", Kokkos::RangePolicy<DeviceType>(nlocal, a.extent(0)), KOKKOS_LAMBDA(int i) { a(i) = 0; });
 }
