@@ -197,6 +197,7 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::route_on_device(cons
   recv_displs.assign(nprocs, 0);
   for (int p = 1; p < nprocs; ++p) recv_displs[p] = recv_displs[p - 1] + recv_counts[p - 1];
   const int n_recv = recv_displs[nprocs - 1] + recv_counts[nprocs - 1];
+  set_peers();
   d_recv_displs = pet::IView1D("pet:recv_displs", nprocs);
   Kokkos::deep_copy(d_recv_displs, Kokkos::View<const int *, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(recv_displs.data(), nprocs));
 
@@ -208,8 +209,8 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::route_on_device(cons
     k[0] = tag(j), k[1] = tag(i);
     for (int c = 0; c < 3; ++c) k[2 + c] = x[3 * j + c] - x[3 * i + c];
   });
-  alltoallv_device(keys_out.data(), keys_in.data(), 5 * sizeof(double), send_counts, send_displs, recv_counts,
-                   recv_displs);
+  exchange_rows(keys_out.data(), keys_in.data(), 5 * sizeof(double), send_counts, send_displs, recv_counts,
+                recv_displs);
 
   // Each arriving key's partner among this rank's edges to ghosts: sorted by
   // (atom's tag, ghost's tag), found by binary search, told apart by the vector

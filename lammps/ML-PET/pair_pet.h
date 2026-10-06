@@ -121,8 +121,13 @@ class PairPET : public Pair {
     void set_live(pet::IView1D live) override { p->set_live(live); }
     void edges(pet::View2D out, pet::View2D in) override { p->edges(out, in); }
   } link{this};
-  void alltoallv_device(const void *out, void *in, int width, const std::vector<int> &sc,
-                        const std::vector<int> &sd, const std::vector<int> &rc, const std::vector<int> &rd);
+  // The ranks this one shares edges with (not itself), from the rebuild's
+  // counts; every exchange is point to point with them alone.
+  std::vector<int> peers;
+  void set_peers();
+  void exchange_rows(const void *out, void *in, int width, const std::vector<int> &sc, const std::vector<int> &sd,
+                     const std::vector<int> &rc, const std::vector<int> &rd, std::vector<int> *got = nullptr);
+  pet::IView1D d_recv_tag_all;                     // set_live's arrivals, at the rebuild's offsets
   void exchange_views();  // what set_live works in, sized for n_remote
   void alltoall_rows(const char *out, int width, char *in);
   void forward_atoms();

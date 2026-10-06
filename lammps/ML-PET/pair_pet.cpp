@@ -255,6 +255,7 @@ void PairPET::set_exchange(const List &l)
   for (int p = 1; p < nprocs; ++p)
     send_displs[p] = send_displs[p - 1] + send_counts[p - 1], recv_displs[p] = recv_displs[p - 1] + recv_counts[p - 1];
   const int n_recv = recv_displs[nprocs - 1] + recv_counts[nprocs - 1];
+  set_peers();
 
   std::vector<double> keys_out(5 * n_remote), keys_in(5 * n_recv);
   for (int q = 0; q < n_remote; ++q) std::copy_n(&key[5 * send_order[q]], 5, &keys_out[5 * q]);
@@ -328,37 +329,71 @@ void PairPET::alltoall_rows(const char *out, int width, char *in)
   MPI_Alltoallv(out, sc.data(), sd.data(), MPI_BYTE, in, rc.data(), rd.data(), MPI_BYTE, world);
 }
 
-// MPI_Alltoallv of rows `width` bytes wide between device buffers: straight from
-// device memory when MPI is GPU-aware, else through pinned host buffers. Counts
-// and displacements are per rank, in rows.
-void PairPET::alltoallv_device(const void *out, void *in, int width, const std::vector<int> &sc,
-                               const std::vector<int> &sd, const std::vector<int> &rc, const std::vector<int> &rd)
+void PairPET::set_peers()
 {
-  const int nprocs = comm->nprocs;
-  std::vector<int> scb(nprocs), sdb(nprocs), rcb(nprocs), rdb(nprocs);
-  for (int p = 0; p < nprocs; ++p)
-    scb[p] = sc[p] * width, sdb[p] = sd[p] * width, rcb[p] = rc[p] * width, rdb[p] = rd[p] * width;
-  const std::size_t n_out = std::size_t(sd[nprocs - 1] + sc[nprocs - 1]) * width;
-  const std::size_t n_in = std::size_t(rd[nprocs - 1] + rc[nprocs - 1]) * width;
-  Kokkos::fence();  // MPI does not follow the stream
-  if (gpu_aware) {
-    MPI_Alltoallv(out, scb.data(), sdb.data(), MPI_BYTE, in, rcb.data(), rdb.data(), MPI_BYTE, world);
-    return;
-  }
+  peers.clear();
+  for (int p = 0; p < comm->nprocs; ++p)
+    if (p != comm->me && (send_counts[p] > 0 || recv_counts[p] > 0)) peers.push_back(p);
+}
+
+// Rows `width` bytes wide between device buffers, point to point with the peers
+// (a message each way with every peer, empty or not, so that sends and receives
+// always pair up): straight from device memory when MPI is GPU-aware, else
+// through pinned host buffers. Rows this rank sends itself (ghosts that are
+// images of its own atoms) are copied on the device. Counts and displacements
+// per rank, in rows; with `got`, rc is an upper bound and got is what came.
+void PairPET::exchange_rows(const void *out, void *in, int width, const std::vector<int> &sc,
+                            const std::vector<int> &sd, const std::vector<int> &rc, const std::vector<int> &rd,
+                            std::vector<int> *got)
+{
   using Bytes = Kokkos::View<char *, pet::MemSpace, Kokkos::MemoryUnmanaged>;
-  const auto first = [](auto v, std::size_t n) { return Kokkos::subview(v, std::make_pair(std::size_t(0), n)); };
-  if (h_send.extent(0) < n_out) h_send = decltype(h_send)("pet:h_send", n_out);
-  if (h_recv.extent(0) < n_in) h_recv = decltype(h_recv)("pet:h_recv", n_in);
-  Kokkos::deep_copy(first(h_send, n_out), Bytes((char *) out, n_out));
-  MPI_Alltoallv(h_send.data(), scb.data(), sdb.data(), MPI_BYTE, h_recv.data(), rcb.data(), rdb.data(), MPI_BYTE,
-                world);
-  Kokkos::deep_copy(Bytes((char *) in, n_in), first(h_recv, n_in));
+  const int me = comm->me, tag = 0x9e7;
+  char *o = (char *) out, *i = (char *) in;
+  const auto bytes = [width](int rows) { return std::size_t(rows) * width; };
+  if (got) got->assign(comm->nprocs, 0);
+  if (sc[me] > 0) Kokkos::deep_copy(Bytes(i + bytes(rd[me]), bytes(sc[me])), Bytes(o + bytes(sd[me]), bytes(sc[me])));
+  if (got) (*got)[me] = sc[me];
+  Kokkos::fence();  // MPI does not follow the stream
+  if (peers.empty()) return;
+
+  std::size_t n_out = 0, n_in = 0;
+  for (int p : peers) n_out = std::max(n_out, bytes(sd[p] + sc[p])), n_in = std::max(n_in, bytes(rd[p] + rc[p]));
+  char *so = o, *si = i;
+  if (!gpu_aware) {
+    if (h_send.extent(0) < n_out) h_send = decltype(h_send)("pet:h_send", n_out);
+    if (h_recv.extent(0) < n_in) h_recv = decltype(h_recv)("pet:h_recv", n_in);
+    Kokkos::deep_copy(Kokkos::subview(h_send, std::make_pair(std::size_t(0), n_out)), Bytes(o, n_out));
+    so = h_send.data(), si = h_recv.data();
+  }
+  const int np = peers.size();
+  std::vector<MPI_Request> req(2 * np);
+  for (int k = 0; k < np; ++k) {
+    const int p = peers[k];
+    MPI_Irecv(si + bytes(rd[p]), (int) bytes(rc[p]), MPI_BYTE, p, tag, world, &req[k]);
+  }
+  for (int k = 0; k < np; ++k) {
+    const int p = peers[k];
+    MPI_Isend(so + bytes(sd[p]), (int) bytes(sc[p]), MPI_BYTE, p, tag, world, &req[np + k]);
+  }
+  std::vector<MPI_Status> st(2 * np);
+  MPI_Waitall(2 * np, req.data(), st.data());
+  for (int k = 0; k < np; ++k) {
+    const int p = peers[k];
+    int n = (int) bytes(rc[p]);
+    if (got) {
+      MPI_Get_count(&st[k], MPI_BYTE, &n);
+      (*got)[p] = n / width;
+    }
+    if (!gpu_aware && n > 0)
+      Kokkos::deep_copy(Bytes(i + bytes(rd[p]), n), Kokkos::subview(h_recv, std::make_pair(bytes(rd[p]), bytes(rd[p]) + n)));
+  }
 }
 
 // The edges PET keeps this evaluation (pet::Exchange::set_live): their rows in
 // send order, how many go to each rank, and -- told by each sender which of its
-// partner edges a row is for -- the row each arrival lands in. One count swap
-// and one swap of ints here; the layers' swaps then move live rows only.
+// partner edges a row is for -- the row each arrival lands in. One round with
+// the peers: each receives at most its rebuild count, and learns from what
+// arrives how many there are. The layers' swaps then move live rows only.
 void PairPET::set_live(pet::IView1D live)
 {
   using Range = Kokkos::RangePolicy<pet::ExecSpace>;
@@ -373,32 +408,34 @@ void PairPET::set_live(pet::IView1D live)
       });
   Kokkos::parallel_for(
       "pet_live_counts", Range(0, nprocs), KOKKOS_LAMBDA(int p) { counts(p) = at(displs(p + 1)) - at(displs(p)); });
-  live_sc.resize(nprocs), live_rc.resize(nprocs), live_sd.assign(nprocs, 0), live_rd.assign(nprocs + 1, 0);
+  live_sc.resize(nprocs), live_sd.assign(nprocs, 0), live_rd.assign(nprocs + 1, 0);
   Kokkos::deep_copy(Kokkos::View<int *, Kokkos::HostSpace>(live_sc.data(), nprocs), counts);
-  MPI_Alltoall(live_sc.data(), 1, MPI_INT, live_rc.data(), 1, MPI_INT, world);
   for (int p = 1; p < nprocs; ++p) live_sd[p] = live_sd[p - 1] + live_sc[p - 1];
-  for (int p = 0; p < nprocs; ++p) live_rd[p + 1] = live_rd[p] + live_rc[p];
-  n_live_send = live_sd[nprocs - 1] + live_sc[nprocs - 1], n_live_arrive = live_rd[nprocs];
+  n_live_send = live_sd[nprocs - 1] + live_sc[nprocs - 1];
 
   if (d_send_row.extent(0) < (size_t) n_live_send)
     d_send_row = pet::IView1D("pet:send_row", n_live_send), d_send_tag = pet::IView1D("pet:send_tag", n_live_send);
-  if (d_recv_tag.extent(0) < (size_t) n_live_arrive)
-    d_recv_tag = pet::IView1D("pet:recv_tag", n_live_arrive), d_arrive_row = pet::IView1D("pet:arrive_row", n_live_arrive);
   auto block = d_send_block, send_row = d_send_row, send_tag = d_send_tag;
   Kokkos::parallel_for(
       "pet_live_send", Range(0, n_send), KOKKOS_LAMBDA(int q) {
         const int l = row(order(q));
         if (l >= 0) send_row(at(q)) = l, send_tag(at(q)) = q - block(q);
       });
-  alltoallv_device(send_tag.data(), d_recv_tag.data(), sizeof(int), live_sc, live_sd, live_rc, live_rd);
+  // Each partner's tags land at the rebuild's offset for it.
+  const std::size_t n_recv = d_recv_map.extent(0);
+  if (d_recv_tag_all.extent(0) < std::max<std::size_t>(n_recv, 1)) d_recv_tag_all = pet::IView1D("pet:recv_tag", std::max<std::size_t>(n_recv, 1));
+  exchange_rows(send_tag.data(), d_recv_tag_all.data(), sizeof(int), live_sc, live_sd, recv_counts, recv_displs, &live_rc);
+  for (int p = 0; p < nprocs; ++p) live_rd[p + 1] = live_rd[p] + live_rc[p];
+  n_live_arrive = live_rd[nprocs];
 
+  if (d_arrive_row.extent(0) < (size_t) n_live_arrive) d_arrive_row = pet::IView1D("pet:arrive_row", n_live_arrive);
   Kokkos::deep_copy(d_arrive, Kokkos::View<const int *, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(live_rd.data(), nprocs + 1));
-  auto map = d_recv_map, rdisp = d_recv_displs, arrive = d_arrive, tag = d_recv_tag, arrive_row = d_arrive_row;
+  auto map = d_recv_map, rdisp = d_recv_displs, arrive = d_arrive, tag = d_recv_tag_all, arrive_row = d_arrive_row;
   Kokkos::parallel_for(
       "pet_live_arrive", Range(0, n_live_arrive), KOKKOS_LAMBDA(int a) {
         int p = 0;
         while (arrive(p + 1) <= a) ++p;  // the sending rank
-        const int r = map(rdisp(p) + tag(a));
+        const int r = map(rdisp(p) + tag(rdisp(p) + a - arrive(p)));
         arrive_row(a) = r >= 0 ? row(r) : -1;
       });
 }
@@ -418,7 +455,7 @@ void PairPET::edges(pet::View2D out, pet::View2D in)
   Kokkos::parallel_for(
       "pet_send_rows", Range(0, std::size_t(n_live_send) * D),
       KOKKOS_LAMBDA(std::size_t i) { send(i / D, i % D) = out(send_row(i / D), i % D); });
-  alltoallv_device(send.data(), recv.data(), D * sizeof(pet::Net), live_sc, live_sd, live_rc, live_rd);
+  exchange_rows(send.data(), recv.data(), D * sizeof(pet::Net), live_sc, live_sd, live_rc, live_rd);
   Kokkos::deep_copy(in, pet::Net(0));  // a row with no partner (warned of at the rebuild) stays zero
   Kokkos::parallel_for(
       "pet_recv_rows", Range(0, std::size_t(n_live_arrive) * D), KOKKOS_LAMBDA(std::size_t i) {
