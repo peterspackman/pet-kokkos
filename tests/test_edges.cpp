@@ -412,11 +412,20 @@ class ImageExchange : public pet::Exchange {
     for (std::size_t g = n_local_; g < owner_.size(); ++g) h(owner_[g]) += h(g), h(g) = 0;
     Kokkos::deep_copy(a, h);
   }
-  void edges(pet::View2D out, pet::View2D in, pet::IView1D) override {
+  void set_live(pet::IView1D live) override {
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), live);
+    live_.assign(h.data(), h.data() + h.extent(0));
+    row_.assign(partner_.size(), -1);
+    for (std::size_t l = 0; l < live_.size(); ++l) row_[live_[l]] = l;
+  }
+  // Live row l is remote edge live_[l]; its partner's row is the partner edge's.
+  void edges(pet::View2D out, pet::View2D in) override {
     auto o = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
     auto i = Kokkos::create_mirror_view(in);
-    for (std::size_t r = 0; r < partner_.size(); ++r)
-      for (std::size_t c = 0; c < o.extent(1); ++c) i(r, c) = partner_[r] >= 0 && !mute ? o(partner_[r], c) : 0;
+    for (std::size_t l = 0; l < live_.size(); ++l) {
+      const int q = partner_[live_[l]], lq = q >= 0 ? row_[q] : -1;
+      for (std::size_t c = 0; c < o.extent(1); ++c) i(l, c) = lq >= 0 && !mute ? o(lq, c) : 0;
+    }
     Kokkos::deep_copy(in, i);
   }
   bool paired() const { return std::find(partner_.begin(), partner_.end(), -1) == partner_.end(); }
@@ -424,6 +433,7 @@ class ImageExchange : public pet::Exchange {
 
  private:
   std::vector<int> owner_, partner_;
+  std::vector<int> live_, row_;  // this evaluation's live remote edges, and each one's row
   std::size_t n_local_;
 };
 

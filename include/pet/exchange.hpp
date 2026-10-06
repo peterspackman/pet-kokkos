@@ -26,14 +26,17 @@ class Exchange {
   // Add each ghost's entry of `a` into its owner's, and zero the ghost's.
   virtual void atoms_reverse(RView1D a) = 0;
 
-  // One row per edge to a ghost, in the order of the engine's list (atom i's
-  // pairs in turn, those whose neighbour is a ghost). Send each row of `out` to
-  // the rank owning that ghost, where it belongs to the partner edge; fill `in`
-  // with the partner edges' rows in the same order. Rows are `out.extent(1)`
-  // wide: one layer's edge outputs, or their adjoints. Only rows with
-  // live(r) >= 0 carry anything -- the rest are edges past the cutoff, on
-  // both ends -- so only they need to cross; the other rows of `in` are zero.
-  virtual void edges(View2D out, View2D in, IView1D live) = 0;
+  // Once per evaluation, before any edges(): which edges to ghosts PET keeps
+  // this time (the rest are past the cutoff, on both ends of the pair). Each is
+  // an index into the edges to ghosts in the order of the engine's list (atom
+  // i's pairs in turn, those whose neighbour is a ghost), ascending.
+  virtual void set_live(IView1D live) = 0;
+
+  // One row per kept edge to a ghost, in set_live's order. Send each row of
+  // `out` to the rank owning that ghost, where it belongs to the partner edge;
+  // fill `in` with the partner edges' rows in the same order. Rows are
+  // `out.extent(1)` wide: one layer's edge outputs, or their adjoints.
+  virtual void edges(View2D out, View2D in) = 0;
 };
 
 }  // namespace pet

@@ -118,16 +118,13 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
   // out_edge of the reverse edge]; the MLP's last linear accumulates onto it. An
   // edge to a ghost reads its reverse from the rank owning the ghost.
   const View2D out_edge = edge_cur;
-  const bool remote = pk.n_remote > 0;
-  auto ro = pk.remote_of, rp = pk.remote_packed;
+  const bool remote = dev.exchange != nullptr;  // every rank, rows or not: the exchange is collective
+  auto ro = pk.remote_of, lp = pk.live_packed;
   if (remote && share) {
-    View2D out = ws_.tmp(pk.n_remote, D);
+    View2D out = ws_.tmp(pk.n_live, D);
     Kokkos::parallel_for(
-        "remote_rows", RangePolicy(0, pk.n_remote * D), KOKKOS_LAMBDA(int i) {
-          const int r = i / D, d = i % D;
-          out(r, d) = rp(r) >= 0 ? out_edge(rp(r), d) : Net(0);
-        });
-    dev.exchange->edges(out, remote_in, rp);
+        "remote_rows", RangePolicy(0, pk.n_live * D), KOKKOS_LAMBDA(int i) { out(i / D, i % D) = out_edge(lp(i / D), i % D); });
+    dev.exchange->edges(out, remote_in);
   }
   View2D concat = save ? keep(sav->concat, "cc", -1, E, 2 * D) : ws_.tmp(E, 2 * D);
   Kokkos::parallel_for(
@@ -175,17 +172,15 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
     pet::norm_bwd(concat_adj, cnorm_adj, sav.concat, vec("combination_norms." + ls + ".weight"), true, false);
     // An edge to a ghost: its partner's rank has the adjoint of this edge's row,
     // and wants the adjoint of the row this edge read.
-    const bool remote = pk.n_remote > 0;
-    auto ro = pk.remote_of, rp = pk.remote_packed;
-    View2D remote_adj = ws_.tmp(remote ? pk.n_remote : 0, D);
+    const bool remote = dev.exchange != nullptr;
+    auto ro = pk.remote_of, lp = pk.live_packed;
+    View2D remote_adj = ws_.tmp(remote ? pk.n_live : 0, D);
     if (remote) {
-      View2D out = ws_.tmp(pk.n_remote, D);
+      View2D out = ws_.tmp(pk.n_live, D);
       Kokkos::parallel_for(
-          "remote_adj", RangePolicy(0, pk.n_remote * D), KOKKOS_LAMBDA(int i) {
-            const int r = i / D, d = i % D;
-            out(r, d) = rp(r) >= 0 ? concat_adj(rp(r), D + d) : Net(0);
-          });
-      dev.exchange->edges(out, remote_adj, rp);
+          "remote_adj", RangePolicy(0, pk.n_live * D),
+          KOKKOS_LAMBDA(int i) { out(i / D, i % D) = concat_adj(lp(i / D), D + i % D); });
+      dev.exchange->edges(out, remote_adj);
     }
     Kokkos::parallel_for(
         "bw_concat", RangePolicy(0, E * D), KOKKOS_LAMBDA(int i) {
@@ -272,8 +267,8 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   std::vector<std::pair<View2D, View2D>> inputs(ckpt ? G : 0);
   // Over several ranks, each layer's rows from the partners' ranks, kept so a
   // recompute need not ask again.
-  std::vector<View2D> remote_in(pk.n_remote > 0 ? G : 0);
-  for (int L = 0; L < (int) remote_in.size(); ++L) remote_in[L] = ws_.n2("remote_in_" + std::to_string(L), pk.n_remote, D);
+  std::vector<View2D> remote_in(dev.exchange ? G : 0);
+  for (int L = 0; L < (int) remote_in.size(); ++L) remote_in[L] = ws_.n2("remote_in_" + std::to_string(L), pk.n_live, D);
   for (int L = 0; L < G; ++L) {
     if (ckpt) {
       inputs[L] = {ws_.n2("ck_node_" + std::to_string(L), N, Dn), ws_.n2("ck_ie_" + std::to_string(L), E, D)};

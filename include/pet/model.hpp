@@ -143,9 +143,10 @@ struct PackedEdges {
   View1D cut;          // [E] smooth cutoff factor
   IView1D slot_edge;   // [N*M] each slot's packed edge, -1 for padding
   int n_local = 0;     // see DeviceEdgeData::n_local
-  int n_remote = 0;       // edges to ghosts (DeviceEdgeData::remote_raw)
-  IView1D remote_of;      // [E] each edge's remote index, -1 if its partner is here
-  IView1D remote_packed;  // [n_remote] each remote edge's packed index, -1 if dropped
+  int n_remote = 0;     // edges to ghosts (DeviceEdgeData::remote_raw)
+  int n_live = 0;       // of those, the ones kept this evaluation (Exchange::set_live)
+  IView1D remote_of;    // [E] each edge's row among the live ones, -1 if its partner is here
+  IView1D live_packed;  // [n_live] each live remote edge's packed index
 };
 
 // One evaluation's outputs, on the device: per-atom energy [N] and, with forces,

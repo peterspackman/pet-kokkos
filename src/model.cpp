@@ -296,17 +296,33 @@ DeviceEdgeData PetModel::upload_edge_data(const EdgeData& ed, bool need_reverse)
 
 // ---- shared by both featurizers -----------------------------------------------------
 
-// Each edge to a ghost: its packed row, and back.
-static void remote_map(const DeviceEdgeData& d, PackedEdges& p) {
-  if (p.n_remote == 0) return;
-  auto raw = d.remote_raw, slot = d.raw_slot, slot_edge = p.slot_edge, of = p.remote_of, packed = p.remote_packed;
+// The edges to ghosts PET keeps this time, numbered in the engine's order: each
+// one's packed row, and back. The engine learns which they are (set_live), so
+// only those rows cross.
+static void remote_map(Workspace& ws, const DeviceEdgeData& d, PackedEdges& p) {
+  if (!d.exchange) return;
+  const int R = p.n_remote;
+  auto raw = d.remote_raw, slot = d.raw_slot, slot_edge = p.slot_edge, of = p.remote_of;
+  IView1D at = ws.i1("pk:live_at", R + 1);
+  Kokkos::parallel_scan(
+      "pk_live_scan", RangePolicy(0, R + 1), KOKKOS_LAMBDA(int r, int& c, bool final) {
+        if (final) at(r) = c;
+        if (r < R) {
+          const int s = slot(raw(r));
+          c += s >= 0 && slot_edge(s) >= 0;
+        }
+      });
+  Kokkos::deep_copy(p.n_live, Kokkos::subview(at, R));
+  IView1D live = ws.i1("pk:live", p.n_live), packed = p.live_packed = ws.i1("pk:live_packed", p.n_live);
   Kokkos::deep_copy(ExecSpace(), of, -1);
   Kokkos::parallel_for(
-      "pk_remote", RangePolicy(0, p.n_remote), KOKKOS_LAMBDA(int r) {
+      "pk_remote", RangePolicy(0, R), KOKKOS_LAMBDA(int r) {
         const int s = slot(raw(r)), k = s >= 0 ? slot_edge(s) : -1;
-        packed(r) = k;
-        if (k >= 0) of(k) = r;
+        if (k < 0) return;
+        const int l = at(r);
+        live(l) = r, packed(l) = k, of(k) = l;
       });
+  d.exchange->set_live(live);
 }
 
 PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
@@ -335,9 +351,9 @@ PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
   auto ev = d.edge_vec;
   auto dd = d.dist, dpc = d.pair_cutoff;
   auto dcut = d.cutoff_factor;
-  if (d.exchange && d.remote_raw.extent(0) > 0) {  // mapped once packed (remote_map)
+  if (d.exchange) {  // mapped once packed (remote_map)
     p.n_remote = d.remote_raw.extent(0);
-    p.remote_of = ws_.i1("pk:remote_of", p.E), p.remote_packed = ws_.i1("pk:remote_packed", p.n_remote);
+    p.remote_of = ws_.i1("pk:remote_of", p.E);
   }
   if (d.padded) {  // every slot a row: slot k is edge k
     Kokkos::parallel_for(
@@ -349,7 +365,7 @@ PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
           for (int c = 0; c < 3; ++c) vec(k, c) = ev(k, c);
           dist(k) = dd(k), pcut(k) = dpc(k), cut(k) = dcut(k);
         });
-    remote_map(d, p);
+    remote_map(ws_, d, p);
     return p;
   }
   Kokkos::parallel_scan(
@@ -372,7 +388,7 @@ PackedEdges PetModel::pack_edges(const DeviceEdgeData& d) {
       "pk_reverse", RangePolicy(0, N * M), KOKKOS_LAMBDA(int k) {
         if (pos(k) >= 0) reverse(pos(k)) = rev(k) >= 0 ? pos(rev(k)) : -1;
       });
-  remote_map(d, p);
+  remote_map(ws_, d, p);
   return p;
 }
 

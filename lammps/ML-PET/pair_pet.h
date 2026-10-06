@@ -49,7 +49,8 @@ class PairPET : public Pair {
   // Mode exchange: pet::Exchange's moves over LAMMPS's comm, and its hooks.
   virtual void atoms_forward(pet::RView1D a);
   virtual void atoms_reverse(pet::RView1D a);
-  void edges(pet::View2D out, pet::View2D in, pet::IView1D live);
+  void set_live(pet::IView1D live);
+  void edges(pet::View2D out, pet::View2D in);
   int pack_forward_comm(int, int *, double *, int, int *) override;
   void unpack_forward_comm(int, int, double *) override;
   int pack_reverse_comm(int, int, double *) override;
@@ -97,24 +98,34 @@ class PairPET : public Pair {
 
   // Mode exchange. Atom values ride LAMMPS's forward and reverse comm (which
   // relay through ghosts of ghosts); edge rows go straight to the rank owning
-  // the ghost, grouped by rank (MPI_Alltoallv), and are matched to that rank's
-  // edges once per rebuild: recv_map[q] is the edge the q-th row arriving is for.
+  // the ghost, grouped by rank (MPI_Alltoallv). Once per rebuild, every edge to
+  // a ghost is matched to that rank's partner edge: recv_map[q] is the edge the
+  // q-th row arriving is for. Once per evaluation (set_live), the edges PET
+  // keeps: only their rows cross, and where each lands is worked out then, so
+  // each layer's swap is one pack, one MPI_Alltoallv and one unpack.
   std::vector<int> send_order, recv_map;           // remote edges by destination; arrival -> edge
   std::vector<int> send_counts, send_displs, recv_counts, recv_displs;  // per rank, in rows
   pet::IView1D d_send_order, d_recv_map;            // the same, on the device
-  pet::IView1D d_send_block, d_send_rank;          // each send position's block start and rank
+  pet::IView1D d_send_block, d_send_displs;        // each send position's block start; per rank
   pet::IView1D d_recv_displs;                      // where each rank's rows start, arriving
-  pet::IView1D d_live_at, d_live_counts, d_arrive; // per step: compacted index, per-rank counts, offsets
+  std::vector<int> live_sc, live_sd, live_rc, live_rd;  // this evaluation's live rows, per rank
+  int n_live_send = 0, n_live_arrive = 0;
+  pet::IView1D d_row, d_live_at, d_live_counts;    // each remote edge's live row; compaction
+  pet::IView1D d_send_row, d_send_tag, d_recv_tag; // live rows in send order, and their partners
+  pet::IView1D d_arrive, d_arrive_row;             // per rank arrival offsets; each arrival's row
   pet::View2D d_send, d_recv;                      // rows in send / arrival order
-  Kokkos::View<pet::Net **, Kokkos::LayoutRight, Kokkos::SharedHostPinnedSpace> h_send, h_recv;
+  Kokkos::View<char *, Kokkos::SharedHostPinnedSpace> h_send, h_recv;  // staging without GPU-aware MPI
   std::vector<double> atom_buf;                    // one value per atom, for the comm hooks
   struct Link : pet::Exchange {                    // what pet-kokkos calls
     PairPET *p;
     explicit Link(PairPET *pair) : p(pair) {}
     void atoms_forward(pet::RView1D a) override { p->atoms_forward(a); }
     void atoms_reverse(pet::RView1D a) override { p->atoms_reverse(a); }
-    void edges(pet::View2D out, pet::View2D in, pet::IView1D live) override { p->edges(out, in, live); }
+    void set_live(pet::IView1D live) override { p->set_live(live); }
+    void edges(pet::View2D out, pet::View2D in) override { p->edges(out, in); }
   } link{this};
+  void alltoallv_device(const void *out, void *in, int width, const std::vector<int> &sc,
+                        const std::vector<int> &sd, const std::vector<int> &rc, const std::vector<int> &rd);
   void alltoall_rows(const char *out, int width, char *in);
   void forward_atoms();
 };
