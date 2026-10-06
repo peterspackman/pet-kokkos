@@ -123,7 +123,10 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
   if (remote && share) {
     View2D out = ws_.tmp(pk.n_live, D);
     Kokkos::parallel_for(
-        "remote_rows", RangePolicy(0, pk.n_live * D), KOKKOS_LAMBDA(int i) { out(i / D, i % D) = out_edge(lp(i / D), i % D); });
+        "remote_rows", RangePolicy(0, pk.n_live * D), KOKKOS_LAMBDA(int i) {
+          const int k = lp(i / D);  // -1: a capacity's padding
+          out(i / D, i % D) = k >= 0 ? out_edge(k, i % D) : Net(0);
+        });
     dev.exchange->edges(out, remote_in);
   }
   View2D concat = save ? keep(sav->concat, "cc", -1, E, 2 * D) : ws_.tmp(E, 2 * D);
@@ -179,7 +182,10 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
       View2D out = ws_.tmp(pk.n_live, D);
       Kokkos::parallel_for(
           "remote_adj", RangePolicy(0, pk.n_live * D),
-          KOKKOS_LAMBDA(int i) { out(i / D, i % D) = concat_adj(lp(i / D), D + i % D); });
+          KOKKOS_LAMBDA(int i) {
+            const int k = lp(i / D);
+            out(i / D, i % D) = k >= 0 ? concat_adj(k, D + i % D) : Net(0);
+          });
       dev.exchange->edges(out, remote_adj);
     }
     Kokkos::parallel_for(

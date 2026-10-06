@@ -416,14 +416,15 @@ class ImageExchange : public pet::Exchange {
     auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), live);
     live_.assign(h.data(), h.data() + h.extent(0));
     row_.assign(partner_.size(), -1);
-    for (std::size_t l = 0; l < live_.size(); ++l) row_[live_[l]] = l;
+    for (std::size_t l = 0; l < live_.size(); ++l)
+      if (live_[l] >= 0) row_[live_[l]] = l;
   }
   // Live row l is remote edge live_[l]; its partner's row is the partner edge's.
   void edges(pet::View2D out, pet::View2D in) override {
     auto o = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
     auto i = Kokkos::create_mirror_view(in);
     for (std::size_t l = 0; l < live_.size(); ++l) {
-      const int q = partner_[live_[l]], lq = q >= 0 ? row_[q] : -1;
+      const int q = live_[l] >= 0 ? partner_[live_[l]] : -1, lq = q >= 0 ? row_[q] : -1;
       for (std::size_t c = 0; c < o.extent(1); ++c) i(l, c) = lq >= 0 && !mute ? o(lq, c) : 0;
     }
     Kokkos::deep_copy(in, i);
@@ -624,6 +625,61 @@ TEST_CASE("a device-resident engine's recorded steps are its eager ones", "[mode
         auto ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), fa);
         auto hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), fb);
         INFO("step " << step);
+        CHECK(ta.energy == tb.energy);
+        for (int k = 0; k < 6; ++k) CHECK(ta.virial[k] == tb.virial[k]);
+        bool same = true;
+        for (int i = 0; i < n; ++i)
+          for (int c = 0; c < 3; ++c) same = same && ha(i, c) == hb(i, c);
+        CHECK(same);
+      }
+    }
+  }
+}
+
+TEST_CASE("an exchanging engine's recorded steps are its eager ones", "[model][edges]") {
+  // Over several ranks a step is recorded as graphs between the exchange's
+  // calls and replayed with the calls made again: every step must be the same
+  // shapes run eagerly, to the bit.
+  for (const auto& model : plumbing_models()) {
+    const auto found = find_model(model);
+    Golden store;
+    const Golden* g = found ? first_periodic(model, store) : nullptr;
+    if (!g) continue;
+    DYNAMIC_SECTION(model) {
+      pet::Options fixed, eager;
+      fixed.md_fixed_shapes = eager.md_fixed_shapes = true;
+      eager.graphs = false;
+      pet::Calculator a(found->first, found->second, fixed), b(found->first, found->second, eager);
+      if (a.hypers().featurizer_type != pet::FeaturizerType::FeedForward) continue;
+      const pet::System& s = g->system;
+      const double rc = a.cutoff();
+      Domain d = make_domain(s, rc + 1.5, 0.0, rc + 1.5);  // room for the atoms to move
+      ImageExchange xa(d), xb(d);
+      REQUIRE(xa.paired());
+      pet::EdgeListView va = view(d), vb = view(d);
+      va.exchange = &xa, vb.exchange = &xb;
+      a.set_neighbors(va);
+      b.set_neighbors(vb);
+      const int n = d.z.size();
+      using D2 = Kokkos::View<double**, Kokkos::LayoutRight, pet::MemSpace>;
+      D2 x("x", n, 3), fa("fa", n, 3), fb("fb", n, 3);
+      std::vector<double> pos = d.pos;
+      for (int step = 0; step < 6; ++step) {
+        // Each owned atom moves; its images follow it.
+        for (int i = 0; i < n; ++i) {
+          const int o = d.owner[i];
+          for (int c = 0; c < 3; ++c) pos[3 * i + c] = d.pos[3 * i + c] + 0.03 * std::sin(1.1 * (3 * o + c) + step);
+        }
+        Kokkos::deep_copy(x, Kokkos::View<const double**, Kokkos::LayoutRight, Kokkos::HostSpace,
+                                          Kokkos::MemoryUnmanaged>(pos.data(), n, 3));
+        Kokkos::deep_copy(fa, 0.0), Kokkos::deep_copy(fb, 0.0);
+        pet::Calculator::DeviceArrays da, db;
+        da.positions = db.positions = x.data();
+        da.forces = fa.data(), db.forces = fb.data();
+        const pet::Calculator::Totals ta = a.compute_step(da, nullptr), tb = b.compute_step(db, nullptr);
+        auto ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), fa);
+        auto hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), fb);
+        INFO("step " << step << ": E " << ta.energy << " vs " << tb.energy);
         CHECK(ta.energy == tb.energy);
         for (int k = 0; k < 6; ++k) CHECK(ta.virial[k] == tb.virial[k]);
         bool same = true;

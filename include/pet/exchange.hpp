@@ -29,7 +29,8 @@ class Exchange {
   // Once per evaluation, before any edges(): which edges to ghosts PET keeps
   // this time (the rest are past the cutoff, on both ends of the pair). Each is
   // an index into the edges to ghosts in the order of the engine's list (atom
-  // i's pairs in turn, those whose neighbour is a ghost), ascending.
+  // i's pairs in turn, those whose neighbour is a ghost), ascending; with fixed
+  // shapes, entries past the kept ones are -1 (rows to leave alone).
   virtual void set_live(IView1D live) = 0;
 
   // One row per kept edge to a ghost, in set_live's order. Send each row of

@@ -573,7 +573,7 @@ void EdgeSession::finish(int N, int n_local, IView1D species, IView1D re_i, IVie
     dev.exchange = exchange;
     dev.remote_raw = remote;
   }
-  M = 0, E_cap = 0, valid = true;
+  M = 0, E_cap = 0, L_cap = 0, valid = true;
 }
 
 bool EdgeSession::overflowed() const {
@@ -630,11 +630,20 @@ const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device,
     const int dm = 2, de = std::max(64, dev.n_edges / 20);
     M = dev.max_neighbors + dm;
     E_cap = dev.n_edges + de;
+    if (dev.exchange) {  // the live edges to ghosts, likewise
+      auto remote = dev.remote_raw, slot = dev.raw_slot;
+      int live = 0;
+      Kokkos::parallel_reduce(
+          "md_live_count", RangePolicy(0, remote.extent(0)),
+          KOKKOS_LAMBDA(int r, int& c) { c += slot(remote(r)) >= 0; }, live);
+      L_cap = live + std::max(64, live / 20);
+    }
     sized = true;
   }
   IView1D overflow = ws.i1("md:overflow", 1);
   Kokkos::deep_copy(ExecSpace(), overflow, 0);
   edge_geometry(ws, dev, h, probes, P, m_high, M, overflow, E_cap);
+  dev.live_capacity = dev.exchange ? L_cap : 0;
   return dev;
 }
 

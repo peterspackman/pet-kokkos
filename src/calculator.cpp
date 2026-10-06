@@ -161,8 +161,22 @@ struct Calculator::Impl {
   // small copy to pinned host memory.
   RView1D totals{"pet:totals", 8};
   Kokkos::View<double*, Kokkos::SharedHostPinnedSpace> h_totals{"pet:h_totals", 8};
-  // With fixed shapes, a whole step -- geometry, network, totals -- as one graph.
+  // With fixed shapes, a whole step -- geometry, network, totals -- as one graph;
+  // over several ranks, as graphs between the exchange's calls (ex_graph, for
+  // ex_key, with what it returns), recorded through Cut standing in for the
+  // engine.
   GraphCache<BatchResult> step_graph;
+  SegmentedGraph ex_graph;
+  GraphCache<BatchResult>::Key ex_key;
+  BatchResult ex_out;
+  struct Cut : Exchange {
+    Exchange* real = nullptr;
+    SegmentedGraph* rec = nullptr;
+    void atoms_forward(RView1D a) override { rec->cut([r = real, a] { r->atoms_forward(a); }); }
+    void atoms_reverse(RView1D a) override { rec->cut([r = real, a] { r->atoms_reverse(a); }); }
+    void set_live(IView1D live) override { rec->cut([r = real, live] { r->set_live(live); }); }
+    void edges(View2D out, View2D in) override { rec->cut([r = real, out, in] { r->edges(out, in); }); }
+  } cut;
   EdgeSession md;  // an engine's list (compute_edges, set_neighbors)
 
   std::vector<int> atomic_types;
@@ -419,21 +433,46 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
     return r;
   };
   for (;;) {
-    // Recorded once the capacities are sized (sizing reads counts back), and not
-    // over several ranks (the exchange calls the engine mid-step). The cell
-    // reaches a replay through set_cell.
-    const bool record = I.opts.md_fixed_shapes && I.model.graphs() && I.md.M > 0 && !I.md.dev.exchange &&
-                        !ozaki_active();
+    // Recorded once the capacities are sized (sizing reads counts back). The
+    // cell reaches a replay through set_cell.
+#if defined(PET_HAVE_GRAPHS)
+    const bool record = I.opts.md_fixed_shapes && I.model.graphs() && I.md.M > 0 && !ozaki_active();
+#else
+    const bool record = false;
+#endif
+    Exchange* const engine = I.md.dev.exchange;
     if (record) {
       I.md.set_cell(cell);
       const GraphCache<BatchResult>::Key key{
           (std::uintptr_t) forces, (std::uintptr_t) a.positions, (std::uintptr_t) I.md.dev.n_atoms,
           (std::uintptr_t) I.md.dev.n_raw, (std::uintptr_t) I.md.M, (std::uintptr_t) I.md.E_cap,
-          I.md.ws.generation(), I.model.ws_generation(), lowp_generation(), (std::uintptr_t) gemm_mode()};
-      I.model.set_graphs(false);  // one graph: the model's own is inside it
+          (std::uintptr_t) I.md.L_cap, (std::uintptr_t) engine, I.md.ws.generation(), I.model.ws_generation(),
+          lowp_generation(), (std::uintptr_t) gemm_mode()};
       const bool just_sized = I.md.sized;  // the last step ran these shapes: nothing left to allocate
       I.md.sized = false;
-      br = I.step_graph.run(key, work, just_sized);
+      I.model.set_graphs(false);  // one recording: the model's own graph is inside it
+      if (!engine) {
+        br = I.step_graph.run(key, work, just_sized);
+      } else if (I.ex_graph.ready() && key == I.ex_key) {
+        I.ex_graph.replay();
+        br = I.ex_out;
+      } else if (just_sized) {
+        I.cut.real = engine, I.cut.rec = &I.ex_graph;
+        I.md.dev.exchange = &I.cut;
+        try {
+          I.ex_graph.begin();
+          br = work();
+          I.ex_graph.finish();
+        } catch (...) {
+          I.md.dev.exchange = engine;
+          I.model.set_graphs(true);
+          throw;
+        }
+        I.md.dev.exchange = engine;
+        I.ex_key = key, I.ex_out = br;
+      } else {
+        br = work();
+      }
       I.model.set_graphs(true);
     } else {
       br = work();

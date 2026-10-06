@@ -249,7 +249,7 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
   int M = m_fixed;
   if (m_fixed > 0) {
     if (e_fixed > 0) dev.n_edges = e_fixed, dev.padded = false, dev.edge_capacity = true, dev.overflow = overflow;
-    else dev.n_edges = NC * M, dev.padded = true;
+    else dev.n_edges = NC * M, dev.padded = true, dev.edge_capacity = false;
     Kokkos::parallel_for(
         "pet_overflow", RangePolicy(0, NC), KOKKOS_LAMBDA(int a) {
           if (count(a) > m_fixed) overflow(0) = 1;
@@ -267,7 +267,7 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
     M = hmn(0), dev.n_edges = hmn(1);
     M = std::max(M, 1);
     if (m_high > 0) M = m_high = std::max(M, m_high);
-    dev.padded = false;
+    dev.padded = false, dev.edge_capacity = false, dev.live_capacity = 0;
   }
   const int S = M + 1, NM = NC * M;
   dev.max_neighbors = M;

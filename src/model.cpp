@@ -312,14 +312,28 @@ static void remote_map(Workspace& ws, const DeviceEdgeData& d, PackedEdges& p) {
           c += s >= 0 && slot_edge(s) >= 0;
         }
       });
-  Kokkos::deep_copy(p.n_live, Kokkos::subview(at, R));
+  // With fixed shapes, a capacity rather than the count, which stays on the
+  // device: padding rows are -1, and more live edges than fit raise overflow.
+  const int L = d.live_capacity;
+  if (L > 0) p.n_live = L;
+  else Kokkos::deep_copy(p.n_live, Kokkos::subview(at, R));
   IView1D live = ws.i1("pk:live", p.n_live), packed = p.live_packed = ws.i1("pk:live_packed", p.n_live);
   Kokkos::deep_copy(ExecSpace(), of, -1);
+  if (L > 0) {
+    Kokkos::deep_copy(ExecSpace(), live, -1), Kokkos::deep_copy(ExecSpace(), packed, -1);
+    auto overflow = d.overflow;
+    Kokkos::parallel_for(
+        "pk_live_capacity", RangePolicy(0, 1), KOKKOS_LAMBDA(int) {
+          if (at(R) > L) overflow(0) = 1;
+        });
+  }
+  const int cap = p.n_live;
   Kokkos::parallel_for(
       "pk_remote", RangePolicy(0, R), KOKKOS_LAMBDA(int r) {
         const int s = slot(raw(r)), k = s >= 0 ? slot_edge(s) : -1;
         if (k < 0) return;
         const int l = at(r);
+        if (l >= cap) return;  // past a capacity: flagged above
         live(l) = r, packed(l) = k, of(k) = l;
       });
   d.exchange->set_live(live);

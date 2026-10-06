@@ -55,6 +55,9 @@ struct DeviceEdgeData {
   // set overflow(0). Fixed shapes without padding every atom to M.
   bool edge_capacity = false;
   IView1D overflow;
+  // Over several ranks with a capacity: room for this many live edges to ghosts
+  // (Exchange::set_live), the rest -1; more set overflow(0).
+  int live_capacity = 0;
   int n_centres = -1;     // atoms [0, n_centres) have neighbourhoods and are the
                           // model's rows; the rest are only neighbours (over
                           // several ranks, the ghosts). -1 = all

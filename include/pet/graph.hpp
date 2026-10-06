@@ -25,6 +25,8 @@
 #endif
 
 #include <algorithm>
+#include <functional>
+#include <stdexcept>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -141,6 +143,87 @@ class GraphCache {
   void reset() {}
 #endif
   bool broken_ = false;
+};
+
+// A step with an engine's calls in it (an exchange's MPI between the layers):
+// the device work between calls recorded as graphs, each launched as soon as it
+// is recorded -- so the recording step computes, and makes each call, exactly
+// once -- and the calls kept to be made again, in order, on replay. A capture
+// that fails mid-step cannot be redone (its work never ran), so it throws: a
+// caller records only shapes it has just run, when nothing is left to allocate.
+class SegmentedGraph {
+ public:
+  SegmentedGraph() = default;
+  SegmentedGraph(const SegmentedGraph&) = delete;
+  SegmentedGraph& operator=(const SegmentedGraph&) = delete;
+  ~SegmentedGraph() { reset(); }
+
+  bool ready() const { return ready_; }
+  void begin() {
+    reset();
+#if defined(PET_HAVE_GRAPHS)
+    if (!gpu::begin()) fail();
+#endif
+  }
+  // In place of an engine call: close the segment, run it, make the call.
+  void cut(std::function<void()> call) {
+    close();
+    call();
+    calls_.push_back(std::move(call));
+#if defined(PET_HAVE_GRAPHS)
+    if (!gpu::begin()) fail();
+#endif
+  }
+  void finish() {
+    close();
+    ready_ = true;
+  }
+  void replay() const {
+    for (std::size_t i = 0; i < segs_.size(); ++i) {
+#if defined(PET_HAVE_GRAPHS)
+      gpu::launch(segs_[i]);
+#endif
+      if (i < calls_.size()) calls_[i]();
+    }
+  }
+  void reset() {
+#if defined(PET_HAVE_GRAPHS)
+    for (auto e : segs_) gpu::destroy(e);
+#endif
+    segs_.clear(), calls_.clear(), ready_ = false;
+  }
+
+ private:
+#if defined(PET_HAVE_GRAPHS)
+  std::vector<gpu::Exec> segs_;
+#else
+  std::vector<int> segs_;
+#endif
+  std::vector<std::function<void()>> calls_;
+  bool ready_ = false;
+
+  void close() {
+#if defined(PET_HAVE_GRAPHS)
+    gpu::Graph graph = nullptr;
+    gpu::Exec exec = nullptr;
+    if (!gpu::end(&graph) || !graph || !gpu::instantiate(&exec, graph)) {
+      if (graph) gpu::destroy(graph);
+      fail();
+    }
+    gpu::destroy(graph);
+    gpu::launch(exec);
+    segs_.push_back(exec);
+#else
+    segs_.push_back(0);
+#endif
+  }
+  [[noreturn]] void fail() {
+#if defined(PET_HAVE_GRAPHS)
+    gpu::clear_error();
+#endif
+    reset();
+    throw std::runtime_error("pet: recording a step as graphs failed (PET_MD_FIXED=0 runs it eagerly)");
+  }
 };
 
 }  // namespace pet
