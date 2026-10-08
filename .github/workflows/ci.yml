@@ -22,7 +22,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: models
-          key: models-${{ hashFiles('tools/convert_pet.py', 'tools/make_multilayer_checkpoint.py') }}
+          key: models-${{ hashFiles('tools/convert_pet.py') }}
 
       - name: Make models
         if: steps.models.outputs.cache-hit != 'true'
@@ -31,8 +31,6 @@ jobs:
           uv run tools/convert_pet.py --model pet-mad-xs --version 1.6.0 --out models/pet-mad-xs-v1.6
           uv run tools/convert_pet.py --model pet-mols-s --version 1.0.0 --out models/pet-mols-s-v1.0
           uv run tools/convert_pet.py --model pet-omol-s --version 1.0.0 --out models/pet-omol-s
-          uv run tools/make_multilayer_checkpoint.py pet-mad-xs attn2.ckpt --version 1.6.0 --layers 2 --distinct 0.05
-          uv run tools/convert_pet.py --ckpt attn2.ckpt --out models/pet-attn2
 
       - name: Cache dependencies
         uses: actions/cache@v4

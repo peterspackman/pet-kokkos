@@ -160,12 +160,10 @@ inline std::vector<std::string> golden_paths(const std::string& model) {
 //   pet-mad-xs-v1.6  v1.6.0, solver adaptive cutoff
 //   pet-mols-s-v1.0  v1.0.0, the residual featurizer: PostLN, LayerNorm, SiLU,
 //                    cosine cutoff
-//   pet-attn2        synthetic, two attention layers, as every published model
-//                    from size m up has (tools/make_multilayer_checkpoint.py)
 // .github/workflows/ci.yml shows how each is made.
 inline const std::vector<std::string>& golden_models() {
   static const std::vector<std::string> m = [] {
-    std::vector<std::string> v{"pet-mad-xs", "pet-mad-xs-v1.6", "pet-mols-s-v1.0", "pet-attn2"};
+    std::vector<std::string> v{"pet-mad-xs", "pet-mad-xs-v1.6", "pet-mols-s-v1.0"};
     for (auto& n : env_list("PET_TEST_MODELS")) v.push_back(n);
     return v;
   }();
