@@ -91,6 +91,13 @@ void attention_impl(Workspace& ws, const std::string& key, View2D out, View2D qk
 // Each pass recomputes q.k and dO.v for its pairs, in registers; a warp is
 // consecutive queries (or keys) of one atom and head, so the rows it reads are
 // broadcasts. Every sum has one owner and a fixed order: nothing is atomic.
+// The passes hold several head-sized arrays per thread. Bounding the block at
+// 256 threads lets the compiler give each thread the registers for them: under
+// HIP's default bound of 1024 an MI250X GCD caps a thread at 128 and they spill
+// (a pbe0-pet relaxation step 1.9x slower).
+using BwdPolicy = Kokkos::RangePolicy<ExecSpace, Kokkos::LaunchBounds<256, 1>,
+                                      Kokkos::Experimental::WorkItemProperty::HintLightWeight_t>;
+
 template <int HD>
 void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, View2D cf_seq_adj,
                         View2D out_adj, View2D qkv, View2D cf_seq, const WeightRef& w_in,
@@ -108,7 +115,7 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
   View2D merged = ws.peek2(key + ":merged"), ml = ws.peek2(key + ":ml");
 
   Kokkos::parallel_for(
-      "attn_bwd_queries", RangePolicy(0, N * H * S), KOKKOS_LAMBDA(int i) {
+      "attn_bwd_queries", BwdPolicy(0, N * H * S), KOKKOS_LAMBDA(int i) {
         const int sq = i % S, h = (i / S) % H, n = i / (S * H);
         const int nd = HD > 0 ? HD : hd;
         const int row_q = n * S + sq;
@@ -142,7 +149,7 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
       });
 
   Kokkos::parallel_for(
-      "attn_bwd_keys", RangePolicy(0, N * H * S), KOKKOS_LAMBDA(int i) {
+      "attn_bwd_keys", BwdPolicy(0, N * H * S), KOKKOS_LAMBDA(int i) {
         const int sk = i % S, h = (i / S) % H, n = i / (S * H);
         const int nd = HD > 0 ? HD : hd;
         const int row_k = n * S + sk;
