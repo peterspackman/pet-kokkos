@@ -211,20 +211,33 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
   }
   // The same gather as fold_edge_gradients, over the raw list. The partner's
   // vector is minus this edge's and it enters with a minus sign, so it adds.
+  // A wavefront per atom: each lane sums every kLanes-th edge, and the lanes'
+  // partials are combined in a fixed order -- the same bits every run.
   RView2D vir_atom = ws.r2("ad:vir_atom", N, 9);
+  constexpr int kSums = 12;  // force, then the virial
+  const std::size_t shmem = sizeof(double) * kLanes * kSums;
   Kokkos::parallel_for(
-      "ad_gather", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
-        double f[3] = {0, 0, 0}, w[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
-        for (int e = roff(a); e < roff(a + 1); ++e) {
-          const double ge = gmag(e);
-          for (int c = 0; c < 3; ++c) f[c] += ge * vec(e, c);
-          for (int x = 0; x < 3; ++x)
-            for (int y = 0; y < 3; ++y) w[x * 3 + y] += vec(e, x) * ge * vec(e, y);
-          if (rrev(e) >= 0)
-            for (int c = 0; c < 3; ++c) f[c] += gmag(rrev(e)) * vec(e, c);
-        }
-        for (int c = 0; c < 3; ++c) forces(a, c) += f[c];
-        for (int t = 0; t < 9; ++t) vir_atom(a, t) = w[t];
+      "ad_gather", TeamPolicy(N, 1, kLanes).set_scratch_size(0, Kokkos::PerTeam(shmem)),
+      KOKKOS_LAMBDA(const TeamPolicy::member_type& m) {
+        const int a = m.league_rank();
+        double* part = (double*) m.team_scratch(0).get_shmem(shmem);
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(m, kLanes), [&](int l) {
+          double s[kSums] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+          for (int e = roff(a) + l; e < roff(a + 1); e += kLanes) {
+            const double ge = gmag(e), gr = rrev(e) >= 0 ? gmag(rrev(e)) : 0.0;
+            for (int c = 0; c < 3; ++c) s[c] += (ge + gr) * vec(e, c);
+            for (int x = 0; x < 3; ++x)
+              for (int y = 0; y < 3; ++y) s[3 + x * 3 + y] += vec(e, x) * ge * vec(e, y);
+          }
+          for (int t = 0; t < kSums; ++t) part[l * kSums + t] = s[t];
+        });
+        m.team_barrier();
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(m, kSums), [&](int t) {
+          double s = 0.0;
+          for (int l = 0; l < kLanes; ++l) s += part[l * kSums + t];
+          if (t < 3) forces(a, t) += s;
+          else vir_atom(a, t - 3) = s;
+        });
       });
   sum_by_structure(vir_atom, structure_offsets(ws, "ad", sid, N, NS), vir9, true);
 }

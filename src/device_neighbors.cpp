@@ -68,33 +68,39 @@ void solver_cutoffs(const Hypers& h, int N, IView1D roff, RView1D re_dist, RView
 // kept for the backward.
 //
 // bump(d, probe) is exactly 1 for probes at or past d + width and 0 at or below
-// d, smooth only in between, and the grid is uniform: so each edge marks where
-// its run of 1s starts and adds the few smooth values, and a per-atom prefix sum
-// turns the marks into counts -- O(E + N*P), not O(E*P).
+// d, smooth only in between, and the grid is uniform: so each edge's part in
+// eff is fixed by two probe indices, where its smooth values start and where
+// its 1s start, worked out once per edge. Then a wavefront per atom, a lane per
+// probe: each lane walks the atom's edges in order, counting those whose 1s it
+// has reached and adding the bump of the few it lies within -- a serial sweep's
+// sums, at the GPU's width (one thread per atom leaves most of it idle at a few
+// thousand atoms).
 RView2D grid_cutoffs(Workspace& ws, const Hypers& h, int N, IView1D roff, RView1D re_dist, RView1D probes,
                      int P, RView1D acut) {
   const double target = h.num_neighbors_adaptive, width = h.cutoff_width_adaptive;
   Kokkos::deep_copy(ExecSpace(), acut, h.cutoff);
   if (P == 0) return RView2D();
-  RView2D eff = ws.r2("nef:eff", N, P), effp = ws.r2("nef:effp", N, P);
+  const int E = re_dist.extent(0);
+  RView2D eff = ws.r2("nef:eff", N, P);
+  IView1D p_start = ws.i1("nef:p_start", E), p_full = ws.i1("nef:p_full", E);
   Kokkos::parallel_for(
-      "pet_adapt_eff_scatter", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
-        const double p0 = probes(0), dp = (P > 1) ? (probes(1) - probes(0)) : 1.0;
-        for (int e = roff(a); e < roff(a + 1); ++e) {
-          const double d = re_dist(e);
-          const int p_full = Kokkos::clamp((int) Kokkos::ceil((d + width - p0) / dp), 0, P);  // first 1
-          const int p_start = Kokkos::max((int) Kokkos::floor((d - p0) / dp) + 1, 0);        // first > 0
-          if (p_full < P) eff(a, p_full) += 1.0;
-          for (int p = p_start; p < p_full && p < P; ++p) effp(a, p) += detail::dev_bump_cutoff(d, probes(p), width);
-        }
+      "pet_adapt_bounds", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
+        const double d = re_dist(e), p0 = probes(0), dp = (P > 1) ? (probes(1) - probes(0)) : 1.0;
+        p_full(e) = Kokkos::clamp((int) Kokkos::ceil((d + width - p0) / dp), 0, P);  // first 1
+        p_start(e) = Kokkos::max((int) Kokkos::floor((d - p0) / dp) + 1, 0);        // first > 0
       });
   Kokkos::parallel_for(
-      "pet_adapt_eff_scan", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
-        double run = 0.0;
-        for (int p = 0; p < P; ++p) {
-          run += eff(a, p);
-          eff(a, p) = run + effp(a, p);
-        }
+      "pet_adapt_eff", TeamPolicy(N, 1, kLanes), KOKKOS_LAMBDA(const TeamPolicy::member_type& m) {
+        const int a = m.league_rank();
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(m, P), [&](int p) {
+          int ones = 0;
+          double smooth = 0.0;
+          for (int e = roff(a); e < roff(a + 1); ++e) {
+            if (p >= p_full(e)) ++ones;
+            else if (p >= p_start(e)) smooth += detail::dev_bump_cutoff(re_dist(e), probes(p), width);
+          }
+          eff(a, p) = ones + smooth;
+        });
       });
   RView2D diff = ws.r2("nef:diffv", N, P), grad = ws.r2("nef:gradv", N, P);
   Kokkos::parallel_for(
