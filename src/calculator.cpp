@@ -110,6 +110,18 @@ double neighbors_estimate(const System& s, const Hypers& h) {
 
 }  // namespace
 
+std::string device_identity() {
+  char id[64] = {0};
+#if defined(KOKKOS_ENABLE_CUDA)
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetPCIBusId(id, sizeof(id), dev) != cudaSuccess) id[0] = 0;
+#elif defined(KOKKOS_ENABLE_HIP)
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess || hipDeviceGetPCIBusId(id, sizeof(id), dev) != hipSuccess) id[0] = 0;
+#endif
+  return id;
+}
+
 std::vector<std::string> model_search_dirs() {
   std::vector<std::string> dirs;
   auto add = [&dirs](std::string d) {

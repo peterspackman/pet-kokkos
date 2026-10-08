@@ -58,6 +58,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 using namespace LAMMPS_NS;
 
@@ -594,15 +595,23 @@ void PairPET::settings(int narg, char **arg)
   no_virial_fdotr_compute = 1;  // pet-kokkos's symmetric virial instead, see compute()
   ensure_kokkos();
 
-  // Ranks on one node share its GPUs, and each must budget for its share.
+  // Ranks that compute on the same GPU split its memory. Counted by the device
+  // each one is on, not by ranks per node over devices visible: a rank that sees
+  // only its own GPU (HIP_VISIBLE_DEVICES per rank) would otherwise budget for an
+  // eighth of it, and recompute what it could have kept.
   MPI_Comm node;
   MPI_Comm_split_type(world, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node);
   int node_ranks = 1;
   MPI_Comm_size(node, &node_ranks);
+  char mine[64] = {0};
+  std::strncpy(mine, pet::device_identity().c_str(), sizeof(mine) - 1);
+  std::vector<char> ids(64 * std::size_t(node_ranks));
+  MPI_Allgather(mine, 64, MPI_CHAR, ids.data(), 64, MPI_CHAR, node);
   MPI_Comm_free(&node);
   pet::Options opts;
-  const int devices = std::max(1, Kokkos::num_devices());
-  opts.device_share = (node_ranks + devices - 1) / devices;
+  opts.device_share = 0;
+  for (int r = 0; r < node_ranks; ++r) opts.device_share += std::strncmp(&ids[64 * std::size_t(r)], mine, 64) == 0;
+  if (!mine[0]) opts.device_share = node_ranks;  // no GPU: the node's ranks share its memory
   // Mode images on a small system: every step between rebuilds the same shapes,
   // recorded and replayed as one graph. It pays where launches dominate (~2000
   // atoms or fewer on an RTX 4080); past that the headroom the shapes need costs

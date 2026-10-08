@@ -97,6 +97,12 @@ bool vesin_available();
 // <name>.json and <name>.safetensors.
 std::vector<std::string> model_search_dirs();
 
+// The physical device this process computes on (its PCI bus id), the same
+// whichever devices CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES leave visible:
+// processes that report the same one share it (Options::device_share). Empty
+// without a GPU.
+std::string device_identity();
+
 // A model name ("pet-mad-xs") or a path prefix to <spec>.json and
 // <spec>.safetensors, to the two paths; empty is the default model. Throws,
 // listing where it looked, if a named model is not found.
