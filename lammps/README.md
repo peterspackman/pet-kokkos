@@ -68,7 +68,8 @@ Models are found on `PET_MODEL_DIR` (and `./models`, `~/.local/share/pet/models`
   ghosts one cutoff deep, and at every message-passing layer the ranks swap the
   rows of the edges that cross between them (and, in the backward, their
   adjoints): ghost cutoffs by LAMMPS's comm, edge rows straight to the owning
-  rank by MPI_Alltoallv, only for edges PET keeps. Needs `newton on`.
+  rank, point to point with the ranks that share edges, only for edges PET
+  keeps. Needs `newton on`.
 - `ghosts`: no exchange; ghosts as deep as the message passing reaches (several
   cutoffs), all evaluated. Kept for comparison.
 
@@ -81,6 +82,15 @@ decides, and its atom comm follows `-pk kokkos comm`. Open MPI 5 built against a
 external PMIx may point `mca_base_component_path` at PMIx's plugins and never load
 its own CUDA ones (`MPIX_Query_cuda_support` then says 0); pass
 `--mca mca_base_component_path $OMPI/lib/openmpi:$PMIX_PLUGINS`.
+
+Which to use: the messages are many and small, so latency decides, not
+bandwidth. On Setonix (MI250X, Cray MPICH) GPU-aware MPI was 3-5% faster
+within one node and 4-13% slower across four, where staging through the host
+won (`-pk kokkos gpu/aware off`); weak scaling to 32 GCDs held 97% staged. For
+GPU-aware MPI there, every rank must see every GCD (`--gres=gpu:8`, then one
+per rank by `HIP_VISIBLE_DEVICES`): with `--gpu-bind=closest` Cray's GPU IPC
+failed in our tests. `PET_EXCHANGE_TIMING=1` reports each rank's time and bytes in the
+exchange at exit.
 
 `pair_style pet` needs `newton on` (its half list); `pet/kk` in `images` mode
 does not. Per-atom energy and virial (`compute pe/atom`, `stress/atom`) are
