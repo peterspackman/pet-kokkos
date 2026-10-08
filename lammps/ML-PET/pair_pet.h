@@ -112,6 +112,10 @@ class PairPET : public Pair {
   pet::IView1D d_arrive, d_arrive_row;             // per rank arrival offsets; each arrival's row
   pet::View2D d_send, d_recv;                      // rows in send / arrival order
   Kokkos::View<char *, Kokkos::SharedHostPinnedSpace> h_send, h_recv;  // staging without GPU-aware MPI
+  // PET_EXCHANGE_TIMING=1: seconds in exchange_rows (all, the fence before MPI, MPI itself).
+  bool ex_timing = false;
+  double ex_all = 0, ex_fence = 0, ex_mpi = 0, ex_bytes = 0;
+  long ex_calls = 0;
   Kokkos::View<char *, pet::MemSpace> d_mpi_send, d_mpi_recv;          // all GPU-aware MPI sees (exchange_rows)
   Kokkos::View<int *, Kokkos::SharedHostPinnedSpace> h_counts, h_arrive;  // set_live's, to and from the host
   std::vector<double> atom_buf;                    // one value per atom, for the comm hooks

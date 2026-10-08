@@ -82,6 +82,7 @@ void ensure_kokkos()
 
 PairPET::PairPET(LAMMPS *lmp) : Pair(lmp)
 {
+  if (const char *e = std::getenv("PET_EXCHANGE_TIMING")) ex_timing = e[0] == '1';
   single_enable = 0;
   restartinfo = 0;
   one_coeff = 1;
@@ -92,6 +93,9 @@ PairPET::PairPET(LAMMPS *lmp) : Pair(lmp)
 
 PairPET::~PairPET()
 {
+  if (ex_timing)
+    fprintf(stderr, "pet exchange rank %d: %ld calls, %.3f s in exchange_rows, %.3f s fence, %.3f s MPI, %.1f MB sent\n",
+            comm->me, ex_calls, ex_all, ex_fence, ex_mpi, ex_bytes / 1e6);
   if (allocated) {
     memory->destroy(setflag);
     memory->destroy(cutsq);
@@ -354,10 +358,15 @@ void PairPET::exchange_rows(const void *out, void *in, int width, const std::vec
   const auto bytes = [width](int rows) { return std::size_t(rows) * width; };
   if (got) got->assign(comm->nprocs, 0);
   const pet::ExecSpace exec;
+  const double t0 = ex_timing ? MPI_Wtime() : 0;
   if (sc[me] > 0)  // in stream order, like everything around it
     Kokkos::deep_copy(exec, Bytes(i + bytes(rd[me]), bytes(sc[me])), Bytes(o + bytes(sd[me]), bytes(sc[me])));
   if (got) (*got)[me] = sc[me];
   if (peers.empty()) return;
+  if (ex_timing) {
+    exec.fence();
+    ex_fence += MPI_Wtime() - t0;
+  }
 
   std::size_t n_out = 0, n_in = 0;
   for (int p : peers) n_out = std::max(n_out, bytes(sd[p] + sc[p])), n_in = std::max(n_in, bytes(rd[p] + rc[p]));
@@ -381,6 +390,7 @@ void PairPET::exchange_rows(const void *out, void *in, int width, const std::vec
     so = h_send.data(), si = h_recv.data();
   }
   const int np = peers.size();
+  const double t1 = ex_timing ? MPI_Wtime() : 0;
   std::vector<MPI_Request> req(2 * np);
   for (int k = 0; k < np; ++k) {
     const int p = peers[k];
@@ -392,6 +402,10 @@ void PairPET::exchange_rows(const void *out, void *in, int width, const std::vec
   }
   std::vector<MPI_Status> st(2 * np);
   MPI_Waitall(2 * np, req.data(), st.data());
+  if (ex_timing) {
+    ex_mpi += MPI_Wtime() - t1;
+    for (int p : peers) ex_bytes += bytes(sc[p]);
+  }
   for (int k = 0; k < np; ++k) {
     const int p = peers[k];
     int n = (int) bytes(rc[p]);
@@ -406,6 +420,10 @@ void PairPET::exchange_rows(const void *out, void *in, int width, const std::vec
   }
   // The rows reach the caller's buffer in stream order; si is not reused before
   // the next exchange's fence.
+  if (ex_timing) {
+    exec.fence();
+    ex_all += MPI_Wtime() - t0, ++ex_calls;
+  }
 }
 
 // The edges PET keeps this evaluation (pet::Exchange::set_live): their rows in
