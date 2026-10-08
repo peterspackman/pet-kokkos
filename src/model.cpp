@@ -532,11 +532,12 @@ void PetModel::readout(const std::vector<View2D>& node_feat, const std::vector<V
 }
 
 // The adjoint of per_atom_net is 1 per atom, so node_pred's is 1 and edge_pred's
-// is the edge's cutoff factor -- whose own adjoint is edge_pred.
+// is the edge's cutoff factor -- whose own adjoint is edge_pred. node_adj and
+// edge_adj are written; cutoff_adj is added to when acc_cutoff.
 void PetModel::readout_bwd(const ReadoutSaves& sav, int i, const PackedEdges& pk, int N,
-                           View2D node_adj, View2D edge_adj, View1D cutoff_adj, bool acc) {
+                           View2D node_adj, View2D edge_adj, View1D cutoff_adj, bool acc_cutoff) {
   const int E = pk.E, Dh = h_.d_head;
-  const Net beta = acc ? 1 : 0;
+  const bool acc = acc_cutoff;
   const std::string si = std::to_string(i);
   View2D npa = ws_.n2("ro:npa", N, 1), epa = ws_.n2("ro:epa", E, 1);
   auto epred = sav.epred[i];
@@ -555,17 +556,17 @@ void PetModel::readout_bwd(const ReadoutSaves& sav, int i, const PackedEdges& pk
         cutoff_adj(k) = acc ? cutoff_adj(k) + ep : ep;
       });
   View2D nh1_adj = ws_.n2("ro:nh1_adj", N, Dh), nh0_adj = ws_.n2("ro:nh0_adj", N, Dh);
-  linear_bwd(nh1_adj, npa, mat("node_last_layers.energy." + si + ".energy___0.weight"), beta);
+  linear_bwd(nh1_adj, npa, mat("node_last_layers.energy." + si + ".energy___0.weight"), 0);
   silu_bwd(nh1_adj, sav.nh1[i]);
-  linear_bwd(nh0_adj, nh1_adj, mat("node_heads.energy." + si + ".2.weight"), beta);
+  linear_bwd(nh0_adj, nh1_adj, mat("node_heads.energy." + si + ".2.weight"), 0);
   silu_bwd(nh0_adj, sav.nh0[i]);
-  linear_bwd(node_adj, nh0_adj, mat("node_heads.energy." + si + ".0.weight"), beta);
+  linear_bwd(node_adj, nh0_adj, mat("node_heads.energy." + si + ".0.weight"), 0);
   View2D eh1_adj = ws_.n2("ro:eh1_adj", E, Dh), eh0_adj = ws_.n2("ro:eh0_adj", E, Dh);
-  linear_bwd(eh1_adj, epa, mat("edge_last_layers.energy." + si + ".energy___0.weight"), beta);
+  linear_bwd(eh1_adj, epa, mat("edge_last_layers.energy." + si + ".energy___0.weight"), 0);
   silu_bwd(eh1_adj, sav.eh1[i]);
-  linear_bwd(eh0_adj, eh1_adj, mat("edge_heads.energy." + si + ".2.weight"), beta);
+  linear_bwd(eh0_adj, eh1_adj, mat("edge_heads.energy." + si + ".2.weight"), 0);
   silu_bwd(eh0_adj, sav.eh0[i]);
-  linear_bwd(edge_adj, eh0_adj, mat("edge_heads.energy." + si + ".0.weight"), beta);
+  linear_bwd(edge_adj, eh0_adj, mat("edge_heads.energy." + si + ".0.weight"), 0);
 }
 
 // ---- evaluation -------------------------------------------------------------------

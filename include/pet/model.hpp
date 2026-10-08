@@ -256,7 +256,7 @@ class PetModel {
   PackedEdges pack_edges(const DeviceEdgeData& dev);
   View2D conditioning(const DeviceEdgeData& dev);
   void readout_bwd(const ReadoutSaves& sav, int i, const PackedEdges& pk, int N, View2D node_adj,
-                   View2D edge_adj, View1D cutoff_adj, bool acc);
+                   View2D edge_adj, View1D cutoff_adj, bool acc_cutoff);
 
  private:
   WeightRef mat(const std::string& name) const;

@@ -99,15 +99,20 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   assemble_energy(per_atom, net, dev.species, comp_view_, energy_scale_, pk.n_local);
   if (!grad) return {per_atom, {}, {}, {}};
 
-  // The backward accumulates in many places, so here the pool zeroes what it
-  // hands out.
-  ws_.set_zero(true);
+  // As in the forward, every buffer's first writer overwrites it, and the few
+  // the backward accumulates into are zeroed here: one memset per evaluation
+  // each, not one per buffer handed out.
   View2D x4_adj = ws_.n2("re_x4_adj", E, 4), cf_seq_adj = ws_.n2("re_cf_seq_adj", N, S);
+  Kokkos::deep_copy(ExecSpace(), x4_adj, Net(0));
+  Kokkos::deep_copy(ExecSpace(), cf_seq_adj, Net(0));
   View1D cutoff_adj = ws_.n1("re_cutoff_adj", E);
   std::vector<View2D> node_adj(G), edge_adj(G);  // of each layer's read-out features
-  for (int L = 0; L < G; ++L)
+  for (int L = 0; L < G; ++L) {
     node_adj[L] = ws_.n2("re_nfa_" + std::to_string(L), N, D), edge_adj[L] = ws_.n2("re_efa_" + std::to_string(L), E, D);
-  for (int i = 0; i < R; ++i) readout_bwd(rs, i, pk, N, node_adj[i], edge_adj[i], cutoff_adj, true);
+    if (L >= R)  // a layer with no read-out of its own
+      Kokkos::deep_copy(ExecSpace(), node_adj[L], Net(0)), Kokkos::deep_copy(ExecSpace(), edge_adj[L], Net(0));
+  }
+  for (int i = 0; i < R; ++i) readout_bwd(rs, i, pk, N, node_adj[i], edge_adj[i], cutoff_adj, i > 0);
 
   // ie_adj: the adjoint of the next layer's input_edge (zero past the last).
   View2D ie_adj = ws_.n2("re_ie_adj", E, D);
@@ -132,13 +137,13 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
       const std::string key = "re_attn_" + ls + "_" + std::to_string(a);
       // tokens_out = norm(s2), s2 = tok_a + mlp(tok_a)
       View2D s2_adj = ws_.n2("re_s2_adj", N * S, D), tok_a_adj = ws_.n2("re_tok_a_adj", N * S, D);
-      norm_bwd(s2_adj, tokens_adj, sav_s2[L][a], tl + ".norm_mlp");
+      norm_bwd(s2_adj, tokens_adj, sav_s2[L][a], tl + ".norm_mlp", false);
       copy(tok_a_adj, s2_adj);
       feedforward_bwd(tok_a_adj, s2_adj, tl + ".mlp", sav_pre[L][a]);
       // tok_a = norm(s1), s1 = tokens_in + attention(tokens_in): the attention's
       // share accumulates onto the residual's, which is then tokens_in's adjoint.
       View2D s1_adj = ws_.n2("re_s1_adj_" + std::to_string(a % 2), N * S, D);
-      norm_bwd(s1_adj, tok_a_adj, sav_s1[L][a], tl + ".norm_attention");
+      norm_bwd(s1_adj, tok_a_adj, sav_s1[L][a], tl + ".norm_attention", false);
       attention_bwd(ws_, key, s1_adj, cf_seq_adj, s1_adj, sav_qkv[L][a], dev.cf_seq,
                     mat(tl + ".attention.input_linear.weight"), mat(tl + ".attention.output_linear.weight"),
                     N, S, h_.num_heads, h_.head_dim, h_.attention_temperature, 1);
@@ -147,7 +152,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
 
     // tokens = [node_L ; et]: only et depends on the geometry. input_edge feeds
     // compress.0 and, through message passing, carries half of ie_adj. The two
-    // buffers alternate by layer, since the pool zeroes what it hands out.
+    // buffers alternate by layer: this layer's is written while the last's is read.
     View2D et_adj = ws_.n2("re_et_adj", E, D), cpre_adj = ws_.n2("re_cpre_adj", E, D);
     View2D ie_next = ws_.n2("re_ie_" + std::to_string(L % 2), E, D);
     const bool has_msg = L + 1 < G;
@@ -157,7 +162,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
           et_adj(k, d) = k < off(N) ? tokens_adj(n * S + 1 + k - off(n), d) : Net(0);  // past: a capacity's dead rows
           ie_next(k, d) = has_msg ? Net(0.5) * ie_adj(k, d) : Net(0);
         });
-    linear_bwd(cpre_adj, et_adj, mat(g + ".compress.2.weight"));
+    linear_bwd(cpre_adj, et_adj, mat(g + ".compress.2.weight"), 0);
     compress_bwd(cpre_adj, sav_cpre[L], compress_fold(L), x4_adj, ie_next);
     ie_adj = ie_next;
   }
