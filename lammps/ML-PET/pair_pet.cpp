@@ -339,8 +339,8 @@ void PairPET::set_peers()
 
 // Rows `width` bytes wide between device buffers, point to point with the peers
 // (a message each way with every peer, empty or not, so that sends and receives
-// always pair up): straight from device memory when MPI is GPU-aware, else
-// through pinned host buffers. Rows this rank sends itself (ghosts that are
+// always pair up): through persistent device buffers when MPI is GPU-aware,
+// else pinned host ones. Rows this rank sends itself (ghosts that are
 // images of its own atoms) are copied on the device. Counts and displacements
 // per rank, in rows; with `got`, rc is an upper bound and got is what came.
 void PairPET::exchange_rows(const void *out, void *in, int width, const std::vector<int> &sc,
@@ -357,14 +357,24 @@ void PairPET::exchange_rows(const void *out, void *in, int width, const std::vec
     Kokkos::deep_copy(exec, Bytes(i + bytes(rd[me]), bytes(sc[me])), Bytes(o + bytes(sd[me]), bytes(sc[me])));
   if (got) (*got)[me] = sc[me];
   if (peers.empty()) return;
-  exec.fence("pet: rows ready for MPI");  // MPI does not follow the stream
 
   std::size_t n_out = 0, n_in = 0;
   for (int p : peers) n_out = std::max(n_out, bytes(sd[p] + sc[p])), n_in = std::max(n_in, bytes(rd[p] + rc[p]));
-  char *so = o, *si = i;
-  if (!gpu_aware) {
-    if (h_send.extent(0) < n_out) h_send = decltype(h_send)("pet:h_send", n_out);
-    if (h_recv.extent(0) < n_in) h_recv = decltype(h_recv)("pet:h_recv", n_in);
+  // MPI sees only persistent buffers, grown with headroom and never shrunk. The
+  // callers' views come and go with each rebuild, and Cray MPICH caches its GPU
+  // IPC mappings by address: a freed buffer whose address is handed out again
+  // under a live mapping faults the GPU.
+  const auto grow = [](auto &v, std::size_t n, const std::string &label) {
+    if (v.extent(0) < n) v = std::decay_t<decltype(v)>(label, n + n / 2);
+  };
+  char *so, *si;
+  if (gpu_aware) {
+    grow(d_mpi_send, n_out, "pet:mpi_send"), grow(d_mpi_recv, n_in, "pet:mpi_recv");
+    Kokkos::deep_copy(exec, Bytes(d_mpi_send.data(), n_out), Bytes(o, n_out));
+    exec.fence("pet: rows ready for MPI");
+    so = d_mpi_send.data(), si = d_mpi_recv.data();
+  } else {
+    grow(h_send, n_out, "pet:h_send"), grow(h_recv, n_in, "pet:h_recv");
     Kokkos::deep_copy(exec, Kokkos::subview(h_send, std::make_pair(std::size_t(0), n_out)), Bytes(o, n_out));
     exec.fence("pet: rows staged for MPI");
     so = h_send.data(), si = h_recv.data();
@@ -388,12 +398,13 @@ void PairPET::exchange_rows(const void *out, void *in, int width, const std::vec
       MPI_Get_count(&st[k], MPI_BYTE, &n);
       (*got)[p] = n / width;
     }
-    if (!gpu_aware && n > 0)
-      Kokkos::deep_copy(exec, Bytes(i + bytes(rd[p]), n),
-                        Kokkos::subview(h_recv, std::make_pair(bytes(rd[p]), bytes(rd[p]) + n)));
+    if (n == 0) continue;
+    const auto at = std::make_pair(bytes(rd[p]), bytes(rd[p]) + n);
+    if (gpu_aware) Kokkos::deep_copy(exec, Bytes(i + bytes(rd[p]), n), Kokkos::subview(d_mpi_recv, at));
+    else Kokkos::deep_copy(exec, Bytes(i + bytes(rd[p]), n), Kokkos::subview(h_recv, at));
   }
-  // The staged rows reach the device in stream order; h_recv is not reused
-  // before the next exchange's fence.
+  // The rows reach the caller's buffer in stream order; si is not reused before
+  // the next exchange's fence.
 }
 
 // The edges PET keeps this evaluation (pet::Exchange::set_live): their rows in
