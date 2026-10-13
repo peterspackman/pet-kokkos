@@ -550,11 +550,19 @@ class PetModel final : public metatomic::BaseModel {
     auto samples = pairs.samples();
     if (!has_names(samples, {"first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"}))
       throw metatomic::Error("pet-kokkos: unexpected pair list samples");
-    auto p = samples.values();
+    auto values = samples.values();
     const std::size_t P = samples.count();
+    // Straight from the data: DLPackArray's operator() checks every index.
+    const int32_t* data = values.data();
+    const int64_t sp = P ? values.strides()[0] : 5, sc = P ? values.strides()[1] : 1;
+    auto p = [&](std::size_t k, int c) { return data[int64_t(k) * sp + c * sc]; };
     std::vector<int> offsets(n + 1, 0), neighbors(P), shifts(3 * P);
     bool shifted = false;
-    for (std::size_t k = 0; k < P; ++k) ++offsets[where[p(k, 0)] + 1];
+    for (std::size_t k = 0; k < P; ++k) {
+      if (p(k, 0) < 0 || p(k, 0) >= n || p(k, 1) < 0 || p(k, 1) >= n)
+        throw metatomic::Error("pet-kokkos: a pair names an atom that does not exist");
+      ++offsets[where[p(k, 0)] + 1];
+    }
     for (int i = 0; i < n; ++i) offsets[i + 1] += offsets[i];
     std::vector<int> cursor(offsets.begin(), offsets.end() - 1);
     for (std::size_t k = 0; k < P; ++k) {

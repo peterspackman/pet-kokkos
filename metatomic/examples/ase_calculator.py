@@ -87,8 +87,9 @@ class PluginCalculator(Calculator):
         torch_dtype = {np.int32: self._torch.int32, np.float64: self._torch.float64, bool: self._torch.bool}[dtype]
         return self._torch.as_tensor(np.asarray(values), dtype=torch_dtype, device=self._cuda)
 
-    def _labels(self, names, values):
-        return Labels(names, self._array(np.asarray(values, dtype=np.int32).reshape(-1, len(names)), np.int32))
+    def _labels(self, names, values, assume_unique=False):
+        values = self._array(np.asarray(values, dtype=np.int32).reshape(-1, len(names)), np.int32)
+        return Labels(names, values, assume_unique=assume_unique)
 
     def _system(self, atoms):
         cell = atoms.cell[:] if atoms.pbc.any() else np.zeros((3, 3))
@@ -99,12 +100,16 @@ class PluginCalculator(Calculator):
             self._array(cell, np.float64),
             self._array(atoms.pbc, bool),
         )
-        i, j, S, D = self.neighbors.compute(atoms.positions, cell, atoms.pbc, "ijSD")
+        i, j, S, D = self.neighbors.compute(atoms.positions, cell, atoms.pbc, "ijSD", copy=False)
+        samples = np.empty((len(i), 5), dtype=np.int32)
+        samples[:, 0], samples[:, 1], samples[:, 2:] = i, j, S
         pairs = TensorBlock(
             values=self._array(D.reshape(-1, 3, 1), np.float64),
+            # A neighbour list's pairs are unique: no need for metatensor to check.
             samples=self._labels(
                 ["first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"],
-                np.column_stack([i, j, S]),
+                samples,
+                assume_unique=True,
             ),
             components=[self._labels(["xyz"], [0, 1, 2])],
             properties=self._labels(["distance"], [0]),
