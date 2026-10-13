@@ -155,7 +155,11 @@ yet:
 - Execute on ROCm arrays at all, so a HIP build takes CPU systems only.
 
 `metatomic/test_plugin.py` checks it against the goldens through metatomic's
-Python API (see the file for what it needs).
+Python API (see the file for what it needs). No engine loads metatomic plugins
+yet -- metatomic's ASE and torch-sim engines take TorchScript models --
+so [`metatomic/examples/ase_calculator.py`](metatomic/examples/ase_calculator.py)
+is a small ASE calculator over the C API, with vesin's neighbour lists, for
+MD and relaxations on either path.
 
 ## Models
 
