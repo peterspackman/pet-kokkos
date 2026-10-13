@@ -188,6 +188,14 @@ class Calculator {
     double virial[6] = {0, 0, 0, 0, 0, 0};  // as Results::virial
   };
   Totals compute_step(const DeviceArrays& arrays, const double* cell = nullptr) const;
+  // An engine's pairs on the device in any order (DevicePairListView), set and
+  // evaluated in one call: positions [n_atoms, 3] row-major device memory in the
+  // engine's order, cell [9] host memory (needed with shifts). The results stay
+  // on the device, in the list's numbering (renumber applied), in this
+  // Calculator's own views: valid until its next evaluation. It replaces any
+  // list set_neighbors holds.
+  BatchResult compute_pairs(const DevicePairListView& pairs, const double* positions, const double* cell = nullptr,
+                            bool compute_forces = true) const;
   // How far past its owned atoms an engine must supply ghosts: one cutoff per
   // message-passing layer, and one more for an adaptive cutoff, which needs each
   // of those atoms' complete neighbourhoods.

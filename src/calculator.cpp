@@ -416,6 +416,15 @@ Results Calculator::compute_edges(const EdgeListView& edges, bool compute_forces
   return session_results(dev, compute_forces, edge_gradients);
 }
 
+BatchResult Calculator::compute_pairs(const DevicePairListView& pairs, const double* positions, const double* cell,
+                                      bool compute_forces) const {
+  auto& I = *impl_;
+  I.md.set(pairs, I.ckpt.species_to_index);
+  const DeviceEdgeData& dev =
+      I.md.step(positions, true, cell, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), false);
+  return I.model.energy_forces_batch(dev, compute_forces);
+}
+
 void Calculator::set_neighbors(const EdgeListView& list) { impl_->md.set(list, impl_->ckpt.species_to_index); }
 void Calculator::set_neighbors(const DeviceEdgeListView& list) { impl_->md.set(list, impl_->ckpt.species_to_index); }
 

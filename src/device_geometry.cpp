@@ -409,6 +409,7 @@ DeviceEdgeData build_device_batch(const std::vector<System>& systems, const Hype
 
 void EdgeSession::set(const EdgeListView& v, const std::vector<int>& species_to_index) {
   const int N = v.n_atoms, L = N > 0 ? v.offsets[N] : 0;
+  renumber = IView1D();
   if (N > detail::PET_KEY_ATOM_MAX) throw std::runtime_error("pet: too many atoms for the edge key");
   if (v.exchange && v.half) throw std::runtime_error("pet: an exchanged list must be full");
   std::vector<int> sp(N);
@@ -454,6 +455,7 @@ void EdgeSession::set(const EdgeListView& v, const std::vector<int>& species_to_
 
 void EdgeSession::set(const DeviceEdgeListView& v, const std::vector<int>& species_to_index) {
   const int N = v.n_atoms, NC = v.n_centres;
+  renumber = IView1D();
   if (N > detail::PET_KEY_ATOM_MAX) throw std::runtime_error("pet: too many atoms for the edge key");
   const int *ilist = v.ilist, *numneigh = v.numneigh, *nbr = v.neighbors, *z = v.atomic_numbers, *image = v.image_of;
   const long si = v.stride_i, sk = v.stride_k;
@@ -542,6 +544,130 @@ void EdgeSession::set(const DeviceEdgeListView& v, const std::vector<int>& speci
   n_pairs = E, shifted = image != nullptr;
 }
 
+void EdgeSession::set(const DevicePairListView& v, const std::vector<int>& species_to_index) {
+  const int N = v.n_atoms, P = v.n_pairs;
+  if (N > detail::PET_KEY_ATOM_MAX) throw std::runtime_error("pet: too many atoms for the edge key");
+  const int *pr = v.pairs, *z = v.atomic_numbers;
+  const long sp = v.stride_pair, sc = v.stride_col;
+
+  // The renumbering, kept for the positions each step; it must be a permutation.
+  renumber = IView1D();
+  IView1D ren = ws.i1("md:renumber", v.renumber ? N : 0);
+  const bool has_ren = v.renumber != nullptr;
+  if (has_ren) {
+    const int* r = v.renumber;
+    IView1D seen = ws.i1("md:renumber_seen", N);
+    Kokkos::deep_copy(ExecSpace(), seen, 0);
+    int bad = 0;
+    Kokkos::parallel_reduce(
+        "md_pairs_renumber", RangePolicy(0, N),
+        KOKKOS_LAMBDA(int a, int& b) {
+          const int to = r[a];
+          ren(a) = to;
+          b += to < 0 || to >= N || Kokkos::atomic_fetch_add(&seen(to), 1) != 0;
+        },
+        bad);
+    if (bad) throw std::runtime_error("pet: the renumbering is not a permutation of the atoms");
+    renumber = ren;
+  }
+
+  // Species through the model's table, in our numbering.
+  const int T = species_to_index.size();
+  IView1D table = ws.i1("md:species_table", T), species = ws.i1("md:species", N);
+  Kokkos::deep_copy(table, Kokkos::View<const int*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(species_to_index.data(), T));
+  int bad = 0;
+  Kokkos::parallel_reduce(
+      "md_pairs_species", RangePolicy(0, N),
+      KOKKOS_LAMBDA(int a, int& b) {
+        const int s = z[a] >= 0 && z[a] < T ? table(z[a]) : -1;
+        species(has_ren ? ren(a) : a) = s;
+        b += s < 0;
+      },
+      bad);
+  if (bad) throw std::runtime_error("pet: " + std::to_string(bad) + " atoms have elements the model does not cover");
+
+  // Each centre's pairs and where its range starts. An engine's list usually
+  // holds each atom's pairs in one run; then the run is the range, in order. A
+  // list that does not is scattered and each range sorted by list position, so
+  // either way the edges come out in the same, deterministic order.
+  IView1D count = ws.i1("md:pairs_count", N), runs = ws.i1("md:pairs_runs", N), first = ws.i1("md:pairs_first", N),
+          off = ws.i1("md:off", N + 1);
+  Kokkos::deep_copy(ExecSpace(), count, 0);
+  Kokkos::deep_copy(ExecSpace(), runs, 0);
+  int bad_atoms = 0;
+  Kokkos::parallel_reduce(
+      "md_pairs_count", RangePolicy(0, P),
+      KOKKOS_LAMBDA(int k, int& b) {
+        const int i = pr[k * sp], j = pr[k * sp + sc];
+        if (i < 0 || i >= N || j < 0 || j >= N) return (void) ++b;
+        Kokkos::atomic_inc(&count(has_ren ? ren(i) : i));
+        if (k == 0 || pr[(k - 1) * sp] != i) {  // a run of i's pairs starts here
+          Kokkos::atomic_inc(&runs(i));
+          first(i) = k;
+        }
+      },
+      bad_atoms);
+  if (bad_atoms) throw std::runtime_error("pet: " + std::to_string(bad_atoms) + " pairs name atoms that do not exist");
+  Kokkos::parallel_scan(
+      "md_pairs_off", RangePolicy(0, N + 1), KOKKOS_LAMBDA(int c, int& acc, bool final) {
+        if (final) off(c) = acc;
+        if (c < N) acc += count(c);
+      });
+  int scattered = 0;
+  Kokkos::parallel_reduce(
+      "md_pairs_runs", RangePolicy(0, N), KOKKOS_LAMBDA(int a, int& s) { s += runs(a) > 1; }, scattered);
+
+  IView1D slot_pair = ws.i1("md:pairs_slot", P);  // the pair in each edge slot
+  if (!scattered) {
+    Kokkos::parallel_for(
+        "md_pairs_place", RangePolicy(0, P), KOKKOS_LAMBDA(int k) {
+          const int i = pr[k * sp];
+          slot_pair(off(has_ren ? ren(i) : i) + (k - first(i))) = k;
+        });
+  } else {
+    IView1D cursor = ws.i1("md:pairs_cursor", N);
+    Kokkos::parallel_for(
+        "md_pairs_cursor", RangePolicy(0, N), KOKKOS_LAMBDA(int c) { cursor(c) = off(c); });
+    Kokkos::parallel_for(
+        "md_pairs_scatter", RangePolicy(0, P), KOKKOS_LAMBDA(int k) {
+          const int i = pr[k * sp];
+          slot_pair(Kokkos::atomic_fetch_add(&cursor(has_ren ? ren(i) : i), 1)) = k;
+        });
+    Kokkos::parallel_for(
+        "md_pairs_sort", RangePolicy(0, N), KOKKOS_LAMBDA(int c) {
+          for (int a = off(c) + 1; a < off(c + 1); ++a) {
+            const int k = slot_pair(a);
+            int b = a - 1;
+            for (; b >= off(c) && slot_pair(b) > k; --b) slot_pair(b + 1) = slot_pair(b);
+            slot_pair(b + 1) = k;
+          }
+        });
+  }
+
+  IView1D re_i = ws.i1("md:re_i", P), re_j = ws.i1("md:re_j", P);
+  IView2D re_shift = ws.i2("md:re_shift", P, 3);
+  int worst = 0;
+  Kokkos::parallel_reduce(
+      "md_pairs_edges", RangePolicy(0, N),
+      KOKKOS_LAMBDA(int c, int& w) {
+        for (int e = off(c); e < off(c + 1); ++e) {
+          const long k = slot_pair(e);
+          const int j = pr[k * sp + sc];
+          re_i(e) = c, re_j(e) = has_ren ? ren(j) : j;
+          for (int d = 0; d < 3; ++d) {
+            const int s = pr[k * sp + (2 + d) * sc];
+            re_shift(e, d) = s;
+            w = Kokkos::max(w, Kokkos::abs(s));
+          }
+        }
+      },
+      Kokkos::Max<int>(worst));
+  if (worst > detail::PET_KEY_SHIFT_BIAS) throw std::runtime_error("pet: cell shift too large for the edge key");
+  finish(N, v.n_local, species, re_i, re_j, re_shift, P, v.charge, v.spin_multiplicity, nullptr);
+  src.clear(), dir.clear();
+  n_pairs = P, shifted = worst > 0;
+}
+
 // What both kinds of list end with: the topology, and over several ranks the
 // edges to ghosts, in the engine's order.
 void EdgeSession::finish(int N, int n_local, IView1D species, IView1D re_i, IView1D re_j, IView2D re_shift, int E,
@@ -589,11 +715,15 @@ const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device,
   if (shifted && !cell) throw std::runtime_error("pet: an edge list with shifts needs the cell");
   const int N = dev.n_atoms, E = dev.n_raw;
   RView2D pos = ws.r2("md:pos", N, 3);
+  if (renumber.extent(0) > 0 && !on_device) throw std::runtime_error("pet: a renumbered list takes device positions");
   if (N && on_device) {
     const Kokkos::View<const double**, Kokkos::LayoutRight, MemSpace, Kokkos::MemoryUnmanaged> x(positions, N, 3);
+    auto ren = renumber;
+    const bool has_ren = ren.extent(0) > 0;
     Kokkos::parallel_for(
         "md_positions", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
-          for (int c = 0; c < 3; ++c) pos(i, c) = x(i, c);
+          const int to = has_ren ? ren(i) : i;
+          for (int c = 0; c < 3; ++c) pos(to, c) = x(i, c);
         });
   } else if (N) {
     Kokkos::deep_copy(pos, Kokkos::View<const double**, Kokkos::LayoutRight, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(positions, N, 3));

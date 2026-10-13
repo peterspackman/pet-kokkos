@@ -687,3 +687,93 @@ TEST_CASE("an exchanging engine's recorded steps are its eager ones", "[model][e
     }
   }
 }
+
+namespace {
+
+// A full periodic list flattened as metatomic hands it over, [P, 5]: first,
+// second, shift. `engine` renames the atoms (ours = engine[theirs]), `order`
+// reorders the pairs.
+std::vector<int> flat_pairs(const PeriodicList& l, int n, const std::vector<int>& theirs,
+                            const std::vector<std::size_t>& order) {
+  std::vector<int> csr;
+  for (int i = 0; i < n; ++i)
+    for (int e = l.off[i]; e < l.off[i + 1]; ++e)
+      csr.insert(csr.end(), {theirs[i], theirs[l.nbr[e]], l.sh[3 * e], l.sh[3 * e + 1], l.sh[3 * e + 2]});
+  std::vector<int> out;
+  for (std::size_t k : order) out.insert(out.end(), csr.begin() + 5 * k, csr.begin() + 5 * k + 5);
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("an engine's flat pair list on the device gets what its host list does", "[model][edges]") {
+  for (const auto& model : plumbing_models()) {
+    auto* calc = shared_calculator(model);
+    Golden store;
+    const Golden* g = calc ? first_periodic(model, store) : nullptr;
+    if (!g) continue;
+    DYNAMIC_SECTION(model) {
+      const pet::System& s = g->system;
+      const int n = s.n_atoms;
+      const PeriodicList list = periodic_list(s, calc->cutoff() + 0.5, false);
+      const pet::Results ref = calc->compute_edges(list.view(s), true, false);
+      const std::size_t P = list.nbr.size();
+
+      using IV = Kokkos::View<int*, pet::MemSpace>;
+      using DV = Kokkos::View<double*, pet::MemSpace>;
+      auto up_i = [](const std::vector<int>& h) {
+        IV d("i", h.size());
+        Kokkos::deep_copy(d, Kokkos::View<const int*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(h.data(), h.size()));
+        return d;
+      };
+      auto up_d = [](const std::vector<double>& h) {
+        DV d("d", h.size());
+        Kokkos::deep_copy(d, Kokkos::View<const double*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(h.data(), h.size()));
+        return d;
+      };
+      auto host = [](auto view) {
+        auto m = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), view);
+        return std::vector<double>(m.data(), m.data() + m.size());
+      };
+
+      // The engine numbers the atoms backwards (`theirs`), and lists the pairs
+      // in `order`; with the renumbering the answer comes back in ours.
+      auto run = [&](bool renumbered, const std::vector<std::size_t>& order) {
+        std::vector<int> theirs(n), ren(n), z(n);
+        std::vector<double> x(3 * std::size_t(n));
+        for (int i = 0; i < n; ++i) theirs[i] = renumbered ? n - 1 - i : i;
+        for (int i = 0; i < n; ++i) {
+          ren[theirs[i]] = i, z[theirs[i]] = s.atomic_numbers[i];
+          for (int c = 0; c < 3; ++c) x[3 * theirs[i] + c] = s.positions[3 * i + c];
+        }
+        const IV pairs = up_i(flat_pairs(list, n, theirs, order)), types = up_i(z), renumber = up_i(ren);
+        const DV pos = up_d(x);
+        pet::DevicePairListView v;
+        v.n_atoms = n, v.n_pairs = int(P), v.pairs = pairs.data(), v.atomic_numbers = types.data();
+        v.renumber = renumbered ? renumber.data() : nullptr;
+        const pet::BatchResult r = calc->compute_pairs(v, pos.data(), s.cell.data(), true);
+        Kokkos::fence();
+        return std::make_tuple(host(r.energy)[0], host(r.forces), host(r.virial), host(r.per_atom));
+      };
+
+      std::vector<std::size_t> listed(P);
+      for (std::size_t k = 0; k < P; ++k) listed[k] = k;
+      // Each atom's pairs interleaved with the others' (a scattered list), but in
+      // their own order: the same edges in the same order as grouped.
+      std::vector<std::size_t> interleaved;
+      for (int round = 0; interleaved.size() < P; ++round)
+        for (int i = 0; i < n; ++i)
+          if (list.off[i] + round < list.off[i + 1]) interleaved.push_back(list.off[i] + round);
+
+      for (bool renumbered : {false, true})
+        for (const auto* order : {&listed, &interleaved}) {
+          INFO("renumbered " << renumbered << ", interleaved " << (order == &interleaved));
+          const auto [e, f, w, pa] = run(renumbered, *order);
+          CHECK(e == ref.energy[0]);
+          CHECK(f == ref.forces);
+          CHECK(w == ref.virial);
+          CHECK(pa == ref.per_atom_energy);
+        }
+    }
+  }
+}

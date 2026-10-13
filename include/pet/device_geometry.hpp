@@ -130,6 +130,23 @@ struct DeviceEdgeListView {
   Exchange* exchange = nullptr;         // as EdgeListView's
 };
 
+// The pairs as a flat list on the device, in any order, as metatomic hands them
+// over: pair k is atom pairs[k * stride_pair] -> pairs[k * stride_pair +
+// stride_col], shifted by the next three columns (in lattice vectors, as
+// EdgeListView::shifts). A full list. atomic_numbers [n_atoms] is device memory.
+// With `renumber` (device, [n_atoms]), the engine's atom a is atom renumber[a]
+// here -- so an engine can put the atoms it owns first, [0, n_local) -- and the
+// positions given each step are permuted the same way; results come back in
+// this numbering. Each atom's pairs keep their order in the list.
+struct DevicePairListView {
+  int n_atoms = 0, n_local = -1, n_pairs = 0;
+  const int* pairs = nullptr;
+  long stride_pair = 5, stride_col = 1;
+  const int* atomic_numbers = nullptr;
+  const int* renumber = nullptr;
+  int charge = 0, spin_multiplicity = 1;
+};
+
 // An engine's list on the device between its rebuilds: the topology once (set),
 // the geometry per step. A half list is mirrored here, each atom's own pairs
 // first. With `fixed`, M is a capacity chosen at the first step, so every step
@@ -151,9 +168,11 @@ struct EdgeSession {
     for (int k = 0; k < 9; ++k) h_cell(k) = cell ? cell[k] : 0.0;
   }
   bool shifted = false, valid = false;
+  IView1D renumber;  // [N] a DevicePairListView's renumbering; empty: none
 
   void set(const EdgeListView& v, const std::vector<int>& species_to_index);
   void set(const DeviceEdgeListView& v, const std::vector<int>& species_to_index);
+  void set(const DevicePairListView& v, const std::vector<int>& species_to_index);
   void finish(int N, int n_local, IView1D species, IView1D re_i, IView1D re_j, IView2D re_shift, int E, int charge,
               int spin, Exchange* exchange);
   // positions: host, or device when on_device.

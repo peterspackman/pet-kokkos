@@ -130,13 +130,13 @@ def system_for(name, atoms, **kwargs):
     return make_system(atoms, cutoff, **kwargs)
 
 
-def evaluate(name, systems, outputs, selected_atoms=None):
+def evaluate(name, systems, outputs, selected_atoms=None, check=True):
     return mta.execute_model(
         model(name),
         systems,
         outputs,
         selected_atoms=selected_atoms,
-        check_consistency=True,
+        check_consistency=check,
     )
 
 
@@ -145,7 +145,8 @@ def test_capabilities():
     capabilities = m.capabilities()
     assert capabilities.length_unit.lower() == "angstrom"
     assert capabilities.dtype == "float64"
-    assert capabilities.supported_devices == ["cpu"]
+    # A CUDA build reads and writes device memory too, and says so first.
+    assert capabilities.supported_devices in (["cpu"], ["cuda", "cpu"])
     assert 1 in capabilities.atomic_types and 8 in capabilities.atomic_types
     # Two message-passing layers and the adaptive cutoff, 7.5 A each.
     assert capabilities.interaction_range == pytest.approx(3 * 7.5)
@@ -350,3 +351,231 @@ def test_unit_conversion():
     kj = mta.Quantity(name="energy", unit="kJ/mol", sample_kind="system")
     (energy,) = evaluate(name, [system_for(name, atoms)], [kj])
     assert energy.block().values[0, 0] == pytest.approx(ev * 96.48533212, rel=1e-6)
+
+
+# --- systems in device memory --------------------------------------------------
+#
+# A CUDA build takes systems whose arrays are on the GPU (here torch tensors)
+# without copying them to the host, and leaves its outputs there. Run whenever
+# the plugin says it can; they need PyTorch with CUDA then, and fail without it.
+#
+# Without metatomic's consistency checks: they build their expected labels on
+# the CPU and cannot compare them with a device block's, whose labels metatensor
+# requires on the device (test_device_consistency_checks).
+
+
+def cuda_build():
+    return "cuda" in model("pet-mad-xs").capabilities().supported_devices
+
+
+needs_cuda = pytest.mark.skipif(
+    "not cuda_build()", reason="the plugin was not built for CUDA"
+)
+
+
+@pytest.fixture(scope="module")
+def torch():
+    import torch
+
+    assert torch.cuda.is_available(), "a CUDA build's device tests need PyTorch with CUDA"
+    metatensor.register_external_data_wrapper("pet_kokkos::KokkosArray", TorchCudaArray)
+    return torch
+
+
+class TorchCudaArray:
+    """The plugin's device arrays as torch tensors, sharing their memory.
+
+    metatensor's ExternalCudaArray does the same through CuPy, or else hands
+    torch an object that refuses torch's stream argument; here torch gets the
+    DLPack capsule itself. The plugin's export has already synchronized.
+    """
+
+    def __new__(cls, mts_array, parent):
+        import ctypes
+
+        import torch
+        from ctypes_dlpack import DLDevice, DLManagedTensorVersioned, DLPackArray, DLPackVersion
+        from metatensor._status import check_status
+
+        pointer = ctypes.POINTER(DLManagedTensorVersioned)()
+        status = mts_array.as_dlpack(
+            mts_array.ptr, ctypes.byref(pointer), DLDevice(device_type=2, device_id=0), None,
+            DLPackVersion(major=1, minor=0),
+        )
+        check_status(status)
+        capsule = DLPackArray(pointer).__dlpack__(stream=None, max_version=(1, 0))
+        tensor = torch.from_dlpack(capsule)
+        tensor._parent = parent
+        return tensor
+
+
+def torch_range(torch, name, n, device):
+    return Labels([name], torch.arange(n, dtype=torch.int32, device=device).reshape(-1, 1))
+
+
+def evaluate_device(name, systems, outputs, selected_atoms=None):
+    return evaluate(name, systems, outputs, selected_atoms=selected_atoms, check=False)
+
+
+def device_system(torch, name, atoms, order=None, charge=None, spin=None):
+    """`atoms` as a System in CUDA memory, its pairs too (metatensor wants a
+    block's labels where its values are); `order` reorders the pairs."""
+    m = model(name)
+    options = m.requested_pair_lists()[0]
+    cuda = torch.device("cuda")
+    system = mta.System(
+        "Angstrom",
+        torch.tensor(atoms.numbers, dtype=torch.int32, device=cuda),
+        torch.tensor(atoms.positions, dtype=torch.float64, device=cuda),
+        torch.tensor(atoms.cell[:], dtype=torch.float64, device=cuda),
+        torch.tensor(atoms.pbc, dtype=torch.bool, device=cuda),
+    )
+    i, j, S, D = ase.neighborlist.neighbor_list("ijSD", atoms, options.cutoff)
+    if order is not None:
+        i, j, S, D = i[order(len(i))], j[order(len(i))], S[order(len(i))], D[order(len(i))]
+    samples = torch.tensor(np.column_stack([i, j, S]), dtype=torch.int32, device=cuda)
+    pairs = TensorBlock(
+        values=torch.tensor(D.reshape(-1, 3, 1), dtype=torch.float64, device=cuda),
+        samples=Labels(
+            ["first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"],
+            samples,
+        ),
+        components=[torch_range(torch, "xyz", 3, samples.device)],
+        properties=torch_range(torch, "distance", 1, samples.device),
+    )
+    system.add_pairs(options, pairs)
+    if m.requested_inputs():
+        for key, value in (("charge", charge or 0), ("spin_multiplicity", spin or 1)):
+            block = TensorBlock(
+                values=torch.tensor([[float(value)]], dtype=torch.float64, device=cuda),
+                samples=Labels(["system"], torch.tensor([[0]], dtype=torch.int32, device=cuda)),
+                components=[],
+                properties=torch_range(torch, key, 1, cuda),
+            )
+            system.add_custom_data(
+                key, TensorMap(Labels(["_"], torch.tensor([[0]], dtype=torch.int32, device=cuda)), [block])
+            )
+    return system
+
+
+def on_gpu(array):
+    return getattr(array, "is_cuda", False)
+
+
+def as_numpy(array):
+    return array.cpu().numpy() if hasattr(array, "cpu") else np.asarray(array)
+
+
+def same(device_map, host_map, gradients=("positions", "strain"), atol=1e-10):
+    d, h = device_map.block(), host_map.block()
+    assert on_gpu(d.values) and on_gpu(d.samples.values)
+    np.testing.assert_array_equal(as_numpy(d.samples.values), as_numpy(h.samples.values))
+    np.testing.assert_allclose(as_numpy(d.values), as_numpy(h.values), atol=atol, rtol=0)
+    for g in gradients:
+        dg, hg = d.gradient(g), h.gradient(g)
+        assert on_gpu(dg.values)
+        np.testing.assert_array_equal(as_numpy(dg.samples.values), as_numpy(hg.samples.values))
+        np.testing.assert_allclose(as_numpy(dg.values), as_numpy(hg.values), atol=atol, rtol=0)
+
+
+@needs_cuda
+@pytest.mark.parametrize("name", MODELS)
+@pytest.mark.parametrize("case", CASES)
+def test_device_matches_host(torch, name, case):
+    atoms = golden_atoms(golden(name, case))
+    host = evaluate(name, [system_for(name, atoms)], [ENERGY, ATOM_ENERGY])
+    device = evaluate_device(
+        name, [device_system(torch, name, atoms)], [ENERGY, ATOM_ENERGY]
+    )
+    same(device[0], host[0])
+    same(device[1], host[1], gradients=())
+
+
+@needs_cuda
+def test_device_pairs_in_any_order(torch):
+    """The pairs need not come grouped by atom; scattered ones give the same
+    answer, and the same one every time."""
+    name = "pet-mad-xs"
+    atoms = golden_atoms(golden(name, "disordered"))
+    grouped = evaluate_device(name, [device_system(torch, name, atoms)], [ENERGY])[0]
+    rng = np.random.default_rng(3)
+    permutation = rng.permutation(10**6)
+    shuffle = lambda n: permutation[permutation < n]  # noqa: E731
+    first = evaluate_device(name, [device_system(torch, name, atoms, order=shuffle)], [ENERGY])[0]
+    again = evaluate_device(name, [device_system(torch, name, atoms, order=shuffle)], [ENERGY])[0]
+    same(first, again, atol=0)
+    np.testing.assert_allclose(
+        as_numpy(first.block().values), as_numpy(grouped.block().values), atol=1e-6
+    )
+    np.testing.assert_allclose(
+        as_numpy(first.block().gradient("positions").values),
+        as_numpy(grouped.block().gradient("positions").values),
+        atol=1e-5,
+    )
+
+
+@needs_cuda
+def test_device_selected_atoms(torch):
+    name = "pet-mad-xs"
+    molecule = golden_atoms(golden(name, "molecule"))
+    crystal = golden_atoms(golden(name, "disordered"))
+    rng = np.random.default_rng(11)
+    chosen = np.sort(rng.choice(len(crystal), size=len(crystal) // 2, replace=False))[::-1]
+    selection = Labels(
+        ["system", "atom"], np.column_stack([np.ones_like(chosen), chosen]).astype(np.int32)
+    )
+    host = evaluate(
+        name, [system_for(name, molecule), system_for(name, crystal)], [ENERGY, ATOM_ENERGY],
+        selected_atoms=selection,
+    )
+    device = evaluate_device(
+        name,
+        [device_system(torch, name, molecule), device_system(torch, name, crystal)],
+        [ENERGY, ATOM_ENERGY],
+        selected_atoms=selection,
+    )
+    same(device[0], host[0])
+    same(device[1], host[1], gradients=())
+
+
+@needs_cuda
+@pytest.mark.xfail(
+    strict=True,
+    raises=mta.MetatomicError,
+    reason="metatomic wants custom data on the system's device, but validates it "
+    "with labels it makes on the CPU, so device systems can not carry a charge yet",
+)
+def test_device_charge_and_spin(torch):
+    name = "pet-omol-s"
+    water = ase.Atoms(
+        "OH2", positions=[[0, 0, 0.11926], [0, 0.76323, -0.47704], [0, -0.76323, -0.47704]]
+    )
+    for charge, spin in ((0, 1), (1, 2)):
+        host = evaluate(name, [system_for(name, water, charge=charge, spin=spin)], [ENERGY])
+        device = evaluate_device(
+            name, [device_system(torch, name, water, charge=charge, spin=spin)], [ENERGY]
+        )
+        same(device[0], host[0])
+
+
+@needs_cuda
+def test_device_unit_conversion(torch):
+    """metatomic scales the outputs in place, on the device."""
+    name = "pet-mad-xs"
+    atoms = golden_atoms(golden(name, "crystal"))
+    ev = evaluate_device(name, [device_system(torch, name, atoms)], [ENERGY_NO_GRADIENTS])[0]
+    kj = mta.Quantity(name="energy", unit="kJ/mol", sample_kind="system")
+    (energy,) = evaluate_device(name, [device_system(torch, name, atoms)], [kj])
+    assert on_gpu(energy.block().values)
+    assert as_numpy(energy.block().values)[0, 0] == pytest.approx(
+        as_numpy(ev.block().values)[0, 0] * 96.48533212, rel=1e-6
+    )
+
+
+@needs_cuda
+def test_device_consistency_checks(torch):
+    """metatomic's checks cannot yet look at device outputs. When this starts
+    failing, they can: run the device tests with them."""
+    atoms = golden_atoms(golden("pet-mad-xs", "crystal"))
+    with pytest.raises(mta.MetatomicError, match="on different devices"):
+        evaluate("pet-mad-xs", [device_system(torch, "pet-mad-xs", atoms)], [ENERGY])

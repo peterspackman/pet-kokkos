@@ -137,9 +137,22 @@ ghost atoms out to the model's `interaction_range` (one cutoff per
 message-passing layer, plus one for the adaptive cutoff) and select its own.
 
 The plugin carries its own Kokkos, with its symbols hidden, and starts it with
-the first model. Inputs and outputs are on the CPU for now; the evaluation runs
-on the build's device. Each call copies the pair list to the device, which adds
-a few milliseconds over `pet-eval` on a few thousand atoms.
+the first model.
+
+A CUDA build lists `cuda` first among its devices. Systems in GPU memory are
+read where they are -- positions, types and the pair list -- and the outputs,
+values and labels, stay on the GPU as DLPack-exportable arrays; nothing but the
+cell, a selection and a few labels crosses the bus, and a call costs what
+`pet-eval` does. Systems on the CPU work with any build; the evaluation still
+runs on the build's device, and copying the pair list there adds a few
+milliseconds per call on a few thousand atoms. What metatomic itself cannot do
+yet:
+
+- Check device outputs: `check_consistency` builds its expected labels on the
+  CPU and fails on device blocks. Run without it on the GPU.
+- Take custom data on the GPU, so a charge-conditioned model (pet-omol) needs
+  its systems on the CPU.
+- Execute on ROCm arrays at all, so a HIP build takes CPU systems only.
 
 `metatomic/test_plugin.py` checks it against the goldens through metatomic's
 Python API (see the file for what it needs).
