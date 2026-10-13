@@ -38,6 +38,8 @@ endif()
 option(PET_BUILD_TESTS   "Build the test suite"            ${PET_IS_TOP_LEVEL})
 option(PET_BUILD_APPS    "Build the command-line tools"    ${PET_IS_TOP_LEVEL})
 option(PET_INSTALL       "Install the library and headers"  ${PET_IS_TOP_LEVEL})
+# The metatomic plugin (metatomic/): needs metatomic and metatensor installed.
+option(PET_BUILD_METATOMIC "Build the metatomic plugin"    OFF)
 
 # Optional vesin backend for the host neighbour search. The built-in search is an
 # O(N^2 x images) brute force, fine for small cells and the dominant cost for
@@ -215,6 +217,10 @@ if(PET_BUILD_APPS)
     add_subdirectory(apps)
 endif()
 
+if(PET_BUILD_METATOMIC)
+    add_subdirectory(metatomic)
+endif()
+
 if(PET_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
@@ -229,3 +235,4 @@ message(STATUS "  build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  tests      : ${PET_BUILD_TESTS}   apps: ${PET_BUILD_APPS}")
 message(STATUS "  vesin      : ${PET_HAVE_VESIN}")
 message(STATUS "  cutlass    : ${PET_HAVE_CUTLASS}")
+message(STATUS "  metatomic  : ${PET_BUILD_METATOMIC}")

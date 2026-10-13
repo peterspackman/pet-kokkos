@@ -38,7 +38,9 @@ and results are bit-identical from run to run on both CPU and GPU.
 MD codes can pass in their own neighbour list and get back forces, per-atom
 energies and virials, or per-edge gradients (`set_neighbors`, `compute_step`,
 `compute_edges`). The LAMMPS package in [`lammps/`](lammps/README.md) uses this
-to provide `pair_style pet` and `pet/kk`.
+to provide `pair_style pet` and `pet/kk`. Engines that load
+[metatomic](https://github.com/metatensor/metatomic) plugins can use the plugin
+in [`metatomic/`](#metatomic-plugin).
 
 ## Performance
 
@@ -90,10 +92,57 @@ CMake options:
   fall back to a plain Kokkos loop, 12-20x slower on pet-mad. With OpenMP, an
   OpenMP-threaded BLAS shares Kokkos's threads.
 - `PET_BUILD_TESTS`, `PET_BUILD_APPS`.
+- `PET_BUILD_METATOMIC`: build the metatomic plugin (default off; see below).
 
 When pet-kokkos is pulled in as a dependency (`add_subdirectory`, CPM or
 FetchContent), the tests and apps are off by default and an existing
 `Kokkos::kokkos` target is reused.
+
+## metatomic plugin
+
+`-DPET_BUILD_METATOMIC=ON` builds `metatomic/pet-kokkos-metatomic.so`, a
+[metatomic](https://github.com/metatensor/metatomic) plugin. It needs metatomic's
+C++ library and metatensor. metatomic-core is not on PyPI yet: build it from a
+metatomic checkout (it needs Rust), and its Python package then ships the CMake
+config, as metatensor's does:
+
+```bash
+pip install "metatensor-core>=0.2.4,<0.3" setuptools packaging cmake
+pip install --no-build-isolation ./python/metatomic_core   # in the metatomic checkout
+```
+
+```bash
+cmake --preset cuda -DKokkos_ARCH_ADA89=ON -DPET_BUILD_METATOMIC=ON \
+  -DCMAKE_PREFIX_PATH="$(python -c 'import metatomic; print(metatomic.utils.cmake_prefix_path)');$(python -c 'import metatensor; print(metatensor.utils.cmake_prefix_path)')"
+```
+
+```python
+import metatomic as mta
+
+mta.load_plugin("build-cuda/metatomic/pet-kokkos-metatomic.so")
+model = mta.load_model("pet-mad-xs", {"gemm": "native"}, plugin_name="pet-kokkos")
+```
+
+`load_model` takes a model name or path prefix, found as `pet::Calculator`
+finds it. The options, all strings, are `gemm` (as `PET_GEMM`; process-wide),
+`recompute` (`auto`, `never`, `wide` or `layers`), `memory_budget_gib`, and
+`device_id` (by default each node-local MPI rank takes its own GPU).
+
+The model computes `energy` per system, with `positions` and `strain`
+gradients, and per atom. It asks for a full pair list at the model's cutoff, and
+for `charge` and `spin_multiplicity` if the model is charge-conditioned
+(pet-omol). With `selected_atoms`, a system's energy is the selected atoms'
+share and its gradients are with respect to every atom, so an engine can pass
+ghost atoms out to the model's `interaction_range` (one cutoff per
+message-passing layer, plus one for the adaptive cutoff) and select its own.
+
+The plugin carries its own Kokkos, with its symbols hidden, and starts it with
+the first model. Inputs and outputs are on the CPU for now; the evaluation runs
+on the build's device. Each call copies the pair list to the device, which adds
+a few milliseconds over `pet-eval` on a few thousand atoms.
+
+`metatomic/test_plugin.py` checks it against the goldens through metatomic's
+Python API (see the file for what it needs).
 
 ## Models
 
