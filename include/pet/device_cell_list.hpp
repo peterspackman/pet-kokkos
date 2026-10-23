@@ -9,9 +9,11 @@
 // lattice shift, and that shift is the edge's image -- floor division gives both.
 //
 // Bins are filled with an atomic counter and then put in atom order, so the edge
-// order, and so the result, is reproducible. It differs from the brute-force
-// search's order (the results differ in the last bits); the edge set is the same,
-// which tests/test_cell_list.cpp checks.
+// order, and so the result, is reproducible. The edge set is the brute-force
+// search's, which tests/test_cell_list.cpp checks; the order is too for any
+// structure Auto could give the brute force (one bin, the brute force's image
+// ranges), so a structure's answer does not depend on the search its batch
+// called for. A larger structure always takes the cell list.
 #pragma once
 
 #include <Kokkos_Core.hpp>

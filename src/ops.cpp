@@ -9,9 +9,12 @@ namespace pet {
 // Every GEMM in the network has a weight as its second operand and comes through
 // here: on narrow operands in the FP8, BF16 and FP16 modes where it can, else
 // through gemm_ozaki, which is the vendor GEMM unless the Ozaki path is on. The
-// backward takes the same path as the forward.
+// backward takes the same path as the forward. In the native mode, CUTLASS's
+// SIMT GEMM where the build has it: its answer for a row does not depend on how
+// many rows there are, so a structure gets the same bits whatever its batch.
 static void weight_gemm(char tw, Net beta, View2D out, View2D in, const WeightRef& W, View1D b = {}) {
   if (gemm_lowp('N', tw, Net(1), in, W.v, beta, out, b)) return;
+  if (!W.split && gemm_mode() == GemmMode::Native && linear_fused(out, in, W.v, tw == 'T', b, beta)) return;
   gemm_ozaki('N', tw, Net(1), in, W.v, beta, out, W.for_orientation(tw == 'T'), b);
 }
 

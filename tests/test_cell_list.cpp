@@ -6,6 +6,7 @@
 // mixed batch.
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <set>
@@ -186,4 +187,26 @@ TEST_CASE("an evaluation is the same on the cell list as by brute force", "[mode
   CHECK(de <= 1e-5 * std::max(escale, 1.0));
   CHECK(df <= 1e-5 * std::max(fscale, 1.0));
   CHECK(dw <= 1e-5 * std::max(escale, 1.0));
+}
+
+TEST_CASE("a structure the brute force could search gets the brute force's order", "[neighbors][cells][determinism]") {
+  // Auto picks the search by the batch's size, so a small structure is searched
+  // by brute force alone and by the cell list in a large batch. Below
+  // kCellListMinAtoms and kCellListMinChecks the cell list walks it as the brute
+  // force does: images in order, then the atoms by index. At pet-mols-s's 4.5 A
+  // an 8-atom cell checks 8 x 5^3 = 1000 pairs.
+  constexpr double kShort = 4.5;
+  const std::vector<pet::System> sys = {diamond(1, 3.567), diamond(1, 3.567, 0.3)};
+  const std::vector<Edge> cells = cell_list_edges(sys, kShort);
+  const std::set<Edge> brute = brute_force_edges(sys, kShort);
+  std::vector<Edge> order(brute.begin(), brute.end());
+  std::sort(order.begin(), order.end(), [](const Edge& a, const Edge& b) {
+    const auto key = [](const Edge& e) {
+      const auto& [s, i, j, sa, sb, sc] = e;
+      return std::make_tuple(s, i, sa, sb, sc, j);
+    };
+    return key(a) < key(b);
+  });
+  INFO(cells.size() << " cell-list edges, " << order.size() << " by brute force");
+  CHECK(cells == order);
 }

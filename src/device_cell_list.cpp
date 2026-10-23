@@ -79,6 +79,7 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
   const double cutoff2 = cutoff * cutoff;
   const IView1D& sid = g.sid;
   const IView1D& sper = g.sper;
+  const IView1D& scnt = g.scnt;
   const RView2D& scell = g.scell;
 
   RawEdges out;
@@ -103,6 +104,20 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
                                 Kokkos::sqrt(ca[0]*ca[0]+ca[1]*ca[1]+ca[2]*ca[2]),
                                 Kokkos::sqrt(ab[0]*ab[0]+ab[1]*ab[1]+ab[2]*ab[2])};
         int nb = 1;
+        // A structure Auto could search by brute force (kCellListMinAtoms,
+        // kCellListMinChecks) gets one bin and the brute force's image ranges:
+        // the walk below is then the brute force's own -- images in order, the
+        // atoms by index, the same vector arithmetic -- so its edges come out the
+        // same to the bit whichever search the rest of its batch called for.
+        const double cell[9] = {a0, a1, a2, b0, b1, b2, c0, c1, c2};
+        int rng[3];
+        image_ranges_rows(cell, cutoff, sper(b), rng);
+        if (scnt(b) < kCellListMinAtoms &&
+            scnt(b) * (2 * rng[0] + 1) * (2 * rng[1] + 1) * (2 * rng[2] + 1) < kCellListMinChecks) {
+          for (int d = 0; d < 3; ++d) gnc(b, d) = 1, gnr(b, d) = rng[d];
+          gbins(b) = 1;
+          return;
+        }
         for (int d = 0; d < 3; ++d) {
           int nc = 1, nr = 0;
           if (sper(b) && vol > 1e-12 && area[d] > 0.0) {

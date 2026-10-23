@@ -55,6 +55,8 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
 // The same with the GEMM and the elementwise step fused (fused_gemm.cpp), h
 // optional; false when that cannot run here.
 bool swiglu_in_fused(View2D pre, View2D h, View2D in, const View2D& w, View1D b);
+// out = in . W^T (w_transposed, W [N, K]) or in . W (W [K, N]), + b, + beta out.
+bool linear_fused(View2D out, View2D in, const View2D& w, bool w_transposed, View1D b, Net beta);
 bool silu_in_fused(View2D out, View2D pre, View2D in, const View2D& w, View1D b);
 bool silu_bwd_fused(View2D grad, View2D out_adj, const View2D& w, View2D pre);
 bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2D pre);

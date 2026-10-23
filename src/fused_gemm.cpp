@@ -1,13 +1,17 @@
-// GEMMs with their elementwise neighbours fused into the epilogue: CUTLASS's
-// fp32 SIMT main loop (bit-identical to cuBLAS's SGEMM, and within a few percent
-// of its speed), with our own epilogue walking each thread's accumulators.
+// The native mode's fp32 GEMMs on CUDA, every weight GEMM in the network:
+// CUTLASS's SIMT main loop with our own epilogue walking each thread's
+// accumulators -- the bias, or the elementwise neighbours fused in. One kernel
+// family for every shape, so a structure's answer does not depend on its batch.
 //
 // Each function returns false when it cannot run here -- no CUTLASS, a double
 // network, PET_CUTLASS=0, or an unaligned operand -- and the caller takes the
-// unfused path.
+// unfused path (cuBLAS, whose kernel and split-k depend on the shape).
 #include "ops.hpp"
 
+#include "pet/gemm.hpp"
+
 #include <cstdlib>
+#include <string>
 
 #if defined(PET_HAVE_CUTLASS) && defined(KOKKOS_ENABLE_CUDA) && !defined(PET_KOKKOS_FP64)
 #define PET_FUSED 1
@@ -23,19 +27,33 @@ namespace {
 
 using RM = cutlass::layout::RowMajor;
 using CM = cutlass::layout::ColumnMajor;
-using TileShape = cutlass::gemm::GemmShape<256, 128, 8>;
-using WarpShape = cutlass::gemm::GemmShape<64, 64, 8>;
+// Three CTA tiles, the largest that fills the device twice over. All are the
+// same SIMT main loop: each thread runs one FMA chain over k, in order, per
+// output element, so the tile changes the speed and never a bit of the answer.
+// That makes a row's result independent of how many rows the GEMM has -- of the
+// batch it came in -- which no split-k or tensor-core kernel promises. Timed on
+// an RTX 4080 SUPER against cuBLAS: Large is level with it from a few hundred
+// rows of tokens up, and a single small structure is ~0.3 ms slower.
+template <int TM, int TN, int WM, int WN>
+struct Tiles {
+  using Tile = cutlass::gemm::GemmShape<TM, TN, 8>;
+  using Warp = cutlass::gemm::GemmShape<WM, WN, 8>;
+};
+using Large = Tiles<128, 128, 32, 64>;
+using Mid = Tiles<64, 64, 32, 32>;
+using Small = Tiles<64, 32, 32, 32>;
 
 // out[M, N] = A[M, K] . B, B = W^T for a [N, K] weight (ColumnMajor) or W for a
 // [K, N] one (RowMajor).
-template <class LayoutB>
+template <class Cfg, class LayoutB>
 using Mma = typename cutlass::gemm::threadblock::DefaultMma<
-    float, RM, 1, float, LayoutB, 1, float, RM, cutlass::arch::OpClassSimt, cutlass::arch::Sm80, TileShape,
-    WarpShape, cutlass::gemm::GemmShape<1, 1, 1>, 3, cutlass::arch::OpMultiplyAdd>::ThreadblockMma;
+    float, RM, 1, float, LayoutB, 1, float, RM, cutlass::arch::OpClassSimt, cutlass::arch::Sm80, typename Cfg::Tile,
+    typename Cfg::Warp, cutlass::gemm::GemmShape<1, 1, 1>, 3, cutlass::arch::OpMultiplyAdd>::ThreadblockMma;
 
 // One CTA per output tile. The epilogue gets each thread's accumulators as runs
 // of kLane contiguous columns, with the run's (row, col); rows and runs outside
-// the output are skipped (N is a multiple of kLane).
+// the output are skipped, and a run the edge cuts (N not a multiple of kLane) is
+// the epilogue's to stop short.
 template <class Mma, class Epi>
 __global__ void __launch_bounds__(Mma::WarpCount::kCount * 32)
     gemm_kernel(int M, int N, int K, const float* A, const float* B, Epi epi) {
@@ -73,12 +91,11 @@ __global__ void __launch_bounds__(Mma::WarpCount::kCount * 32)
       }
 }
 
-constexpr int kLane = 4;  // LaneMmaShape::kN for fp32 at this warp shape
+constexpr int kLane = 4;  // LaneMmaShape::kN for fp32 at these warp shapes
 
-// Reported to Kokkos Tools as a kernel called `name`, like any Kokkos kernel.
-template <class LayoutB, class Epi>
-void launch(const char* name, int M, int N, int K, const float* A, const float* B, Epi epi) {
-  using G = Mma<LayoutB>;
+template <class Cfg, class LayoutB, class Epi>
+void launch_tile(const char* name, int M, int N, int K, const float* A, const float* B, Epi epi) {
+  using G = Mma<Cfg, LayoutB>;
   static_assert(G::Operator::Policy::LaneMmaShape::kN == kLane);
   constexpr int smem = sizeof(typename G::SharedStorage);
   static const bool attr =
@@ -91,24 +108,49 @@ void launch(const char* name, int M, int N, int K, const float* A, const float* 
   if (Kokkos::Tools::profileLibraryLoaded()) Kokkos::Tools::endParallelFor(id);
 }
 
-bool enabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("PET_CUTLASS");
-    return !(e && e[0] == '0');
-  }();
-  return on;
-}
-
-// Enough 256x128 tiles to fill the device a few times over; below that cuBLAS's
-// smaller tiles win.
-bool big_enough(int M, int N) {
+int sm_count() {
   static const int sms = [] {
     int n = 0, dev = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
     return n;
   }();
-  return long(M + TileShape::kM - 1) / TileShape::kM * ((N + TileShape::kN - 1) / TileShape::kN) >= 4L * sms;
+  return sms;
+}
+
+template <class Cfg>
+long tiles(int M, int N) {
+  return long(M + Cfg::Tile::kM - 1) / Cfg::Tile::kM * ((N + Cfg::Tile::kN - 1) / Cfg::Tile::kN);
+}
+
+// detail::set_cutlass_tile, from PET_CUTLASS_TILE: a pinned tile or -1.
+int& forced_tile() {
+  static int t = [] {
+    const char* e = std::getenv("PET_CUTLASS_TILE");
+    if (!e) return -1;
+    const std::string s(e);
+    return s == "large" ? 0 : s == "mid" ? 1 : s == "small" ? 2 : -1;
+  }();
+  return t;
+}
+
+// Reported to Kokkos Tools as a kernel called `name`, like any Kokkos kernel.
+template <class LayoutB, class Epi>
+void launch(const char* name, int M, int N, int K, const float* A, const float* B, Epi epi) {
+  if (M == 0 || N == 0) return;
+  int t = forced_tile();
+  if (t < 0) t = tiles<Large>(M, N) >= 2L * sm_count() ? 0 : tiles<Mid>(M, N) >= 2L * sm_count() ? 1 : 2;
+  if (t == 0) launch_tile<Large, LayoutB>(name, M, N, K, A, B, epi);
+  else if (t == 1) launch_tile<Mid, LayoutB>(name, M, N, K, A, B, epi);
+  else launch_tile<Small, LayoutB>(name, M, N, K, A, B, epi);
+}
+
+bool enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("PET_CUTLASS");
+    return !(e && e[0] == '0');
+  }();
+  return on;
 }
 
 // Contiguous rows, 16-byte aligned, a whole number of kLane runs wide.
@@ -190,10 +232,43 @@ struct SiluBwd {
   }
 };
 
+// out = acc + b (+ beta out): the GEMM with nothing fused, for a run of up to
+// kLane columns (N need not be a multiple of it).
+struct Plain {
+  float* out;
+  const float* b;
+  float beta;
+  int N;
+  __device__ void operator()(int r, int c, const float* v) const {
+#pragma unroll
+    for (int j = 0; j < kLane; ++j)
+      if (c + j < N) {
+        float* o = out + std::size_t(r) * N + c + j;
+        float x = v[j];
+        if (b) x += b[c + j];
+        if (beta != 0.0f) x += beta * *o;
+        *o = x;
+      }
+  }
+};
+
 }  // namespace
 
+bool batch_invariant_gemms() { return enabled() && gemm_mode() == GemmMode::Native; }
+void detail::set_cutlass_tile(int tile) { forced_tile() = tile; }
+
+bool linear_fused(View2D out, View2D in, const View2D& w, bool w_transposed, View1D b, Net beta) {
+  if (!enabled() || !out.span_is_contiguous() || !in.span_is_contiguous() || !w.span_is_contiguous()) return false;
+  const int M = out.extent(0), N = out.extent(1), K = in.extent(1);
+  if (w_transposed)
+    launch<CM>("linear", M, N, K, in.data(), w.data(), Plain{out.data(), b.data(), float(beta), N});
+  else
+    launch<RM>("linear_bwd", M, N, K, in.data(), w.data(), Plain{out.data(), b.data(), float(beta), N});
+  return true;
+}
+
 bool silu_in_fused(View2D out, View2D pre, View2D in, const View2D& w, View1D b) {
-  if (!enabled() || !big_enough(out.extent(0), out.extent(1)) || !vec_ok(out) || (pre.data() && !vec_ok(pre)) ||
+  if (!enabled() || !vec_ok(out) || (pre.data() && !vec_ok(pre)) ||
       (b.data() && !vec_ok(b)) || !in.span_is_contiguous())
     return false;
   launch<CM>("fused linear_silu", out.extent(0), out.extent(1), in.extent(1), in.data(), w.data(),
@@ -202,7 +277,7 @@ bool silu_in_fused(View2D out, View2D pre, View2D in, const View2D& w, View1D b)
 }
 
 bool silu_bwd_fused(View2D grad, View2D out_adj, const View2D& w, View2D pre) {
-  if (!enabled() || !big_enough(grad.extent(0), grad.extent(1)) || !vec_ok(grad) || !vec_ok(pre) ||
+  if (!enabled() || !vec_ok(grad) || !vec_ok(pre) ||
       !out_adj.span_is_contiguous())
     return false;
   launch<RM>("fused silu_bwd", grad.extent(0), grad.extent(1), out_adj.extent(1), out_adj.data(), w.data(),
@@ -211,14 +286,14 @@ bool silu_bwd_fused(View2D grad, View2D out_adj, const View2D& w, View2D pre) {
 }
 
 bool swiglu_in_fused(View2D pre, View2D h, View2D in, const View2D& w, View1D b) {
-  if (!enabled() || !big_enough(pre.extent(0), pre.extent(1)) || !vec_ok(pre) || (h.data() && !vec_ok(h)) || !vec_ok(b) || !in.span_is_contiguous()) return false;
+  if (!enabled() || !vec_ok(pre) || (h.data() && !vec_ok(h)) || !vec_ok(b) || !in.span_is_contiguous()) return false;
   launch<CM>("fused swiglu_in", pre.extent(0), pre.extent(1), in.extent(1), in.data(), w.data(),
              SwigluFwd{pre.data(), h.data(), b.data(), int(pre.extent(1))});
   return true;
 }
 
 bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2D pre) {
-  if (!enabled() || !big_enough(out_adj.extent(0), w_out.extent(1)) || !vec_ok(pre) || !vec_ok(pre_adj) || !out_adj.span_is_contiguous() ||
+  if (!enabled() || !vec_ok(pre) || !vec_ok(pre_adj) || !out_adj.span_is_contiguous() ||
       w_out.extent(1) % kLane)
     return false;
   launch<RM>("fused swiglu_bwd", out_adj.extent(0), w_out.extent(1), out_adj.extent(1), out_adj.data(), w_out.data(),
@@ -228,6 +303,16 @@ bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2
 
 #else
 
+bool batch_invariant_gemms() {
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(PET_HAVE_CBLAS)
+  return false;
+#else
+  return gemm_mode() == GemmMode::Native;  // the naive loop: one dot product per element
+#endif
+}
+void detail::set_cutlass_tile(int) {}
+
+bool linear_fused(View2D, View2D, const View2D&, bool, View1D, Net) { return false; }
 bool silu_in_fused(View2D, View2D, View2D, const View2D&, View1D) { return false; }
 bool silu_bwd_fused(View2D, View2D, const View2D&, View2D) { return false; }
 bool swiglu_in_fused(View2D, View2D, View2D, const View2D&, View1D) { return false; }

@@ -6,11 +6,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <utility>
 #include <vector>
 
 #include "pet/calculator.hpp"
+#include "pet/device_cell_list.hpp"
 #include "pet/gemm.hpp"
 #include "test_support.hpp"
 
@@ -236,6 +238,166 @@ TEST_CASE("a replayed CUDA graph gives the eager answer", "[model][determinism]"
       DYNAMIC_SECTION(model << " / " << g.name) {
         const pet::Results ref = a.compute(g.system, true);
         for (int k = 0; k < kRepeats; ++k) require_bit_identical(ref, b.compute(g.system, true), "graph");
+      }
+    }
+  }
+}
+
+namespace {
+
+// Each structure's energy, forces and virial from stage + compute_device -- the
+// path a relaxation or MD driver steps -- for the leading `lead` of `systems`
+// (all of them when 0).
+struct Device {
+  std::vector<double> energy;
+  std::vector<std::vector<double>> forces, virial;
+};
+
+Device device_eval(const pet::Calculator& calc, const std::vector<pet::System>& systems, int lead = 0) {
+  pet::DeviceGeom g = calc.stage(systems);
+  const int B = lead > 0 ? lead : static_cast<int>(systems.size());
+  int n = 0;
+  for (int b = 0; b < B; ++b) n += systems[b].n_atoms;
+  g.B = B, g.Ntot = n;
+  const pet::BatchResult r = calc.compute_device(g, true);
+  const auto he = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), r.energy);
+  const auto hf = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), r.forces);
+  const auto hw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), r.virial);
+  Device d;
+  for (int b = 0, off = 0; b < B; off += systems[b++].n_atoms) {
+    d.energy.push_back(he(b));
+    std::vector<double> f, w;
+    for (int i = 0; i < systems[b].n_atoms; ++i)
+      for (int c = 0; c < 3; ++c) f.push_back(hf(off + i, c));
+    for (int v = 0; v < 6; ++v) w.push_back(hw(b, v));
+    d.forces.push_back(std::move(f)), d.virial.push_back(std::move(w));
+  }
+  return d;
+}
+
+// Structure b of `got` against `want`'s structure 0: to the bit where the build
+// promises it (batch_invariant_gemms), else to the fp32 noise of a vendor BLAS
+// picking its kernels by size.
+void require_same_structure(const Device& got, int b, const Device& want, const char* what) {
+  INFO(what << ", structure " << b);
+  const bool bits = pet::batch_invariant_gemms();
+  const double e = want.energy[0], de = std::abs(got.energy[b] - e);
+  INFO("|dE| = " << de << " eV on E = " << e);
+  if (bits) REQUIRE(got.energy[b] == e);
+  else CHECK(de <= 1e-5 * worst(1.0, std::abs(e)));
+  double max_f = 0.0, max_df = 0.0;
+  for (std::size_t i = 0; i < want.forces[0].size(); ++i) {
+    max_f = worst(max_f, std::abs(want.forces[0][i]));
+    max_df = worst(max_df, std::abs(got.forces[b][i] - want.forces[0][i]));
+    if (bits) REQUIRE(got.forces[b][i] == want.forces[0][i]);
+  }
+  INFO("max|dF| = " << max_df << " eV/A on max|F| = " << max_f << " eV/A");
+  if (!bits) CHECK(max_df <= 1e-4 * std::max(max_f, 1.0));
+  for (int v = 0; v < 6; ++v)
+    if (bits) REQUIRE(got.virial[b][v] == want.virial[0][v]);
+}
+
+// s repeated three times along its first lattice vector.
+pet::System tripled(const pet::System& s) {
+  pet::System t = s;
+  t.n_atoms = 3 * s.n_atoms;
+  t.atomic_numbers.clear(), t.positions.clear();
+  for (int k = 0; k < 3; ++k)
+    for (int i = 0; i < s.n_atoms; ++i) {
+      t.atomic_numbers.push_back(s.atomic_numbers[i]);
+      for (int d = 0; d < 3; ++d) t.positions.push_back(s.positions[3 * i + d] + k * s.cell[d]);
+    }
+  for (int d = 0; d < 3; ++d) t.cell[d] *= 3;
+  return t;
+}
+
+// The periodic goldens tripled along one axis, each in copies moved apart by a
+// few hundredths of an Angstrom, until the batch passes kCellListMinAtoms: so
+// the batch takes the cell list, with two bins along that axis at pet-mols-s's
+// 4.5 A, while each structure alone is small enough for the brute force (24
+// atoms x 3 x 5 x 5 images).
+std::vector<pet::System> rattled_batch(const std::string& model) {
+  std::vector<pet::System> base;
+  for (const auto& path : golden_paths(model)) {
+    Golden g = load_golden(path);
+    if (g.periodic) base.push_back(tripled(g.system));
+  }
+  std::vector<pet::System> out;
+  int atoms = 0;
+  for (int copy = 0; !base.empty() && atoms < 2 * pet::kCellListMinAtoms; ++copy)
+    for (const auto& s : base) {
+      pet::System r = s;
+      for (std::size_t i = 0; i < r.positions.size(); ++i)
+        r.positions[i] += 0.03 * std::sin(1.7 * double(i) + 2.3 * copy);
+      atoms += r.n_atoms;
+      out.push_back(std::move(r));
+    }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("a structure's answer does not depend on the batch it is in", "[model][determinism]") {
+  // A relaxation packs the structures still running to the front, so a
+  // structure's batch-mates and the batch's size change under it; a chaotic
+  // optimiser turns last-bit differences into different minima. Alone, in the
+  // whole batch, in a leading part of it and with the batch reversed, each
+  // structure must get the same answer: to the bit where batch_invariant_gemms.
+  for (const auto& model : golden_models()) {
+    const pet::Calculator* calc = shared_calculator(model);
+    if (!calc) continue;
+    const std::vector<pet::System> batch = rattled_batch(model);
+    if (batch.size() < 4) continue;
+    DYNAMIC_SECTION(model << " / " << batch.size() << " structures") {
+      INFO("batch_invariant_gemms() = " << pet::batch_invariant_gemms());
+      std::vector<Device> alone;
+      for (const auto& s : batch) alone.push_back(device_eval(*calc, {s}));
+      const Device whole = device_eval(*calc, batch);
+      const int lead = static_cast<int>(batch.size()) / 3;
+      const Device front = device_eval(*calc, batch, lead);
+      const std::vector<pet::System> reversed(batch.rbegin(), batch.rend());
+      const Device back = device_eval(*calc, reversed);
+      const int B = static_cast<int>(batch.size());
+      for (int b = 0; b < B; ++b) {
+        require_same_structure(whole, b, alone[b], "whole batch");
+        if (b < lead) require_same_structure(front, b, alone[b], "leading part");
+        require_same_structure(back, B - 1 - b, alone[b], "reversed");
+      }
+    }
+  }
+}
+
+TEST_CASE("the GEMM's tile does not change the answer", "[model][determinism]") {
+  // The batch invariance above rests on this: every CUTLASS tile runs the same
+  // per-element FMA chain, so the tile -- chosen by the GEMM's size -- is free.
+  if (!pet::batch_invariant_gemms()) {
+    WARN("this build's GEMMs are not batch-invariant; skipping the tile check");
+    return;
+  }
+  struct Unpin {
+    ~Unpin() { pet::detail::set_cutlass_tile(-1); }
+  } unpin;
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    // No graphs: a replayed graph would run the tile it was recorded with.
+    pet::Options opts;
+    opts.graphs = false;
+    const pet::Calculator calc(found->first, found->second, opts);
+    const std::vector<pet::System> batch = rattled_batch(model);
+    if (batch.empty()) continue;
+    DYNAMIC_SECTION(model) {
+      pet::detail::set_cutlass_tile(-1);
+      const Device chosen = device_eval(calc, batch);
+      for (int tile : {0, 1, 2}) {
+        INFO("tile " << tile);
+        pet::detail::set_cutlass_tile(tile);
+        const Device pinned = device_eval(calc, batch);
+        for (std::size_t b = 0; b < batch.size(); ++b) {
+          REQUIRE(pinned.energy[b] == chosen.energy[b]);
+          REQUIRE(pinned.forces[b] == chosen.forces[b]);
+          REQUIRE(pinned.virial[b] == chosen.virial[b]);
+        }
       }
     }
   }

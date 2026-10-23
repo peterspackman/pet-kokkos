@@ -254,6 +254,17 @@ inline bool lt_gemm_bias(bool, bool, int, int, int, double, const double*, int, 
 }
 #endif
 
+// Whether every weight GEMM gives a row the same bits however many rows the GEMM
+// has, so that a structure's answer does not depend on the batch it is in: the
+// native mode on CUTLASS (CUDA, fused_gemm.cpp), or the naive loop. cuBLAS,
+// rocBLAS and a CBLAS pick their kernels, and split k, by the shape.
+bool batch_invariant_gemms();
+namespace detail {
+// For tests: pin the CUTLASS tile (0 large, 1 mid, 2 small), or -1 to choose
+// it by size as usual. PET_CUTLASS_TILE=large|mid|small does the same.
+void set_cutlass_tile(int tile);
+}  // namespace detail
+
 // The FP8, BF16 and FP16 modes (gemm_lowp.cpp): C = alpha op(A) op(W) + beta C
 // (+ bias), W a weight, which it converts on first use and keeps. False when it
 // cannot -- another mode, not CUDA, an fp64 network, too old a device, or a
