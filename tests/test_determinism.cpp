@@ -402,3 +402,44 @@ TEST_CASE("the GEMM's tile does not change the answer", "[model][determinism]") 
     }
   }
 }
+
+TEST_CASE("the TF32 mode's tensor-core tile does not change the answer", "[model][determinism]") {
+  // The TF32 mode times its tiles per shape and keeps the fastest, which is only
+  // sound if every tile gives the same bits: all share CUTLASS's multistage main
+  // loop, which sums k in one order whatever the tile.
+  const int tiles = pet::detail::tf32_tile_count();
+  if (tiles == 0) {
+    WARN("the TF32 mode does not run on CUTLASS tensor cores here; skipping");
+    return;
+  }
+  struct Restore {
+    ~Restore() {
+      pet::detail::set_tf32_tile(-1);
+      pet::gemm_mode() = pet::GemmMode::Native;
+    }
+  } restore;
+  pet::gemm_mode() = pet::GemmMode::TF32;
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    pet::Options opts;
+    opts.graphs = false;
+    const pet::Calculator calc(found->first, found->second, opts);
+    const std::vector<pet::System> batch = rattled_batch(model);
+    if (batch.empty()) continue;
+    DYNAMIC_SECTION(model) {
+      pet::detail::set_tf32_tile(-1);
+      const Device chosen = device_eval(calc, batch);
+      for (int tile = 0; tile < tiles; ++tile) {
+        INFO("tile " << tile);
+        pet::detail::set_tf32_tile(tile);
+        const Device pinned = device_eval(calc, batch);
+        for (std::size_t b = 0; b < batch.size(); ++b) {
+          REQUIRE(pinned.energy[b] == chosen.energy[b]);
+          REQUIRE(pinned.forces[b] == chosen.forces[b]);
+          REQUIRE(pinned.virial[b] == chosen.virial[b]);
+        }
+      }
+    }
+  }
+}

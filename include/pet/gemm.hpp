@@ -263,6 +263,11 @@ namespace detail {
 // For tests: pin the CUTLASS tile (0 large, 1 mid, 2 small), or -1 to choose
 // it by size as usual. PET_CUTLASS_TILE=large|mid|small does the same.
 void set_cutlass_tile(int tile);
+// For tests: how many CUTLASS tensor-core tiles the TF32 mode chooses among --
+// 0 where it runs on cuBLAS (no CUTLASS, not Ampere or Ada) -- and pinning one
+// (-1: the fastest, timed per shape).
+int tf32_tile_count();
+void set_tf32_tile(int tile);
 }  // namespace detail
 
 // The FP8, BF16 and FP16 modes (gemm_lowp.cpp): C = alpha op(A) op(W) + beta C

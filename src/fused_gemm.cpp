@@ -66,7 +66,9 @@ struct TcTiles {
   static constexpr int kStages = S;
 };
 using Tc64x64 = TcTiles<64, 64, 32, 32, 32, 4>;
-using Tc64x128 = TcTiles<64, 128, 16, 32, 64, 4>;
+using Tc64x64s = TcTiles<64, 64, 16, 32, 32, 3>;  // the s tiles: small shared memory, more CTAs per SM
+using Tc64x128s = TcTiles<64, 128, 16, 32, 64, 3>;
+using Tc128x64s = TcTiles<128, 64, 16, 64, 32, 3>;
 using Tc128x128 = TcTiles<128, 128, 16, 64, 64, 3>;
 using Tc128x128w8 = TcTiles<128, 128, 32, 32, 64, 3>;
 using Tc128x256 = TcTiles<128, 256, 16, 64, 64, 3>;
@@ -198,15 +200,23 @@ int& forced_tile() {
 
 // Tensor cores for the TF32 mode on Ampere and Ada. Hopper and later have
 // faster instructions (wgmma) than this main loop's, which cuBLAS uses there.
-bool tensor() {
-  static const bool sm8x = [] {
+bool sm8x() {
+  static const bool yes = [] {
     int dev = 0, major = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
     return major == 8;
   }();
-  return sm8x && gemm_mode() == GemmMode::TF32;
+  return yes;
 }
+bool tensor() { return sm8x() && gemm_mode() == GemmMode::TF32; }
+
+int& pinned_tf32_tile() {
+  static int t = -1;
+  return t;
+}
+
+constexpr int kTf32Tiles = 8;
 
 // The tensor-core tile for a GEMM: the fastest of the candidates, timed once per
 // (kernel, rows to within a factor of two, N, K) and kept. While a CUDA graph is
@@ -217,10 +227,13 @@ template <class LayoutB, class Epi>
 void launch_tc(const char* name, int M, int N, int K, const float* A, const float* B, Epi epi, float* keep,
                std::size_t n) {
   using Fn = void (*)(const char*, int, int, int, const float*, const float*, Epi);
-  static constexpr Fn fns[] = {launch_tile<Tc64x64, LayoutB, Epi>, launch_tile<Tc64x128, LayoutB, Epi>,
-                               launch_tile<Tc128x128, LayoutB, Epi>, launch_tile<Tc128x128w8, LayoutB, Epi>,
-                               launch_tile<Tc128x256, LayoutB, Epi>, launch_tile<Tc256x128, LayoutB, Epi>};
+  static constexpr Fn fns[] = {launch_tile<Tc64x64, LayoutB, Epi>,     launch_tile<Tc64x64s, LayoutB, Epi>,
+                               launch_tile<Tc128x128, LayoutB, Epi>,   launch_tile<Tc64x128s, LayoutB, Epi>,
+                               launch_tile<Tc128x64s, LayoutB, Epi>,   launch_tile<Tc128x128w8, LayoutB, Epi>,
+                               launch_tile<Tc128x256, LayoutB, Epi>,   launch_tile<Tc256x128, LayoutB, Epi>};
   constexpr int kFns = sizeof fns / sizeof fns[0];
+  static_assert(kFns == kTf32Tiles);
+  if (pinned_tf32_tile() >= 0) return fns[pinned_tf32_tile()](name, M, N, K, A, B, epi);
   static std::map<std::tuple<int, int, int>, int> best;
   const cudaStream_t st = ExecSpace().cuda_stream();
   const std::tuple<int, int, int> key{32 - __builtin_clz(unsigned(M)), N, K};
@@ -444,6 +457,8 @@ struct Plain {
 
 bool batch_invariant_gemms() { return enabled() && gemm_mode() == GemmMode::Native; }
 void detail::set_cutlass_tile(int tile) { forced_tile() = tile; }
+int detail::tf32_tile_count() { return enabled() && sm8x() ? kTf32Tiles : 0; }
+void detail::set_tf32_tile(int tile) { pinned_tf32_tile() = tile; }
 
 bool linear_fused(View2D out, View2D in, const View2D& w, bool w_transposed, View1D b, Net beta) {
   if (!usable(in, w) || !out.span_is_contiguous()) return false;
@@ -495,6 +510,8 @@ bool batch_invariant_gemms() {
 #endif
 }
 void detail::set_cutlass_tile(int) {}
+int detail::tf32_tile_count() { return 0; }
+void detail::set_tf32_tile(int) {}
 
 bool linear_fused(View2D, View2D, const View2D&, bool, View1D, Net) { return false; }
 bool silu_in_fused(View2D, View2D, View2D, const View2D&, View1D) { return false; }
