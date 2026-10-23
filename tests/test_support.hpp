@@ -44,6 +44,12 @@ inline std::vector<std::string> env_list(const char* name) {
   return out;
 }
 
+// PET_TEST_QUICK=1: skip the tests marked as slow on a host backend (CI).
+inline bool quick() {
+  const char* e = std::getenv("PET_TEST_QUICK");
+  return e && e[0] == '1';
+}
+
 // Resolve a named model, or nullopt when it is not installed on this machine.
 inline std::optional<std::pair<std::string, std::string>> find_model(const std::string& name) {
   try {

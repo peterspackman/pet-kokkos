@@ -343,6 +343,8 @@ TEST_CASE("a structure's answer does not depend on the batch it is in", "[model]
   // optimiser turns last-bit differences into different minima. Alone, in the
   // whole batch, in a leading part of it and with the batch reversed, each
   // structure must get the same answer: to the bit where batch_invariant_gemms.
+  // Several minutes on a CI runner's host backend: PET_TEST_QUICK=1 skips it.
+  if (quick()) SKIP("PET_TEST_QUICK is set");
   for (const auto& model : golden_models()) {
     const pet::Calculator* calc = shared_calculator(model);
     if (!calc) continue;
