@@ -45,11 +45,11 @@ namespace pet {
 // need an fp32 network; TF32 and FP8 need CUDA (compute capability 8.0 and
 // 8.9); BF16 and FP16 run on CUDA (8.0, 7.0) or on AMD's matrix cores (rocBLAS).
 // A GEMM the narrow path does not take (a shape cuBLASLt refuses) runs fp32.
-// Process-global, from PET_GEMM=native|tf32|bf16|fp16|fp8|ozaki; unset, TF32
-// on an NVIDIA GPU with TF32 tensor cores (compute capability 8.0 and later),
-// Native elsewhere. TF32's error -- 0.1-0.25 meV/atom on pet-mad and pet-mols,
-// NVE energy drift unchanged -- is far below the models' own, and on an H200 it
-// halves an evaluation, the plain fp32 GEMMs leaving the tensor cores idle.
+// Process-global, from PET_GEMM=native|tf32|bf16|fp16|fp8|ozaki; unset,
+// Native. TF32's error -- 0.1-0.4 meV/atom on pet-mad and pet-mols, NVE energy
+// drift unchanged -- is far below the models' own, and on an H200 it more than
+// halves an evaluation, the plain fp32 GEMMs leaving the tensor cores idle; but
+// it is asked for, never assumed (README, "Faster modes").
 enum class GemmMode { Native, TF32, BF16, FP16, FP8, Ozaki };
 
 inline GemmMode parse_gemm_mode(const char* s) {
@@ -59,28 +59,18 @@ inline GemmMode parse_gemm_mode(const char* s) {
   throw std::runtime_error(std::string("pet: unknown PET_GEMM mode '") + s + "'");
 }
 
-inline GemmMode default_gemm_mode() {
-#if defined(KOKKOS_ENABLE_CUDA) && !defined(PET_KOKKOS_FP64)
-  int dev = 0, major = 0;
-  if (cudaGetDevice(&dev) == cudaSuccess &&
-      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= 8)
-    return GemmMode::TF32;
-#endif
-  return GemmMode::Native;
-}
-
 inline GemmMode& gemm_mode() {
   static GemmMode m = [] {
     const char* e = std::getenv("PET_GEMM");
-    return e && *e ? parse_gemm_mode(e) : default_gemm_mode();
+    return e && *e ? parse_gemm_mode(e) : GemmMode::Native;
   }();
   return m;
 }
 
 // How attention's own products (scores, weights times values, and their
 // adjoints) run: Native fp32, or TF32 on tensor cores (CUDA, compute capability
-// 8.0 and later; elsewhere Native). Separate from the GEMM mode, and off unless
-// asked for, so each can be measured on its own. Process-global, from
+// 8.0 and later; elsewhere Native). Separate from the GEMM mode, and like it off
+// unless asked for, so each can be measured on its own. Process-global, from
 // PET_ATTN=native|tf32.
 enum class AttentionMode { Native, TF32 };
 

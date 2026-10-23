@@ -10,8 +10,8 @@
 int main(int argc, char** argv) {
   Kokkos::initialize(argc, argv);
   // The tests check the implementation against fp32 references, so they run the
-  // GEMMs in fp32 whatever the device's default (TF32 from compute capability
-  // 8.0); test_gemm_modes measures the other modes. PET_GEMM still overrides.
+  // GEMMs in fp32 (the default anyway); test_gemm_modes measures the other
+  // modes. PET_GEMM still overrides.
   if (!std::getenv("PET_GEMM")) pet::gemm_mode() = pet::GemmMode::Native;
   int rc = 0;
   {

@@ -76,7 +76,7 @@ void kokkos_release() {
 struct PetOptions {
   pet::Options calc;
   // The GEMM mode, when given. pet::Options::gemm = Native means "the default"
-  // (TF32 on recent NVIDIA GPUs), so an explicit "native" is set directly.
+  // (PET_GEMM, else fp32), so an explicit "native" is set directly, over PET_GEMM.
   // Process-global, as in pet-kokkos: the last model loaded sets it.
   std::optional<pet::GemmMode> gemm;
   std::optional<pet::AttentionMode> attention;  // the same, for attention's products

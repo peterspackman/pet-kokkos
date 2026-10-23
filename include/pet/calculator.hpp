@@ -39,7 +39,7 @@ struct Options {
 
   // How the network's GEMMs run: Native, or a faster, less exact mode on tensor
   // cores (TF32, BF16, FP16, FP8; see gemm.hpp). Native leaves the default:
-  // PET_GEMM, else TF32 on NVIDIA from compute capability 8.0, else native fp32.
+  // PET_GEMM, else native fp32.
   // Process-global.
   GemmMode gemm = GemmMode::Native;
 

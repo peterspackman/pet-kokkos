@@ -44,8 +44,9 @@ in [`metatomic/`](#metatomic-plugin).
 
 ## Performance
 
-One evaluation with forces, neighbour list included. On an RTX 4080 SUPER, with
-the speed-up over upet 0.3.0 (PyTorch) in brackets:
+One evaluation with forces, neighbour list included, in fp32 (the default; see
+[Faster modes](#faster-modes) for what tensor cores add). On an RTX 4080 SUPER,
+with the speed-up over upet 0.3.0 (PyTorch) in brackets:
 
 | model | 64-atom diamond | 648-atom water | 1728-atom diamond |
 |---|---|---|---|
@@ -200,32 +201,70 @@ then `./models`, `.`, `$XDG_DATA_HOME/pet/models` (or
   fp64, `PET_GEMM=ozaki` computes the matrix products to fp64 accuracy using
   integer tensor cores (the Ozaki scheme).
 
-The network's matrix products can also run in lower precision on tensor cores,
-set with `PET_GEMM` (`tf32`, `fp16`, `bf16` or `fp8`) or `Options::gemm`. On
-NVIDIA GPUs from compute capability 8.0 `tf32` is the default: 10-20% faster on
-an RTX 4080 and up to 2x on an H200, 0.1-0.25 meV/atom from fp32 and the same
-NVE energy drift; `PET_GEMM=native` turns it off. `fp16` is about as accurate;
-`bf16` is not (about 1 meV/atom, 4x the drift). `fp8` needs an Ada or Hopper GPU
-and is only good enough for screening. On AMD GPUs, only `bf16` and `fp16` are
-supported, and their fp32 already runs on the matrix cores.
-
 The virial is `W = V·σ`, a symmetric tensor in Voigt order
 `[xx, yy, zz, xy, xz, yz]`. Optimizers that work with strain gradients need
 `dE/dε`, whose off-diagonal terms are `2·W_xy`.
 
+### Faster modes
+
+Everything runs in fp32 unless you ask otherwise: the answers are the
+reference's, to fp32 rounding, on every device. Two independent switches trade
+a little accuracy for speed on tensor cores. Each is process-wide and can be
+set by environment variable, by `pet::Options`, or as a metatomic option:
+
+| switch | what it changes | where it runs | env / `Options` / metatomic |
+|---|---|---|---|
+| GEMM mode | the dense layers' matrix products | see below | `PET_GEMM` / `gemm` / `gemm` |
+| attention mode | attention's own products (scores, weights times values, their adjoints) | NVIDIA, compute capability 8.0+ | `PET_ATTN` / `attention` / `attention` |
+
+**For MD or relaxations on a recent NVIDIA GPU** (A100, H100/H200, RTX 30xx/40xx),
+`PET_GEMM=tf32 PET_ATTN=tf32` is the one to use. Measured against fp32, on
+pet-mad-xs, pet-mad-s, pbe0-pet (pet-mols-s) and pet-omat-l, 648-atom water and
+1728-atom diamond:
+
+| | energy | largest force error |
+|---|---|---|
+| `PET_GEMM=tf32` | 0.08-0.37 meV/atom | 1.7-5 meV/Å |
+| `PET_ATTN=tf32` | 0.01-0.13 meV/atom | 0.7-6 meV/Å |
+| both | 0.02-0.31 meV/atom | 1.4-8 meV/Å |
+
+all far below the models' own errors. With `PET_GEMM=tf32` the NVE energy drift
+is the same as fp32's; it has not yet been measured with `PET_ATTN=tf32`.
+
+What they buy, ms per evaluation with forces:
+
+| | fp32 | `PET_GEMM=tf32` | + `PET_ATTN=tf32` |
+|---|---|---|---|
+| H200, pet-mad-s, 5184-atom water | 92.0 | 37.6 | 33.2 |
+| H200, pet-mols-s, 5184-atom water | 98.5 | 51.0 | 39.0 |
+| H200, pet-omat-l, 2592-atom water | 439 | 138 | 116 |
+| RTX 4080 SUPER, pet-mad-s, 648-atom water | 24.5 | 17.3 | 16.7 |
+| RTX 4080 SUPER, pbe0-pet, 1728-atom diamond | 98.9 | 85.6 | 71.9 |
+
+An H200's fp32 runs on its CUDA cores, several times slower than its TF32
+tensor cores, so it gains the most; an RTX 4080's TF32 and fp32 peaks are about
+equal, and what it gains is from better-used kernels.
+
+The other GEMM modes:
+
+- `fp16`: about as accurate as `tf32`; NVIDIA from compute capability 7.0, and
+  AMD's matrix cores (on an MI250X, about 10% faster than fp32).
+- `bf16`: less accurate (about 1 meV/atom, 4x the NVE drift); NVIDIA 8.0+ and
+  AMD. Not faster than `tf32` on NVIDIA.
+- `fp8`: Ada or Hopper only, good enough for screening and nothing more.
+- `ozaki`: for the fp64 build, fp64-accurate products on integer tensor cores.
+
+On AMD GPUs fp32 already runs on the matrix cores, so there is no `tf32`, and
+attention already uses them in fp32. A mode the device cannot run falls back
+to fp32.
+
 ## Environment variables
 
 - `PET_MODEL_DIR`: extra directories to search for models.
-- `PET_GEMM`: `native`, `tf32`, `fp16`, `bf16`, `fp8` or `ozaki`. Unset, NVIDIA
-  GPUs from compute capability 8.0 (A100, H100/H200, RTX 30xx/40xx) use `tf32`
-  (0.1-0.25 meV/atom from fp32, up to 2x faster) and everything else `native`;
-  `PET_GEMM=native` keeps plain fp32 everywhere.
-- `PET_ATTN`: `native` (default) or `tf32`. With `tf32`, attention's own
-  products (scores, weights times values, and their adjoints) run on TF32
-  tensor cores, on NVIDIA GPUs from compute capability 8.0 (elsewhere it is
-  ignored). Separate from `PET_GEMM`, so the two can be measured apart: on its
-  own 0.01-0.13 meV/atom and 1-6 meV/A from fp32 on the published models.
-  Also `Options::attention`, and the metatomic option `attention`.
+- `PET_GEMM`: `native` (default, fp32), `tf32`, `fp16`, `bf16`, `fp8` or
+  `ozaki`; see [Faster modes](#faster-modes).
+- `PET_ATTN`: `native` (default, fp32) or `tf32`; see
+  [Faster modes](#faster-modes).
 - `PET_CUTLASS=0`: use plain cuBLAS instead of the CUTLASS kernels.
 - `PET_GRAPHS=0`: don't use CUDA/HIP graphs (useful when profiling).
 - `PET_RECOMPUTE`: `never`, `wide` or `layers` forces how much of the forward

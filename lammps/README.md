@@ -98,6 +98,12 @@ supported; the global virial is PET's symmetric one (PET is not exactly
 rotation invariant, so LAMMPS's f.r would keep one side of an antisymmetric
 part). Runtime switches: `PET_CUTLASS=0`, `PET_GRAPHS=0`.
 
+The network runs in fp32 unless asked otherwise. On a recent NVIDIA GPU
+(A100, H100/H200, RTX 30xx/40xx), `PET_GEMM=tf32 PET_ATTN=tf32` in the job's
+environment runs it on tensor cores: about 2.8x faster on an H200 for
+pet-mad-s, within 0.4 meV/atom and 8 meV/Å of fp32. See "Faster modes" in the
+pet-kokkos README for what each switch does and costs.
+
 ## Check it
 
 `examples/` has structures as LAMMPS data files and as extxyz, and `compare.py`
