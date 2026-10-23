@@ -666,6 +666,114 @@ struct Keys {
   }
 };
 
+// On CUDA, when they fit fast scratch, the backward as small dense products in
+// one team of kPairThreads per (atom, head): its queries, keys, values and
+// output adjoints staged once, and S x S tables of the weights A and of dS, a
+// thread per (query, key) pair; then dQ, dK, dV and the cf shares, a thread per
+// output and four dims, each a sum over the S tokens in order. The rows are
+// staged with a pitch of head_dim + 4, so a pair phase's threads, which read
+// different rows, hit different banks. On an RTX 4080 SUPER, pet-mad-s water
+// 648, 773 -> 485 us per layer against the two passes below, at a quarter
+// occupancy, held there by the scratch.
+constexpr int kPairThreads = 128;
+
+std::size_t shared_per_sm() {
+  int b = 0;
+#if defined(KOKKOS_ENABLE_CUDA)
+  int dev = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&b, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
+#endif
+  return std::size_t(b);
+}
+
+template <int HD>
+struct Pairs {
+  View2D qkv, dmerged, merged, ml, cf_seq, qkv_adj, cfh;
+  int S, H, hd;
+  Net sc;
+  int level = 0;
+  std::size_t bytes = 0;
+
+  static int pitch(int hd) { return hd + 4; }
+  static std::size_t values(int S, int hd) { return 4 * std::size_t(S) * pitch(hd) + 2 * std::size_t(S) * S + 4 * S; }
+
+  KOKKOS_INLINE_FUNCTION void operator()(const Member& m) const {
+    const int n = m.league_rank() / H, h = m.league_rank() % H, nd = HD > 0 ? HD : hd, D = H * hd;
+    const int P = HD > 0 ? HD + 4 : hd + 4;
+    Net* sq_ = scratch(m, level, bytes);
+    Net* sk = sq_ + S * P;
+    Net* sv = sk + S * P;
+    Net* sg = sv + S * P;
+    Net* sa = sg + S * P;  // A[q][k]
+    Net* sds = sa + S * S;  // dS[q][k], before the scale
+    Net* slc = sds + S * S;
+    Net* sm = slc + S;
+    Net* sl = sm + S;
+    Net* sd = sl + S;
+    const int row0 = n * S;
+    // The four rows' slices together, so a thread has all its loads in flight.
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S * (nd / 4)), [&](int t) {
+      const int r = t / (nd / 4), c = (t % (nd / 4)) * 4, o = r * P + c;
+      const Net4 q = ld4(&qkv(row0 + r, h * hd + c)), k = ld4(&qkv(row0 + r, D + h * hd + c));
+      const Net4 v = ld4(&qkv(row0 + r, 2 * D + h * hd + c)), g = ld4(&dmerged(row0 + r, h * hd + c));
+      *reinterpret_cast<Net4*>(sq_ + o) = q, *reinterpret_cast<Net4*>(sk + o) = k;
+      *reinterpret_cast<Net4*>(sv + o) = v, *reinterpret_cast<Net4*>(sg + o) = g;
+    });
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S), [&](int r) {
+      const int si = (n * H + h) * S + r;
+      const Net cf = cf_seq(n, r);
+      slc[r] = cf > Net(0) ? fast_log(cf) : kOff;
+      sm[r] = ml(si, 0), sl[r] = ml(si, 1);
+      Net dq = Net(0);  // Dq = dO.out, from global memory
+      for (int d = 0; d < nd; d += 4) {
+        const Net4 g = ld4(&dmerged(row0 + r, h * hd + d)), o = ld4(&merged(row0 + r, h * hd + d));
+        dq += g.v[0] * o.v[0] + g.v[1] * o.v[1] + g.v[2] * o.v[2] + g.v[3] * o.v[3];
+      }
+      sd[r] = dq;
+    });
+    m.team_barrier();
+    // A and dS per pair; zero for a padding query or key.
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S * S), [&](int t) {
+      const int q = t / S, k = t % S;
+      const Net invl = sl[q], lc = slc[k];
+      Net a = Net(0), ds = Net(0);
+      if (invl > Net(0) && !off(lc)) {
+        Net s = Net(0), dp = Net(0);
+        for (int d = 0; d < nd; d += 4) {
+          const Net4 x = ld4(sq_ + q * P + d), y = ld4(sk + k * P + d), g = ld4(sg + q * P + d), v = ld4(sv + k * P + d);
+          for (int j = 0; j < 4; ++j) s += x.v[j] * y.v[j], dp += g.v[j] * v.v[j];
+        }
+        a = fast_exp(s * sc + lc - sm[q]) * invl;
+        ds = a * (dp - sd[q]);
+      }
+      sa[t] = a, sds[t] = ds;
+    });
+    m.team_barrier();
+    // dQ = sc dS K, dK = sc dS^T Q, dV = A^T dO: a thread per (token, four dims).
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(m, 3 * S * (nd / 4)), [&](int t) {
+      const int which = t / (S * (nd / 4)), r = (t / (nd / 4)) % S, d = (t % (nd / 4)) * 4;
+      // Row r of dS (which 0), or column r of dS or A, against the rows of K, Q or dO.
+      const Net* w = which == 0 ? sds + r * S : which == 1 ? sds + r : sa + r;
+      const int ws = which == 0 ? 1 : S;
+      const Net* x = (which == 0 ? sk : which == 1 ? sq_ : sg) + d;
+      Net acc[4] = {Net(0), Net(0), Net(0), Net(0)};
+      for (int j = 0; j < S; ++j) {
+        const Net c = w[j * ws];
+        const Net4 y = ld4(x + j * P);
+        for (int i = 0; i < 4; ++i) acc[i] += c * y.v[i];
+      }
+      const Net f = which == 2 ? Net(1) : sc;
+      *reinterpret_cast<Net4*>(&qkv_adj(row0 + r, which * D + h * hd + d)) = {{acc[0] * f, acc[1] * f, acc[2] * f, acc[3] * f}};
+    });
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S), [&](int k) {
+      Net acc = Net(0);
+      for (int q = 0; q < S; ++q) acc += sds[q * S + k];
+      cfh(row0 + k, h) = acc;
+    });
+  }
+};
+
 template <int HD>
 void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, View2D cf_seq_adj,
                         View2D out_adj, View2D qkv, View2D cf_seq, const WeightRef& w_in,
@@ -708,6 +816,21 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
       return;
     }
 #endif
+  if constexpr (kStaged) {
+    // Where two teams fit an SM's shared memory (with the driver's 1 KiB each),
+    // or head_dim is 48 or more, where the two passes' per-thread arrays spill.
+    // With one team per SM and a small head the two passes are faster: pbe0-pet
+    // (S = 51, head_dim 32) 1.11 against 1.42 ms per layer; but pet-omat-l
+    // (S = 49, head_dim 64) 4.9 against 2.3 for the pairs.
+    static const std::size_t sm_bytes = shared_per_sm();
+    const std::size_t pb = sizeof(Net) * Pairs<HD>::values(S, hd) + 16;
+    if (hd % 4 == 0 && pb <= std::size_t(AttnPolicy::scratch_size_max(0)) && (2 * (pb + 1024) <= sm_bytes || hd >= 48)) {
+      Kokkos::parallel_for("attn_bwd", AttnPolicy(N * H, kPairThreads).set_scratch_size(0, Kokkos::PerTeam(pb)),
+                           Pairs<HD>{qkv, dmerged, merged, ml, cf_seq, qkv_adj, cfh, S, H, hd, sc, 0, pb});
+      cf_and_input_adjoint();
+      return;
+    }
+  }
   launch("attn_bwd_queries", Queries<HD>{qkv, dmerged, merged, ml, dq_out, cf_seq, qkv_adj, S, H, hd, sc}, N, H, S,
          2 * std::size_t(S) * hd + S);
 
