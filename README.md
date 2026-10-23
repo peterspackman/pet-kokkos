@@ -125,6 +125,7 @@ model = mta.load_model("pet-mad-xs", {"gemm": "native"}, plugin_name="pet-kokkos
 
 `load_model` takes a model name or path prefix, found as `pet::Calculator`
 finds it. The options, all strings, are `gemm` (as `PET_GEMM`; process-wide),
+`attention` (as `PET_ATTN`; process-wide),
 `recompute` (`auto`, `never`, `wide` or `layers`), `memory_budget_gib`, and
 `device_id` (by default each node-local MPI rank takes its own GPU).
 
@@ -219,6 +220,12 @@ The virial is `W = V·σ`, a symmetric tensor in Voigt order
   GPUs from compute capability 8.0 (A100, H100/H200, RTX 30xx/40xx) use `tf32`
   (0.1-0.25 meV/atom from fp32, up to 2x faster) and everything else `native`;
   `PET_GEMM=native` keeps plain fp32 everywhere.
+- `PET_ATTN`: `native` (default) or `tf32`. With `tf32`, attention's own
+  products (scores, weights times values, and their adjoints) run on TF32
+  tensor cores, on NVIDIA GPUs from compute capability 8.0 (elsewhere it is
+  ignored). Separate from `PET_GEMM`, so the two can be measured apart: on its
+  own 0.01-0.13 meV/atom and 1-6 meV/A from fp32 on the published models.
+  Also `Options::attention`, and the metatomic option `attention`.
 - `PET_CUTLASS=0`: use plain cuBLAS instead of the CUTLASS kernels.
 - `PET_GRAPHS=0`: don't use CUDA/HIP graphs (useful when profiling).
 - `PET_RECOMPUTE`: `never`, `wide` or `layers` forces how much of the forward

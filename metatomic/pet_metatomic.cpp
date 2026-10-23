@@ -79,6 +79,7 @@ struct PetOptions {
   // (TF32 on recent NVIDIA GPUs), so an explicit "native" is set directly.
   // Process-global, as in pet-kokkos: the last model loaded sets it.
   std::optional<pet::GemmMode> gemm;
+  std::optional<pet::AttentionMode> attention;  // the same, for attention's products
   int device_id = -1;  // -1: by node-local MPI rank
 };
 
@@ -100,6 +101,10 @@ PetOptions parse_options(const std::map<std::string, std::string>& options) {
   for (const auto& [key, value] : options) {
     if (key == "gemm") {
       o.gemm = pet::parse_gemm_mode(value.c_str());
+    } else if (key == "attention") {
+      if (value != "native" && value != "tf32")
+        throw metatomic::Error("pet-kokkos option 'attention' must be native or tf32");
+      o.attention = value == "tf32" ? pet::AttentionMode::TF32 : pet::AttentionMode::Native;
     } else if (key == "recompute") {
       bool found = false;
       for (auto r : {pet::Recompute::Auto, pet::Recompute::Never, pet::Recompute::Wide, pet::Recompute::Layers})
@@ -111,7 +116,7 @@ PetOptions parse_options(const std::map<std::string, std::string>& options) {
       o.device_id = int(parse_number(value, key));
     } else {
       throw metatomic::Error("unknown pet-kokkos option '" + key +
-                             "' (known: gemm, recompute, memory_budget_gib, device_id)");
+                             "' (known: gemm, attention, recompute, memory_budget_gib, device_id)");
     }
   }
   return o;
@@ -364,6 +369,7 @@ class PetModel final : public metatomic::BaseModel {
     kokkos_acquire(options.device_id);
     try {
       if (options.gemm) pet::gemm_mode() = *options.gemm;
+      if (options.attention) pet::attention_mode() = *options.attention;
       calc_ = std::make_unique<pet::Calculator>(json, weights, options.calc);
     } catch (...) {
       kokkos_release();

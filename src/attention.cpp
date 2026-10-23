@@ -15,6 +15,8 @@
 // generic path sized kMaxHeadDim).
 #include "ops.hpp"
 
+#include "pet/gemm.hpp"
+
 #include <algorithm>
 #include <type_traits>
 
@@ -509,6 +511,291 @@ void run(const char* name, F&& f) {
 }  // namespace mfma
 #endif
 
+#if defined(KOKKOS_ENABLE_CUDA) && !defined(PET_KOKKOS_FP64)
+#define PET_TC 1
+// On NVIDIA from compute capability 8.0, with PET_ATTN=tf32 (AttentionMode),
+// the per-(atom, head) products on TF32 tensor cores (mma m16n8k8): a block per
+// (atom, head), a warp per 16 queries (or keys), the shared rows staged once,
+// rounded to TF32. The instruction's lanes, l = (g, t) = (l/4, l%4):
+//   A [16][8]: a0 (g, t), a1 (g+8, t), a2 (g, t+4), a3 (g+8, t+4);
+//   B [8][8]:  b0 (t, g), b1 (t+4, g);
+//   C [16][8]: c0 (g, 2t), c1 (g, 2t+1), c2 (g+8, 2t), c3 (g+8, 2t+1).
+// A product's eight k-slots may take the summed index in any order A and B
+// agree on. Taking slot t as key (or query) 2t and slot t+4 as 2t+1, a score
+// tile's C registers are, as they are, the A operand of the next product
+// (P V, dS K, ...): (c0, c2, c1, c3).
+namespace tc {
+
+__device__ inline float tf32(float x) {
+  std::uint32_t r;
+  asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+  return __uint_as_float(r);
+}
+// c += A B, the operands already TF32.
+__device__ inline void mma(float (&c)[4], float a0, float a1, float a2, float a3, float b0, float b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  asm volatile(
+      "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(__float_as_uint(a0)), "r"(__float_as_uint(a1)), "r"(__float_as_uint(a2)), "r"(__float_as_uint(a3)),
+        "r"(__float_as_uint(b0)), "r"(__float_as_uint(b1)));
+#endif
+}
+__device__ inline float quad_max(float x) {  // over the four lanes with this g
+  x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 1));
+  return fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 2));
+}
+__device__ inline float quad_sum(float x) {
+  x += __shfl_xor_sync(0xffffffffu, x, 1);
+  return x + __shfl_xor_sync(0xffffffffu, x, 2);
+}
+// Rows' pitch in shared memory: head_dim + 4 puts a fragment's eight rows on
+// different banks.
+template <int HD>
+constexpr int pitch = HD + 4;
+// Rows [0, R) of a head's slice at column col of a row-major array into dst,
+// rounded to TF32, rows past S zero.
+template <int HD>
+__device__ void stage(float* dst, const float* src, int ld, int col, int S, int R) {
+  for (int i = threadIdx.x; i < R * (HD / 4); i += blockDim.x) {
+    const int r = i / (HD / 4), c = (i % (HD / 4)) * 4;
+    float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (r < S) x = *reinterpret_cast<const float4*>(src + (size_t) r * ld + col + c);
+    *reinterpret_cast<float4*>(dst + r * pitch<HD> + c) = make_float4(tf32(x.x), tf32(x.y), tf32(x.z), tf32(x.w));
+  }
+}
+__device__ inline float log_cf(const float* cf, int j, int S) {
+  if (j >= S) return -1e30f;
+  const float c = cf[j];
+  return c > 0.0f ? __logf(c) : -1e30f;
+}
+
+// Shared memory, in floats: two head slices of rows (K and V; in the
+// backward's keys pass, Q and dO in their place) and per-token values.
+template <int HD>
+std::size_t forward_floats(int S) { return std::size_t((S + 15) / 16 * 16) * (2 * pitch<HD> + 1); }
+template <int HD>
+std::size_t backward_floats(int S) { return std::size_t((S + 15) / 16 * 16) * (2 * pitch<HD> + 4); }
+
+// The forward, online softmax over blocks of 8 keys. Warp w: queries 16w + g
+// (row 0 of its C tiles) and 16w + g + 8 (row 1).
+template <int HD>
+__global__ void forward(const float* qkv, int ldq, const float* cf_seq, int ldc, float* merged, int ldm, float* ml,
+                        int ldml, int S, int H, float sc) {
+  constexpr int P = pitch<HD>, DK = HD / 8;
+  extern __shared__ float smem[];
+  const int R = (S + 15) / 16 * 16;
+  float *sk = smem, *sv = sk + R * P, *slc = sv + R * P;
+  const int n = blockIdx.x / H, h = blockIdx.x % H, D = H * HD;
+  const float* rows = qkv + (size_t) n * S * ldq;
+  const float* cf = cf_seq + (size_t) n * ldc;
+  stage<HD>(sk, rows, ldq, D + h * HD, S, R);
+  stage<HD>(sv, rows, ldq, 2 * D + h * HD, S, R);
+  for (int r = threadIdx.x; r < R; r += blockDim.x) slc[r] = log_cf(cf, r, S);
+  const int w = threadIdx.x / 32, l = threadIdx.x % 32, g = l / 4, t = l % 4;
+  const int qr[2] = {16 * w + g, 16 * w + g + 8};
+  float qa[DK][4];
+  for (int c = 0; c < DK; ++c)
+    for (int j = 0; j < 4; ++j) {
+      const int q = qr[j % 2], d = 8 * c + t + 4 * (j / 2);
+      qa[c][j] = q < S ? tf32(rows[(size_t) q * ldq + h * HD + d]) : 0.0f;
+    }
+  __syncthreads();
+  float acc[DK][4], mx[2] = {-1e30f, -1e30f}, sum[2] = {0.0f, 0.0f};
+  for (int c = 0; c < DK; ++c)
+    for (int j = 0; j < 4; ++j) acc[c][j] = 0.0f;
+  for (int J = 0; J < R / 8; ++J) {
+    const int k0 = 8 * J + 2 * t;  // this lane's keys: k0 and k0 + 1
+    float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int c = 0; c < DK; ++c)
+      mma(s, qa[c][0], qa[c][1], qa[c][2], qa[c][3], sk[(8 * J + g) * P + 8 * c + t], sk[(8 * J + g) * P + 8 * c + t + 4]);
+    const float lc[2] = {slc[k0], slc[k0 + 1]};
+    float p[4];
+    for (int i = 0; i < 2; ++i) {  // query row i: s[2i], s[2i+1] against k0, k0 + 1
+      float x[2];
+      for (int j = 0; j < 2; ++j) x[j] = lc[j] > -1e29f ? s[2 * i + j] * sc + lc[j] : -1e30f;
+      const float nm = fmaxf(mx[i], quad_max(fmaxf(x[0], x[1])));
+      const float alpha = __expf(mx[i] - nm);
+      for (int j = 0; j < 2; ++j) p[2 * i + j] = lc[j] > -1e29f ? __expf(x[j] - nm) : 0.0f;
+      sum[i] = sum[i] * alpha + p[2 * i] + p[2 * i + 1];
+      mx[i] = nm;
+      for (int c = 0; c < DK; ++c) acc[c][2 * i] *= alpha, acc[c][2 * i + 1] *= alpha;
+    }
+    const float a0 = tf32(p[0]), a1 = tf32(p[2]), a2 = tf32(p[1]), a3 = tf32(p[3]);
+    for (int c = 0; c < DK; ++c)
+      mma(acc[c], a0, a1, a2, a3, sv[k0 * P + 8 * c + g], sv[(k0 + 1) * P + 8 * c + g]);
+  }
+  for (int i = 0; i < 2; ++i) {
+    const int q = qr[i];
+    const float tot = quad_sum(sum[i]);
+    if (q >= S) continue;
+    const bool live = q == 0 || cf[q] > 0.0f;  // else a padding query: zero out
+    const float invl = live && tot > 0.0f ? 1.0f / tot : 0.0f;
+    float* o = merged + (size_t) (n * S + q) * ldm + h * HD;
+    for (int c = 0; c < DK; ++c)  // acc[c][2i + j]: query q, dim 8c + 2t + j
+      *reinterpret_cast<float2*>(o + 8 * c + 2 * t) = make_float2(acc[c][2 * i] * invl, acc[c][2 * i + 1] * invl);
+    if (ml && t == 0) {
+      float* m = ml + (size_t) ((n * H + h) * S + q) * ldml;
+      m[0] = live ? mx[i] : -1e30f, m[1] = invl;
+    }
+  }
+}
+
+// The backward, with A recomputed from the saved max and 1/sum, dP = dO V^T,
+// dS = A (dP - Dq) and Dq = dO . O:
+//   queries (warp w: queries 16w + g, + 8; keys in blocks of 8): dQ = sc dS K;
+//   keys (warp w: keys 16w + g, + 8; queries in blocks of 8): dK = sc dS^T Q,
+//     dV = A^T dO, and each key's dS summed over queries (its cf share).
+// Each pass reads two slices from shared memory and the other two only as its
+// warp's own fragments, so one buffer holds K and V, then Q and dO: two blocks
+// fit an SM where four slices would leave one.
+template <int HD>
+__global__ void backward(const float* qkv, int ldq, const float* dmerged, const float* merged, int ldm, const float* ml,
+                         int ldml, const float* cf_seq, int ldc, float* qkv_adj, int lda, float* cfh, int S, int H,
+                         float sc) {
+  constexpr int P = pitch<HD>, DK = HD / 8;
+  extern __shared__ float smem[];
+  const int R = (S + 15) / 16 * 16;
+  float *sk = smem, *sv = sk + R * P, *sq = sk, *sg = sv;  // K, V, then Q, dO
+  float *sm = sv + R * P, *sl = sm + R, *sd = sl + R, *slc = sd + R;
+  const int n = blockIdx.x / H, h = blockIdx.x % H, D = H * HD;
+  const float* rows = qkv + (size_t) n * S * ldq;
+  const float* go = dmerged + (size_t) n * S * ldm;
+  const float* cf = cf_seq + (size_t) n * ldc;
+  stage<HD>(sk, rows, ldq, D + h * HD, S, R);
+  stage<HD>(sv, rows, ldq, 2 * D + h * HD, S, R);
+  for (int r = threadIdx.x; r < R; r += blockDim.x) {
+    float dq = 0.0f, m = -1e30f, li = 0.0f;
+    if (r < S) {  // Dq in fp32, from the unrounded rows
+      const float *a = go + (size_t) r * ldm + h * HD, *b = merged + (size_t) (n * S + r) * ldm + h * HD;
+      for (int d = 0; d < HD; d += 4) {
+        const float4 x = *reinterpret_cast<const float4*>(a + d), y = *reinterpret_cast<const float4*>(b + d);
+        dq += x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w;
+      }
+      const float* mm = ml + (size_t) ((n * H + h) * S + r) * ldml;
+      m = mm[0], li = mm[1];
+    }
+    sd[r] = dq, sm[r] = m, sl[r] = li, slc[r] = log_cf(cf, r, S);
+  }
+  __syncthreads();
+  const int w = threadIdx.x / 32, l = threadIdx.x % 32, g = l / 4, t = l % 4;
+  const int r0 = 16 * w + g, rr[2] = {r0, r0 + 8};
+  // A fragments of rows r0, r0 + 8: of a staged slice, or from global memory.
+  auto frags = [&](const float* x, float (&f)[DK][4]) {
+    for (int c = 0; c < DK; ++c)
+      for (int j = 0; j < 4; ++j) f[c][j] = x[rr[j % 2] * P + 8 * c + t + 4 * (j / 2)];
+  };
+  auto global_frags = [&](const float* x, int ld, float (&f)[DK][4]) {
+    for (int c = 0; c < DK; ++c)
+      for (int j = 0; j < 4; ++j) {
+        const int r = rr[j % 2];
+        f[c][j] = r < S ? tf32(x[(size_t) r * ld + 8 * c + t + 4 * (j / 2)]) : 0.0f;
+      }
+  };
+  float ka[DK][4], va[DK][4];  // the keys pass's own rows, taken before Q and dO replace them
+
+  {  // Queries.
+    float qa[DK][4], ga[DK][4], dq[DK][4];
+    global_frags(rows + h * HD, ldq, qa), global_frags(go + h * HD, ldm, ga);
+    for (int c = 0; c < DK; ++c)
+      for (int j = 0; j < 4; ++j) dq[c][j] = 0.0f;
+    const float mi[2] = {sm[rr[0]], sm[rr[1]]}, li[2] = {sl[rr[0]], sl[rr[1]]}, di[2] = {sd[rr[0]], sd[rr[1]]};
+    for (int J = 0; J < R / 8; ++J) {
+      const int k0 = 8 * J + 2 * t, kb = 8 * J + g;
+      float s[4] = {0.0f, 0.0f, 0.0f, 0.0f}, dp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      for (int c = 0; c < DK; ++c) {
+        mma(s, qa[c][0], qa[c][1], qa[c][2], qa[c][3], sk[kb * P + 8 * c + t], sk[kb * P + 8 * c + t + 4]);
+        mma(dp, ga[c][0], ga[c][1], ga[c][2], ga[c][3], sv[kb * P + 8 * c + t], sv[kb * P + 8 * c + t + 4]);
+      }
+      float ds[4];
+      for (int e = 0; e < 4; ++e) {  // query rr[e / 2], key k0 + e % 2
+        const int i = e / 2;
+        const float lc = slc[k0 + e % 2];
+        const float a = li[i] > 0.0f && lc > -1e29f ? __expf(s[e] * sc + lc - mi[i]) * li[i] : 0.0f;
+        ds[e] = tf32(a * (dp[e] - di[i]));
+      }
+      for (int c = 0; c < DK; ++c)
+        mma(dq[c], ds[0], ds[2], ds[1], ds[3], sk[k0 * P + 8 * c + g], sk[(k0 + 1) * P + 8 * c + g]);
+    }
+    for (int i = 0; i < 2; ++i) {
+      if (rr[i] >= S) continue;
+      float* o = qkv_adj + (size_t) (n * S + rr[i]) * lda + h * HD;
+      for (int c = 0; c < DK; ++c)
+        *reinterpret_cast<float2*>(o + 8 * c + 2 * t) = make_float2(dq[c][2 * i] * sc, dq[c][2 * i + 1] * sc);
+    }
+  }
+  frags(sk, ka), frags(sv, va);
+  __syncthreads();
+  stage<HD>(sq, rows, ldq, h * HD, S, R);
+  stage<HD>(sg, go, ldm, h * HD, S, R);
+  __syncthreads();
+
+  {  // Keys.
+    float dk[DK][4], dv[DK][4];
+    for (int c = 0; c < DK; ++c)
+      for (int j = 0; j < 4; ++j) dk[c][j] = dv[c][j] = 0.0f;
+    const float lc[2] = {slc[rr[0]], slc[rr[1]]};
+    float cfa[2] = {0.0f, 0.0f};
+    for (int I = 0; I < R / 8; ++I) {
+      const int q0 = 8 * I + 2 * t, qb = 8 * I + g;
+      float s[4] = {0.0f, 0.0f, 0.0f, 0.0f}, dp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      for (int c = 0; c < DK; ++c) {
+        mma(s, ka[c][0], ka[c][1], ka[c][2], ka[c][3], sq[qb * P + 8 * c + t], sq[qb * P + 8 * c + t + 4]);
+        mma(dp, va[c][0], va[c][1], va[c][2], va[c][3], sg[qb * P + 8 * c + t], sg[qb * P + 8 * c + t + 4]);
+      }
+      float a[4], ds[4];
+      for (int e = 0; e < 4; ++e) {  // key rr[e / 2], query q0 + e % 2
+        const int i = e / 2, q = q0 + e % 2;
+        a[e] = sl[q] > 0.0f && lc[i] > -1e29f ? __expf(s[e] * sc + lc[i] - sm[q]) * sl[q] : 0.0f;
+        ds[e] = a[e] * (dp[e] - sd[q]);
+        cfa[i] += ds[e];
+        a[e] = tf32(a[e]), ds[e] = tf32(ds[e]);
+      }
+      for (int c = 0; c < DK; ++c) {
+        mma(dk[c], ds[0], ds[2], ds[1], ds[3], sq[q0 * P + 8 * c + g], sq[(q0 + 1) * P + 8 * c + g]);
+        mma(dv[c], a[0], a[2], a[1], a[3], sg[q0 * P + 8 * c + g], sg[(q0 + 1) * P + 8 * c + g]);
+      }
+    }
+    for (int i = 0; i < 2; ++i) {
+      const float cft = quad_sum(cfa[i]);
+      if (rr[i] >= S) continue;
+      float* o = qkv_adj + (size_t) (n * S + rr[i]) * lda + D + h * HD;
+      for (int c = 0; c < DK; ++c) {
+        *reinterpret_cast<float2*>(o + 8 * c + 2 * t) = make_float2(dk[c][2 * i] * sc, dk[c][2 * i + 1] * sc);
+        *reinterpret_cast<float2*>(o + D + 8 * c + 2 * t) = make_float2(dv[c][2 * i], dv[c][2 * i + 1]);
+      }
+      if (t == 0) cfh[(size_t) (n * S + rr[i]) * H + h] = cft;
+    }
+  }
+}
+
+// Whether the tensor-core kernels run here: the mode, the device, and shared
+// memory for `floats`.
+inline bool usable(std::size_t floats) {
+  static const int smem_max = [] {
+    int dev = 0, major = 0, b = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&b, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    return major >= 8 ? b : 0;
+  }();
+  return attention_mode() == AttentionMode::TF32 && sizeof(float) * floats <= std::size_t(smem_max);
+}
+// Launched on Kokkos's stream with `bytes` of shared memory, and reported to
+// Kokkos Tools as a kernel.
+template <class K, class... A>
+void run(const char* name, K kernel, int blocks, int threads, std::size_t bytes, A... args) {
+  static int set = 0;  // the largest opt-in so far, per kernel
+  if (int(bytes) > set) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(bytes)), set = int(bytes);
+  uint64_t id = 0;
+  if (Kokkos::Tools::profileLibraryLoaded()) Kokkos::Tools::beginParallelFor(name, 0, &id);
+  kernel<<<blocks, threads, bytes, ExecSpace().cuda_stream()>>>(args...);
+  if (Kokkos::Tools::profileLibraryLoaded()) Kokkos::Tools::endParallelFor(id);
+}
+
+}  // namespace tc
+#endif
+
 template <int HD>
 void attention_impl(Workspace& ws, const std::string& key, View2D out, View2D qkv, View2D cf_seq,
                     const WeightRef& w_out, View1D b_out, int N, int S, int H, int hd,
@@ -527,6 +814,17 @@ void attention_impl(Workspace& ws, const std::string& key, View2D out, View2D qk
                                int(merged.stride(0)), save ? ml.data() : nullptr, S, H, float(sc), int(save));
           });
         })) {
+      linear(out, merged, w_out, b_out);
+      return;
+    }
+#endif
+#if defined(PET_TC)
+  if constexpr (HD > 0 && HD % 8 == 0)
+    if (tc::usable(tc::forward_floats<HD>(S))) {
+      tc::run("attention", tc::forward<HD>, N * H, (S + 15) / 16 * 32, sizeof(float) * tc::forward_floats<HD>(S),
+              (const float*) qkv.data(), int(qkv.stride(0)), (const float*) cf_seq.data(), int(cf_seq.stride(0)),
+              merged.data(), int(merged.stride(0)), save ? ml.data() : nullptr, save ? int(ml.stride(0)) : 0, S, H,
+              float(sc));
       linear(out, merged, w_out, b_out);
       return;
     }
@@ -816,6 +1114,18 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
       return;
     }
 #endif
+#if defined(PET_TC)
+  if constexpr (HD > 0 && HD % 8 == 0)
+    if (tc::usable(tc::backward_floats<HD>(S))) {
+      tc::run("attn_bwd", tc::backward<HD>, N * H, (S + 15) / 16 * 32, sizeof(float) * tc::backward_floats<HD>(S),
+              (const float*) qkv.data(), int(qkv.stride(0)), (const float*) dmerged.data(),
+              (const float*) merged.data(), int(merged.stride(0)), (const float*) ml.data(), int(ml.stride(0)),
+              (const float*) cf_seq.data(), int(cf_seq.stride(0)), qkv_adj.data(), int(qkv_adj.stride(0)),
+              cfh.data(), S, H, float(sc));
+      cf_and_input_adjoint();
+      return;
+    }
+#endif
   if constexpr (kStaged) {
     // Where two teams fit an SM's shared memory (with the driver's 1 KiB each),
     // or head_dim is 48 or more, where the two passes' per-thread arrays spill.
@@ -856,6 +1166,17 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
 }
 
 }  // namespace
+
+bool detail::tf32_attention_available() {
+#if defined(PET_TC)
+  int dev = 0, major = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+  return major >= 8;
+#else
+  return false;
+#endif
+}
 
 void attention(Workspace& ws, const std::string& key, View2D out, View2D qkv, View2D cf_seq,
                const WeightRef& w_out, View1D b_out, int N, int S, int heads, int head_dim,

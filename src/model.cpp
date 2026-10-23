@@ -755,7 +755,7 @@ std::vector<std::uintptr_t> PetModel::graph_key(const DeviceEdgeData& d, bool gr
                                 (std::uintptr_t) d.max_neighbors, (std::uintptr_t) d.n_raw,
                                 (std::uintptr_t) d.n_struct,  (std::uintptr_t) d.n_edges,
                                 (std::uintptr_t) d.n_local,   ws_.generation(),
-                                lowp_generation(), (std::uintptr_t) gemm_mode()};
+                                lowp_generation(), numerics_key()};
   auto add = [&k](const auto& v) { k.push_back((std::uintptr_t) v.data()), k.push_back(v.size()); };
   add(d.species), add(d.neigh_species), add(d.reverse_index), add(d.edge_vec), add(d.dist);
   add(d.mask), add(d.pair_cutoff), add(d.cutoff_factor), add(d.cf_seq), add(d.raw_center);

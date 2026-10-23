@@ -203,6 +203,7 @@ struct Calculator::Impl {
     for (int z = 0; z < (int) ckpt.species_to_index.size(); ++z)
       if (ckpt.species_to_index[z] >= 0) atomic_types.push_back(z);
     if (o.gemm != GemmMode::Native) gemm_mode() = o.gemm;
+    if (o.attention != AttentionMode::Native) attention_mode() = o.attention;
     if (const char* f = std::getenv("PET_MD_FIXED")) opts.md_fixed_shapes = f[0] == '1';
     std::size_t free_b = 0, total_b = 0;
     device_memory(o, free_b, total_b);
@@ -479,7 +480,7 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
           (std::uintptr_t) forces, (std::uintptr_t) a.positions, (std::uintptr_t) I.md.dev.n_atoms,
           (std::uintptr_t) I.md.dev.n_raw, (std::uintptr_t) I.md.M, (std::uintptr_t) I.md.E_cap,
           (std::uintptr_t) I.md.L_cap, (std::uintptr_t) engine, I.md.ws.generation(), I.model.ws_generation(),
-          lowp_generation(), (std::uintptr_t) gemm_mode()};
+          lowp_generation(), numerics_key()};
       const bool just_sized = I.md.sized;  // the last step ran these shapes: nothing left to allocate
       I.md.sized = false;
       I.model.set_graphs(false);  // one recording: the model's own graph is inside it

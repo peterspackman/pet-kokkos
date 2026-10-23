@@ -43,6 +43,10 @@ struct Options {
   // Process-global.
   GemmMode gemm = GemmMode::Native;
 
+  // How attention's products run: Native fp32, or TF32 on tensor cores (see
+  // gemm.hpp). Native leaves the default: PET_ATTN, else Native. Process-global.
+  AttentionMode attention = AttentionMode::Native;
+
   // The host neighbour search: vesin's cell list, or the built-in O(N^2) one.
   // Without vesin in the build, the built-in one either way. They agree on the
   // edges, not on their order, so results differ in the last bits.

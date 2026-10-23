@@ -10,6 +10,7 @@
 #include "pet/kokkos.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -74,6 +75,28 @@ inline GemmMode& gemm_mode() {
     return e && *e ? parse_gemm_mode(e) : default_gemm_mode();
   }();
   return m;
+}
+
+// How attention's own products (scores, weights times values, and their
+// adjoints) run: Native fp32, or TF32 on tensor cores (CUDA, compute capability
+// 8.0 and later; elsewhere Native). Separate from the GEMM mode, and off unless
+// asked for, so each can be measured on its own. Process-global, from
+// PET_ATTN=native|tf32.
+enum class AttentionMode { Native, TF32 };
+
+inline AttentionMode& attention_mode() {
+  static AttentionMode m = [] {
+    const char* e = std::getenv("PET_ATTN");
+    if (!e || !*e || std::strcmp(e, "native") == 0) return AttentionMode::Native;
+    if (std::strcmp(e, "tf32") == 0) return AttentionMode::TF32;
+    throw std::runtime_error(std::string("pet: unknown PET_ATTN mode '") + e + "'");
+  }();
+  return m;
+}
+
+// The numeric modes, for keys that must tell a recorded graph from another.
+inline std::uintptr_t numerics_key() {
+  return std::uintptr_t(gemm_mode()) | std::uintptr_t(attention_mode()) << 8;
 }
 
 #if defined(KOKKOS_ENABLE_CUDA)
@@ -268,6 +291,9 @@ void set_cutlass_tile(int tile);
 // (-1: the fastest, timed per shape).
 int tf32_tile_count();
 void set_tf32_tile(int tile);
+// For tests: whether AttentionMode::TF32 runs on tensor cores here (CUDA,
+// compute capability 8.0 and later), not falling back to fp32.
+bool tf32_attention_available();
 }  // namespace detail
 
 // The FP8, BF16 and FP16 modes (gemm_lowp.cpp): C = alpha op(A) op(W) + beta C

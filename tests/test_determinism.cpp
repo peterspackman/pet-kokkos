@@ -443,3 +443,45 @@ TEST_CASE("the TF32 mode's tensor-core tile does not change the answer", "[model
     }
   }
 }
+
+TEST_CASE("TF32 attention repeats itself, keeps batch invariance, and stays near fp32", "[model][determinism]") {
+  // AttentionMode::TF32 rounds attention's operands to TF32 (10-bit mantissa)
+  // on tensor cores. Each (atom, head) is one block in a fixed order, so it
+  // repeats to the bit, and a padding key adds exact zeros, so a structure's
+  // bits do not depend on its batch. Its distance from fp32 is TF32's: measured
+  // 0.01-0.13 meV/atom and 1-6 meV/A on the published models.
+  if (!pet::detail::tf32_attention_available()) {
+    WARN("TF32 attention does not run on tensor cores here; skipping");
+    return;
+  }
+  struct Restore {
+    ~Restore() { pet::attention_mode() = pet::AttentionMode::Native; }
+  } restore;
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    pet::Options opts;
+    opts.graphs = false;
+    const pet::Calculator calc(found->first, found->second, opts);
+    const std::vector<pet::System> batch = rattled_batch(model);
+    if (batch.empty()) continue;
+    DYNAMIC_SECTION(model) {
+      pet::attention_mode() = pet::AttentionMode::Native;
+      const Device fp32 = device_eval(calc, batch);
+      pet::attention_mode() = pet::AttentionMode::TF32;
+      const Device a = device_eval(calc, batch), b = device_eval(calc, batch);
+      for (std::size_t s = 0; s < batch.size(); ++s) {
+        INFO("structure " << s);
+        REQUIRE(a.energy[s] == b.energy[s]);
+        REQUIRE(a.forces[s] == b.forces[s]);
+        const double de = std::abs(a.energy[s] - fp32.energy[s]) / batch[s].n_atoms;
+        double df = 0.0;
+        for (std::size_t i = 0; i < a.forces[s].size(); ++i) df = worst(df, std::abs(a.forces[s][i] - fp32.forces[s][i]));
+        INFO("|dE| = " << 1e3 * de << " meV/atom, max |dF| = " << 1e3 * df << " meV/A from fp32 attention");
+        CHECK(de <= 1e-3);
+        CHECK(df <= 0.03);
+        if (pet::batch_invariant_gemms()) require_same_structure(a, int(s), device_eval(calc, {batch[s]}), "alone");
+      }
+    }
+  }
+}
