@@ -35,7 +35,7 @@ void gather(View2D out, View2D table, IView1D idx);
 // a = b, a plain kernel, so it is always safe inside a recorded CUDA graph.
 void copy(View2D a, View2D b);
 
-// RMSNorm, or LayerNorm when `bias` is non-empty (see ops.cpp).
+// RMSNorm, or LayerNorm when `bias` is non-empty (norm_rows below).
 // add, unless empty, is first added into in (a residual sum the norm reads);
 // also, unless empty, receives a second copy of in_adj.
 void norm_fwd(View2D out, View2D in, View1D weight, View1D bias, View2D add = {});
@@ -108,5 +108,93 @@ void sum_by_structure(RView2D x, IView1D soff, RView2D out, bool acc);
 void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdges& pk,
                        const Hypers& h, RView1D probes, int n_probes, double scale, View2D x4_adj,
                        View1D cutoff_adj, View2D cf_seq_adj, RView2D& forces, RView2D& vir9, RView2D& edge_grad);
+
+// ---- the norm kernels -------------------------------------------------------
+//
+// RMSNorm and LayerNorm are one operation: out = (x - mu) * inv * weight (+ bias),
+// where LayerNorm centres (mu = mean) and RMSNorm does not (mu = 0). One warp per
+// row, in the network type (as torch does), and in two passes so LayerNorm's
+// variance never subtracts two large squares; the second pass reads from L1.
+// A block holds several rows: one 32-thread block per row would leave the GPU at
+// its limit of resident blocks with half its warp slots empty.
+//
+// A norm reads its rows just after another pass writes them, or its adjoint is
+// just scattered somewhere: those passes ride along, a row at a time, as the
+// norm's prologue and sink, saving a trip through memory and a launch.
+
+constexpr double kRmsNormEps = 1.1920928955078125e-07;  // float32 epsilon
+constexpr double kLayerNormEps = 1e-5;
+
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+constexpr int kNormRows = 256 / kLanes;
+#else
+constexpr int kNormRows = 1;
+#endif
+
+inline TeamPolicy norm_policy(int rows) { return TeamPolicy((rows + kNormRows - 1) / kNormRows, kNormRows, kLanes); }
+
+KOKKOS_INLINE_FUNCTION Net norm_inv(Net sq, int D, bool ln) {
+  return Net(1) / Kokkos::sqrt(sq / D + Net(ln ? kLayerNormEps : kRmsNormEps));
+}
+
+KOKKOS_INLINE_FUNCTION Net row_mean(const Team& t, const View2D& x, int r) {
+  Net s = Net(0);
+  Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(t, int(x.extent(1))), [&](int d, Net& a) { a += x(r, d); }, s);
+  return s / x.extent(1);
+}
+
+// out = norm(in), row by row, after pro(r, d) has written in(r, d) for every d
+// of row r. Each lane rereads only what it (or pro) wrote, so the passes need no
+// barrier, and out may be in itself.
+template <class Pro>
+void norm_rows(const char* name, View2D out, View2D in, View1D weight, View1D bias, Pro pro) {
+  const bool ln = bias.extent(0) > 0;
+  const int N = in.extent(0), D = in.extent(1);
+  Kokkos::parallel_for(
+      name, norm_policy(N), KOKKOS_LAMBDA(const Team& t) {
+        const int r = t.league_rank() * kNormRows + t.team_rank();
+        if (r >= N) return;
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, D), [&](int d) { pro(r, d); });
+        const Net mu = ln ? row_mean(t, in, r) : Net(0);
+        Net v = Net(0);
+        Kokkos::parallel_reduce(
+            Kokkos::ThreadVectorRange(t, D), [&](int d, Net& s) { s += (in(r, d) - mu) * (in(r, d) - mu); }, v);
+        const Net inv = norm_inv(v, D, ln);
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, D), [&](int d) {
+          out(r, d) = (in(r, d) - mu) * inv * weight(d) + (ln ? bias(d) : Net(0));
+        });
+      });
+}
+
+// The backward: sink(r, d, g) receives in's adjoint g. With xhat = (x - mu) * inv
+// and gw = out_adj * weight:
+//   g = inv * (gw - [mean(gw) for LayerNorm] - xhat * mean(gw * xhat)).
+// The bias is a shift, so it does not appear. The variance and both gradient
+// sums come from one pass over the row (after the mean, for LayerNorm).
+template <class Sink>
+void norm_rows_bwd(const char* name, View2D out_adj, View2D in, View1D weight, bool ln, Sink sink) {
+  const int N = in.extent(0), D = in.extent(1);
+  Kokkos::parallel_for(
+      name, norm_policy(N), KOKKOS_LAMBDA(const Team& t) {
+        const int r = t.league_rank() * kNormRows + t.team_rank();
+        if (r >= N) return;
+        const Net mu = ln ? row_mean(t, in, r) : Net(0);
+        Net sq = Net(0), sg = Net(0), sgx = Net(0);
+        Kokkos::parallel_reduce(
+            Kokkos::ThreadVectorRange(t, D),
+            [&](int d, Net& a, Net& b, Net& c) {
+              const Net x = in(r, d) - mu, gw = out_adj(r, d) * weight(d);
+              a += x * x;
+              b += gw;
+              c += gw * x;
+            },
+            sq, sg, sgx);
+        const Net inv = norm_inv(sq, D, ln);
+        const Net mg = ln ? sg / D : Net(0), mgx = sgx * inv / D;
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, D), [&](int d) {
+          sink(r, d, inv * (out_adj(r, d) * weight(d) - mg - (in(r, d) - mu) * inv * mgx));
+        });
+      });
+}
 
 }  // namespace pet

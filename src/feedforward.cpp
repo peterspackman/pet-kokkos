@@ -11,6 +11,8 @@
 // residual connection is then just leaving the value where it is.
 #include "ops.hpp"
 
+#include <algorithm>
+
 namespace pet {
 
 void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D& node,
@@ -20,7 +22,10 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
   const int D = h_.d_pet, Dn = h_.d_node, A = h_.num_attention_layers;
   const bool save = sav != nullptr;
   const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
-  auto off = pk.off, rev = pk.reverse;
+  auto off = pk.off, rev = pk.reverse, centre = pk.center;
+  const bool ln = h_.normalization == Normalization::LayerNorm;
+  auto nweight = [&](const std::string& key) { return vec(key + ".weight"); };
+  auto nbias = [&](const std::string& key) { return ln ? vec(key + ".bias") : View1D(); };
   if (save)
     for (auto* v : {&sav->tokens, &sav->qkv, &sav->node_new, &sav->tmp_center, &sav->eps, &sav->tmp_edge})
       v->assign(A, View2D());
@@ -46,26 +51,31 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
 
     View2D input_node = ws_.tmp(N, D);
     linear(input_node, node_cur, mat(tl + ".center_contraction.weight"), vec(tl + ".center_contraction.bias"));
-    View2D tokens = save ? keep(sav->tokens[a], "tok", a, N * S, D) : ws_.tmp(N * S, D);
-    Kokkos::parallel_for(
-        "tok", RangePolicy(0, N * S * D), KOKKOS_LAMBDA(int i) {
-          const int row = i / D, d = i % D, n = row / S, e = off(n) + row % S - 1;
-          tokens(row, d) = row % S == 0 ? input_node(n, d) : e < off(n + 1) ? edge_cur(e, d) : Net(0);
-        });
 
-    // Attention, then its output split: the central row to the centre expansion,
-    // the edge rows onto the edge residual, eps = attn + edge_in. The block's edge
-    // output is eps + mlp(norm(eps)), accumulated onto a copy of eps -- or, when
-    // nothing is saved, onto eps itself.
+    // Attention over tokens = [input_node ; edge_cur] per atom, gathered as the
+    // norm reads them (into attn_in itself when tokens are not kept). Then its
+    // output split: the central row to the centre expansion, the edge rows onto
+    // the edge residual, eps = attn + edge_in, gathered as eps's norm reads them.
+    // The block's edge output is eps + mlp(norm(eps)), accumulated onto a copy of
+    // eps -- or, when nothing is saved, onto eps itself. The rows the attention's
+    // norm wrote take eps's norm afterwards.
     View2D out_node = ws_.tmp(N, D);
     View2D eps = save ? keep(sav->eps[a], "eps", a, E, D) : edge_next;
+    // (A capacity's E can pass N * S.)
+    View2D normed = ws_.tmp(std::max(N * S, E), D);
+    View2D edge_norm(normed.data(), E, D);
     {
       Workspace::Scope attn_scope(ws_);
       View2D attn_out = ws_.tmp(N * S, D);
       {
         Workspace::Scope qkv_scope(ws_);
-        View2D attn_in = ws_.tmp(N * S, D);
-        norm(attn_in, tokens, tl + ".norm_attention");
+        View2D attn_in(normed.data(), N * S, D);
+        View2D tokens = save ? keep(sav->tokens[a], "tok", a, N * S, D) : attn_in;
+        norm_rows("norm_tok", attn_in, tokens, nweight(tl + ".norm_attention"), nbias(tl + ".norm_attention"),
+                  KOKKOS_LAMBDA(int row, int d) {
+                    const int n = row / S, e = off(n) + row % S - 1;
+                    tokens(row, d) = row % S == 0 ? input_node(n, d) : e < off(n + 1) ? edge_cur(e, d) : Net(0);
+                  });
         View2D qkv = save && save_wide ? keep(sav->qkv[a], "qkv", a, N * S, 3 * D) : ws_.tmp(N * S, 3 * D);
         linear(qkv, attn_in, mat(tl + ".attention.input_linear.weight"), vec(tl + ".attention.input_linear.bias"));
         attention(ws_, key, attn_out, qkv, dev.cf_seq, mat(tl + ".attention.output_linear.weight"),
@@ -73,13 +83,13 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
                   h_.attention_temperature, save);
       }
       Kokkos::parallel_for(
-          "split_res", RangePolicy(0, N * S * D), KOKKOS_LAMBDA(int i) {
-            const int row = i / D, d = i % D, n = row / S, k = off(n) + row % S - 1;
-            if (row % S == 0) return (void) (out_node(n, d) = attn_out(row, d));
-            if (k >= off(n + 1)) return;
-            eps(k, d) = attn_out(row, d) + edge_cur(k, d);
-            if (save) edge_next(k, d) = eps(k, d);
-          });
+          "attn_node", RangePolicy(0, N * D), KOKKOS_LAMBDA(int i) { out_node(i / D, i % D) = attn_out(i / D * S, i % D); });
+      norm_rows("norm_eps", edge_norm, eps, nweight(tl + ".norm_mlp"), nbias(tl + ".norm_mlp"),
+                KOKKOS_LAMBDA(int k, int d) {
+                  const int n = centre(k);  // a capacity's dead rows: no atom's, no attention
+                  eps(k, d) = (k < off(n + 1) ? attn_out(n * S + k - off(n) + 1, d) : Net(0)) + edge_cur(k, d);
+                  if (save) edge_next(k, d) = eps(k, d);
+                });
     }
 
     // The node side the same way: node_res = node_in + expansion(central row), the
@@ -87,21 +97,17 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
     View2D node_exp = ws_.tmp(N, Dn);
     linear(node_exp, out_node, mat(tl + ".center_expansion.weight"), vec(tl + ".center_expansion.bias"));
     View2D node_res = save ? keep(sav->node_new[a], "nn", a, N, Dn) : node_next;
-    Kokkos::parallel_for(
-        "nres", RangePolicy(0, N * Dn), KOKKOS_LAMBDA(int i) {
-          const int n = i / Dn, d = i % Dn;
-          node_res(n, d) = node_cur(n, d) + node_exp(n, d);
-          if (save) node_next(n, d) = node_res(n, d);
-        });
     const int cw = ffn_pre_width(tl + ".center_mlp"), ew = ffn_pre_width(tl + ".mlp");
     View2D node_norm = ws_.tmp(N, Dn);
-    norm(node_norm, node_res, tl + ".norm_center_features");
+    norm_rows("norm_nres", node_norm, node_res, nweight(tl + ".norm_center_features"),
+              nbias(tl + ".norm_center_features"), KOKKOS_LAMBDA(int n, int d) {
+                node_res(n, d) = node_cur(n, d) + node_exp(n, d);
+                if (save) node_next(n, d) = node_res(n, d);
+              });
     View2D pre_center = save ? keep(sav->tmp_center[a], "tc", a, N, cw) : ws_.tmp(N, cw);
     feedforward(node_next, node_norm, tl + ".center_mlp", pre_center, save, 1);
     {
       Workspace::Scope mlp_scope(ws_);
-      View2D edge_norm = ws_.tmp(E, D);
-      norm(edge_norm, eps, tl + ".norm_mlp");
       View2D pre_edge = save && save_wide ? keep(sav->tmp_edge[a], "te", a, E, ew) : ws_.tmp(E, ew);
       feedforward(edge_next, edge_norm, tl + ".mlp", pre_edge, save, 1);
     }
@@ -129,16 +135,20 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
         });
     dev.exchange->edges(out, remote_in);
   }
-  View2D concat = save ? keep(sav->concat, "cc", -1, E, 2 * D) : ws_.tmp(E, 2 * D);
-  Kokkos::parallel_for(
-      "cat_rev", RangePolicy(0, E * D), KOKKOS_LAMBDA(int i) {
-        const int k = i / D, d = i % D, r = rev(k);
-        concat(k, d) = out_edge(k, d);
-        concat(k, D + d) = r >= 0 ? out_edge(r, d) : remote && ro(k) >= 0 ? remote_in(ro(k), d) : Net(0);
-        input_edge(k, d) += out_edge(k, d);
-      });
+  // The concat is gathered as its norm reads it (into the norm's output itself
+  // when it is not kept), adding out_edge onto input_edge on the way.
   View2D comb_norm = ws_.tmp(E, 2 * D), cph = ws_.tmp(E, 2 * D);
-  norm_fwd(comb_norm, concat, vec("combination_norms." + ls + ".weight"), vec("combination_norms." + ls + ".bias"));
+  View2D concat = save ? keep(sav->concat, "cc", -1, E, 2 * D) : comb_norm;
+  norm_rows("norm_cat", comb_norm, concat, vec("combination_norms." + ls + ".weight"),
+            vec("combination_norms." + ls + ".bias"), KOKKOS_LAMBDA(int k, int d) {
+              if (d < D) {
+                concat(k, d) = out_edge(k, d);
+                input_edge(k, d) += out_edge(k, d);
+                return;
+              }
+              const int r = rev(k), c = d - D;
+              concat(k, d) = r >= 0 ? out_edge(r, c) : remote && ro(k) >= 0 ? remote_in(ro(k), c) : Net(0);
+            });
   linear_silu(cph, save ? keep(sav->cph, "cph", -1, E, 2 * D) : View2D(), comb_norm,
               mat("combination_mlps." + ls + ".0.weight"), vec("combination_mlps." + ls + ".0.bias"));
   linear(input_edge, cph, mat("combination_mlps." + ls + ".2.weight"), vec("combination_mlps." + ls + ".2.bias"), 1);
@@ -211,8 +221,10 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
     Workspace::Scope block_scope(ws_);
 
     // Attention: its output's adjoint is the expansion's input adjoint on the
-    // central row and eps's on the edge rows.
-    View2D tokens_adj = ws_.tmp(N * S, D);
+    // central row and eps's on the edge rows. Its input's, through the norm, goes
+    // where the tokens came from: edge rows onto edge_in's residual share, the
+    // central row back through the contraction onto node_in's.
+    View2D input_node_adj = ws_.tmp(N, D);
     {
       Workspace::Scope scope(ws_);
       View2D out_node_adj = ws_.tmp(N, D), attn_out_adj = ws_.tmp(N * S, D), attn_in_adj = ws_.tmp(N * S, D);
@@ -227,18 +239,13 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
                     dev.cf_seq, mat(tl + ".attention.input_linear.weight"),
                     mat(tl + ".attention.output_linear.weight"), N, S, h_.num_heads, h_.head_dim,
                     h_.attention_temperature, 0);
-      norm_bwd(tokens_adj, attn_in_adj, sav.tokens[a], tl + ".norm_attention", false);
+      norm_rows_bwd("norm_tok_bwd", attn_in_adj, sav.tokens[a], vec(tl + ".norm_attention.weight"),
+                    h_.normalization == Normalization::LayerNorm, KOKKOS_LAMBDA(int row, int d, Net g) {
+                      const int n = row / S, k = off(n) + row % S - 1;
+                      if (row % S == 0) input_node_adj(n, d) = g;
+                      else if (k < off(n + 1)) edge_adj(k, d) += g;
+                    });
     }
-
-    // tokens = [input_node ; edge_in]: edge rows add onto edge_in's residual
-    // share, the central row goes back through the contraction onto node_in's.
-    View2D input_node_adj = ws_.tmp(N, D);
-    Kokkos::parallel_for(
-        "bw_tok", RangePolicy(0, N * S * D), KOKKOS_LAMBDA(int i) {
-          const int row = i / D, d = i % D, n = row / S, k = off(n) + row % S - 1;
-          if (row % S == 0) input_node_adj(n, d) = tokens_adj(row, d);
-          else if (k < off(n + 1)) edge_adj(k, d) += tokens_adj(row, d);
-        });
     linear_bwd(node_adj, input_node_adj, mat(tl + ".center_contraction.weight"));
   }
 
