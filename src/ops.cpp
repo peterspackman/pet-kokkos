@@ -9,12 +9,13 @@ namespace pet {
 // Every GEMM in the network has a weight as its second operand and comes through
 // here: on narrow operands in the FP8, BF16 and FP16 modes where it can, else
 // through gemm_ozaki, which is the vendor GEMM unless the Ozaki path is on. The
-// backward takes the same path as the forward. In the native mode, CUTLASS's
-// SIMT GEMM where the build has it: its answer for a row does not depend on how
-// many rows there are, so a structure gets the same bits whatever its batch.
+// backward takes the same path as the forward. In the native and TF32 modes,
+// CUTLASS's GEMM where the build has it (fused_gemm.cpp); in the native mode its
+// answer for a row does not depend on how many rows there are, so a structure
+// gets the same bits whatever its batch.
 static void weight_gemm(char tw, Net beta, View2D out, View2D in, const WeightRef& W, View1D b = {}) {
   if (gemm_lowp('N', tw, Net(1), in, W.v, beta, out, b)) return;
-  if (!W.split && gemm_mode() == GemmMode::Native && linear_fused(out, in, W.v, tw == 'T', b, beta)) return;
+  if (!W.split && linear_fused(out, in, W.v, tw == 'T', b, beta)) return;
   gemm_ozaki('N', tw, Net(1), in, W.v, beta, out, W.for_orientation(tw == 'T'), b);
 }
 
@@ -25,8 +26,8 @@ void linear_bwd(View2D in_adj, View2D out_adj, const WeightRef& W, Net beta) {
 }
 
 void linear_silu(View2D out, View2D pre, View2D in, const WeightRef& W, View1D b) {
-  // The fused kernels are fp32 SIMT: only the native mode takes them.
-  if (!W.split && gemm_mode() == GemmMode::Native && silu_in_fused(out, pre, in, W.v, b)) return;
+  // The fused kernels run in the native and TF32 modes only.
+  if (!W.split && silu_in_fused(out, pre, in, W.v, b)) return;
   linear(out, in, W, b);
   const int n = out.extent(0) * out.extent(1);
   const bool save = pre.data() != nullptr;
@@ -50,7 +51,7 @@ void silu_bwd(View2D grad, View2D pre) {
 }
 
 void linear_silu_bwd(View2D grad, View2D out_adj, const WeightRef& W, View2D pre) {
-  if (!W.split && gemm_mode() == GemmMode::Native && silu_bwd_fused(grad, out_adj, W.v, pre)) return;
+  if (!W.split && silu_bwd_fused(grad, out_adj, W.v, pre)) return;
   linear_bwd(grad, out_adj, W, 0);
   silu_bwd(grad, pre);
 }
@@ -161,8 +162,8 @@ void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln, 
 // ---- SwiGLU -------------------------------------------------------------------
 
 void swiglu_in(View2D pre, View2D h, View2D in, const WeightRef& w_in, View1D b_in) {
-  // The fused kernels are fp32 SIMT: only the native mode takes them.
-  if (!w_in.split && gemm_mode() == GemmMode::Native && swiglu_in_fused(pre, h, in, w_in.v, b_in)) return;
+  // The fused kernels run in the native and TF32 modes only.
+  if (!w_in.split && swiglu_in_fused(pre, h, in, w_in.v, b_in)) return;
   linear(pre, in, w_in, b_in);
   if (!h.data()) return;
   const int F = h.extent(1);
@@ -186,7 +187,7 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
   const int R = out_adj.extent(0), F = pre.extent(1) / 2;
   Workspace::Scope scope(ws);
   View2D pre_adj = ws.tmp(R, 2 * F);
-  if (w_out.split || gemm_mode() != GemmMode::Native || !swiglu_bwd_fused(pre_adj, out_adj, w_out.v, pre)) {
+  if (w_out.split || !swiglu_bwd_fused(pre_adj, out_adj, w_out.v, pre)) {
     View2D h_adj = ws.tmp(R, F);
     linear_bwd(h_adj, out_adj, w_out, 0);
     Kokkos::parallel_for(
