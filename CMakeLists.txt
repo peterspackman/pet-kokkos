@@ -40,6 +40,9 @@ option(PET_BUILD_APPS    "Build the command-line tools"    ${PET_IS_TOP_LEVEL})
 option(PET_INSTALL       "Install the library and headers"  ${PET_IS_TOP_LEVEL})
 # The metatomic plugin (metatomic/): needs metatomic and metatensor installed.
 option(PET_BUILD_METATOMIC "Build the metatomic plugin"    OFF)
+# The Python package's compiled module (python/): needs nanobind. A wheel build
+# (pyproject.toml) turns it on.
+option(PET_BUILD_PYTHON "Build the Python module pet_kokkos._core" OFF)
 
 # Optional vesin backend for the host neighbour search. The built-in search is an
 # O(N^2 x images) brute force, fine for small cells and the dominant cost for
@@ -62,13 +65,14 @@ set_property(CACHE PET_WITH_CUTLASS PROPERTY STRINGS AUTO ON OFF)
 option(PET_ARCH_NATIVE "Optimize for the building machine's CPU (-march=native)" ON)
 option(PET_USE_BLAS "Host builds: the GEMMs through a CBLAS (OpenBLAS, MKL, ...) when one is found" ON)
 
-set(PET_BACKEND "serial" CACHE STRING "Kokkos backend: serial, openmp, cuda, hip")
-set_property(CACHE PET_BACKEND PROPERTY STRINGS serial openmp cuda hip)
+# threads: Kokkos's own C++ threads, for host compilers without OpenMP (Apple's).
+set(PET_BACKEND "serial" CACHE STRING "Kokkos backend: serial, openmp, threads, cuda, hip")
+set_property(CACHE PET_BACKEND PROPERTY STRINGS serial openmp threads cuda hip)
 # Inside an application that brings its own Kokkos (LAMMPS's KOKKOS package),
 # that Kokkos's device is ours: in-tree it leaves Kokkos_ENABLE_*, installed
 # Kokkos_DEVICES.
 if(TARGET Kokkos::kokkos)
-    foreach(dev CUDA HIP OPENMP)
+    foreach(dev CUDA HIP OPENMP THREADS)
         if(Kokkos_ENABLE_${dev} OR "${dev}" IN_LIST Kokkos_DEVICES)
             string(TOLOWER ${dev} PET_BACKEND)
             break()
@@ -120,9 +124,12 @@ if(NOT TARGET Kokkos::kokkos)
     set(Kokkos_ENABLE_OPENMP OFF CACHE BOOL "" FORCE)
     set(Kokkos_ENABLE_CUDA   OFF CACHE BOOL "" FORCE)
     set(Kokkos_ENABLE_HIP    OFF CACHE BOOL "" FORCE)
+    set(Kokkos_ENABLE_THREADS OFF CACHE BOOL "" FORCE)
 
     if(PET_BACKEND STREQUAL "openmp")
         set(Kokkos_ENABLE_OPENMP ON CACHE BOOL "" FORCE)
+    elseif(PET_BACKEND STREQUAL "threads")
+        set(Kokkos_ENABLE_THREADS ON CACHE BOOL "" FORCE)
     elseif(PET_BACKEND STREQUAL "cuda")
         set(Kokkos_ENABLE_CUDA           ON CACHE BOOL "" FORCE)
         set(Kokkos_ENABLE_CUDA_LAMBDA    ON CACHE BOOL "" FORCE)
@@ -132,7 +139,7 @@ if(NOT TARGET Kokkos::kokkos)
         set(Kokkos_ENABLE_HIP    ON CACHE BOOL "" FORCE)
         set(Kokkos_ENABLE_OPENMP ON CACHE BOOL "" FORCE)
     elseif(NOT PET_BACKEND STREQUAL "serial")
-        message(FATAL_ERROR "PET_BACKEND must be one of: serial, openmp, cuda, hip")
+        message(FATAL_ERROR "PET_BACKEND must be one of: serial, openmp, threads, cuda, hip")
     endif()
 
     CPMAddPackage(
@@ -221,6 +228,10 @@ if(PET_BUILD_METATOMIC)
     add_subdirectory(metatomic)
 endif()
 
+if(PET_BUILD_PYTHON)
+    add_subdirectory(python)
+endif()
+
 if(PET_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
@@ -236,3 +247,4 @@ message(STATUS "  tests      : ${PET_BUILD_TESTS}   apps: ${PET_BUILD_APPS}")
 message(STATUS "  vesin      : ${PET_HAVE_VESIN}")
 message(STATUS "  cutlass    : ${PET_HAVE_CUTLASS}")
 message(STATUS "  metatomic  : ${PET_BUILD_METATOMIC}")
+message(STATUS "  python     : ${PET_BUILD_PYTHON}")

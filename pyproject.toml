@@ -1,0 +1,77 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pet-kokkos"
+dynamic = ["version"]
+description = "PET machine-learned interatomic potentials (PET-MAD, ...) on Kokkos: CPU and GPU"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+ase = ["ase>=3.23"]
+test = ["pytest>=8", "ase>=3.23"]
+
+[project.urls]
+Source = "https://github.com/peterspackman/pet-kokkos"
+Models = "https://huggingface.co/peterspackman/pet-kokkos-models"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build-py/{wheel_tag}"
+wheel.packages = ["python/pet_kokkos"]
+# Only the package: not Kokkos's or the C++ library's own install rules.
+install.components = ["python"]
+# The module uses Python's stable ABI from 3.12: one wheel for 3.12 and later.
+wheel.py-api = "cp312"
+sdist.exclude = ["build*", "models", ".venv", "lammps/examples/*.data"]
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "CMakeLists.txt"
+regex = 'project\(\s*pet_kokkos\s+VERSION\s+(?P<value>[0-9.]+)'
+
+# A wheel is the library and its Python module: no tests, tools or install of
+# the C++ library. The backend defaults to OpenMP on Linux and Kokkos's threads
+# on macOS (Apple's compiler has no OpenMP); GPU builds pass their own, e.g.
+#   uv build --wheel -Ccmake.define.PET_BACKEND=cuda -Ccmake.define.Kokkos_ARCH_HOPPER90=ON
+# Wheels for other machines need PET_ARCH_NATIVE off (the default here).
+[tool.scikit-build.cmake.define]
+PET_BUILD_PYTHON = "ON"
+PET_BUILD_TESTS = "OFF"
+PET_BUILD_APPS = "OFF"
+PET_INSTALL = "OFF"
+PET_ARCH_NATIVE = "OFF"
+PET_WITH_VESIN = "OFF"
+PET_BACKEND = { env = "PET_BACKEND", default = "openmp" }
+
+[[tool.scikit-build.overrides]]
+if.platform-system = "darwin"
+cmake.define.PET_BACKEND = { env = "PET_BACKEND", default = "threads" }
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+
+# ---- wheels (cibuildwheel, with uv) ------------------------------------------
+#
+# CPU wheels: OpenMP + OpenBLAS on Linux (bundled by auditwheel), Kokkos's
+# threads + Accelerate on macOS. From Python 3.12 one abi3 wheel serves every
+# later version. The tests download pet-mad-xs (17 MB) from Hugging Face; the
+# goldens' own checkpoints are not published, so those tests skip.
+[tool.cibuildwheel]
+build-frontend = "build[uv]"
+build = ["cp310-*", "cp311-*", "cp312-*"]
+skip = ["*-musllinux_*", "*_i686", "*-win32"]
+test-requires = ["pytest", "ase"]
+test-command = "python -c \"import pet_kokkos; pet_kokkos.download('pet-mad-xs')\" && pytest -q -W ignore::FutureWarning {project}/python/tests"
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+before-all = "dnf install -y openblas-devel || (dnf install -y dnf-plugins-core && dnf config-manager --set-enabled powertools && dnf install -y openblas-devel)"
+
+[tool.cibuildwheel.macos]
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
