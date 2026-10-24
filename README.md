@@ -247,10 +247,12 @@ equal, and what it gains is from better-used kernels.
 
 The other GEMM modes:
 
-- `fp16`: about as accurate as `tf32`; NVIDIA from compute capability 7.0, and
-  AMD's matrix cores (on an MI250X, about 10% faster than fp32).
-- `bf16`: less accurate (about 1 meV/atom, 4x the NVE drift); NVIDIA 8.0+ and
-  AMD. Not faster than `tf32` on NVIDIA.
+- `fp16`: about as accurate as `tf32` (0.08-0.37 meV/atom, 1-6 meV/Å on the
+  models above); NVIDIA from compute capability 7.0, and AMD's matrix cores (on
+  an MI250X, about 10% faster than fp32).
+- `bf16`: much less accurate (up to 5 meV/atom and 7-42 meV/Å from fp32, 4x
+  the NVE drift): its 7-bit mantissa is 8x coarser than fp16's. NVIDIA 8.0+
+  and AMD. Not faster than `tf32` on NVIDIA.
 - `fp8`: Ada or Hopper only, good enough for screening and nothing more.
 - `ozaki`: for the fp64 build, fp64-accurate products on integer tensor cores.
 
