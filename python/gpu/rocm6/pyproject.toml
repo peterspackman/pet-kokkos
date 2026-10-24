@@ -41,6 +41,9 @@ Kokkos_ARCH_AMD_GFX90A = "ON"
 GPU_TARGETS = "gfx90a"
 CMAKE_CXX_FLAGS = { env = "PET_ROCM_CXXFLAGS", default = "--offload-arch=gfx942" }
 PET_PYTHON_PACKAGE = "pet_kokkos_rocm6"
+# No host OpenMP: ROCm's clang would need its OpenMP runtime installed and
+# shipped, for host work that is small next to the GPU's.
+PET_HOST_OPENMP = "OFF"
 CMAKE_CXX_COMPILER = { env = "PET_HIPCC", default = "hipcc" }
 
 # ---- wheels (cibuildwheel, with uv) ------------------------------------------

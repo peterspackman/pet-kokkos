@@ -64,6 +64,9 @@ set_property(CACHE PET_WITH_CUTLASS PROPERTY STRINGS AUTO ON OFF)
 # not accept the flag.
 option(PET_ARCH_NATIVE "Optimize for the building machine's CPU (-march=native)" ON)
 option(PET_USE_BLAS "Host builds: the GEMMs through a CBLAS (OpenBLAS, MKL, ...) when one is found" ON)
+# GPU builds run Kokkos's host space on OpenMP; off, on one thread (a wheel
+# without a host OpenMP runtime to ship: the ROCm one).
+option(PET_HOST_OPENMP "GPU builds: OpenMP for the host" ON)
 
 # threads: Kokkos's own C++ threads, for host compilers without OpenMP (Apple's).
 set(PET_BACKEND "serial" CACHE STRING "Kokkos backend: serial, openmp, threads, cuda, hip")
@@ -134,10 +137,10 @@ if(NOT TARGET Kokkos::kokkos)
         set(Kokkos_ENABLE_CUDA           ON CACHE BOOL "" FORCE)
         set(Kokkos_ENABLE_CUDA_LAMBDA    ON CACHE BOOL "" FORCE)
         set(Kokkos_ENABLE_CUDA_CONSTEXPR ON CACHE BOOL "" FORCE)
-        set(Kokkos_ENABLE_OPENMP         ON CACHE BOOL "" FORCE)
+        set(Kokkos_ENABLE_OPENMP         ${PET_HOST_OPENMP} CACHE BOOL "" FORCE)
     elseif(PET_BACKEND STREQUAL "hip")
         set(Kokkos_ENABLE_HIP    ON CACHE BOOL "" FORCE)
-        set(Kokkos_ENABLE_OPENMP ON CACHE BOOL "" FORCE)
+        set(Kokkos_ENABLE_OPENMP ${PET_HOST_OPENMP} CACHE BOOL "" FORCE)
     elseif(NOT PET_BACKEND STREQUAL "serial")
         message(FATAL_ERROR "PET_BACKEND must be one of: serial, openmp, threads, cuda, hip")
     endif()
