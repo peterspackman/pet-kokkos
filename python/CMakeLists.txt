@@ -9,7 +9,8 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT)
 find_package(nanobind CONFIG REQUIRED)
 
-nanobind_add_module(_core NB_STATIC STABLE_ABI core.cpp)
+# NOMINSIZE: not -Os, which nvcc (a CUDA build compiles this with nvcc_wrapper) rejects.
+nanobind_add_module(_core NB_STATIC STABLE_ABI NOMINSIZE core.cpp)
 target_link_libraries(_core PRIVATE pet_kokkos pet_warnings)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(_core PRIVATE "LINKER:--exclude-libs,ALL")
