@@ -16,6 +16,24 @@ namespace pet {
 using Team = TeamPolicy::member_type;
 constexpr int kMaxHeadDim = 128;  // attention's per-thread arrays
 
+// ---- token rows ---------------------------------------------------------------
+//
+// The attention runs over each atom's tokens: its own, then one per kept edge.
+// They are rows of one [N + E, width] matrix: atom n's own token is row n and
+// its edge tokens are rows N + off(n) .. N + off(n+1) - 1, so token N + k is
+// edge k's, aligned with the edge rows. Atom n has count(n) tokens; slot s of
+// it (0 its own, s its s-th kept edge) is row(n, s). Per-slot values -- cf_seq,
+// the softmax's max and sum -- stay [N, S], S the most tokens an atom has.
+// With a capacity, the edges past off(N) are dead: their rows are no atom's,
+// and attention zeroes them (`dead`).
+struct Tokens {
+  IView1D off;
+  int N = 0;
+  bool dead = false;  // edge rows past off(N) may exist
+  KOKKOS_INLINE_FUNCTION int count(int n) const { return off(n + 1) - off(n) + 1; }
+  KOKKOS_INLINE_FUNCTION int row(int n, int s) const { return s == 0 ? n : N + off(n) + s - 1; }
+};
+
 // ---- ops.cpp ----------------------------------------------------------------
 
 // out = in W^T + b, onto beta * out.
@@ -78,17 +96,17 @@ void assemble_energy(RView1D per_atom, View1D net, IView1D species, RView1D comp
 
 // ---- attention.cpp ----------------------------------------------------------
 
-// Multi-head attention over each atom's S = M+1 tokens, with log(cf) as a
+// Multi-head attention over each atom's tokens (Tokens above), with log(cf) as a
 // per-key bias, followed by the output linear. `save` keeps what the backward
 // needs under `key`.
 void attention(Workspace& ws, const std::string& key, View2D out, View2D qkv, View2D cf_seq,
-               const WeightRef& w_out, View1D b_out, int N, int S, int heads, int head_dim,
+               const WeightRef& w_out, View1D b_out, const Tokens& tk, int S, int heads, int head_dim,
                double temperature, bool save);
 // in_adj (onto beta * in_adj) is the adjoint of the input linear's input;
 // cf_seq_adj accumulates. `key` names the forward's saves.
 void attention_bwd(Workspace& ws, const std::string& key, View2D in_adj, View2D cf_seq_adj,
                    View2D out_adj, View2D qkv, View2D cf_seq, const WeightRef& w_in,
-                   const WeightRef& w_out, int N, int S, int heads, int head_dim,
+                   const WeightRef& w_out, const Tokens& tk, int S, int heads, int head_dim,
                    double temperature, Net beta);
 
 // ---- forces.cpp -------------------------------------------------------------

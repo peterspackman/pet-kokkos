@@ -1,10 +1,11 @@
 // Multi-head attention over each atom's tokens, forward and backward.
 //
-// Atom n has S = M+1 tokens: its own (s = 0) and one per neighbour slot. Per
-// head, query q attends to key k with weight softmax_k(scale * q.k + log cf_k),
-// where cf is the key's smooth cutoff factor; a key with cf <= 0 (padding, or an
-// edge exactly at its cutoff) is left out, and a padding query (s > 0, cf <= 0)
-// produces zero.
+// Atom n has tk.count(n) tokens: its own (s = 0) and one per kept edge, rows of
+// the token matrix (Tokens, ops.hpp); S, the most any atom has, sizes the
+// per-slot values. Per head, query q attends to key k with weight
+// softmax_k(scale * q.k + log cf_k), where cf is the key's smooth cutoff factor;
+// a key with cf <= 0 (a slot past the atom's tokens, or an edge exactly at its
+// cutoff) is left out, and a query on such an edge produces zero.
 //
 // Each pass runs a team per (atom, head), a thread per token. The team first
 // copies the rows every thread reads -- the keys and values, or in the keys pass
@@ -83,17 +84,21 @@ KOKKOS_INLINE_FUNCTION Net* scratch(const Member& m, int level, std::size_t byte
   return (Net*) m.team_scratch(level).get_shmem_aligned(bytes - 16, 16);
 }
 
-// Rows n*S .. n*S+S-1 of src, columns [col, col+hd), into dst [S][hd].
+// Atom n's tokens' columns [col, col+hd) of src into dst [S][hd], the slots
+// past its count zero.
 template <int HD>
-KOKKOS_INLINE_FUNCTION void stage(const Member& m, Net* dst, const View2D& src, int n, int S, int col, int hd) {
+KOKKOS_INLINE_FUNCTION void stage(const Member& m, Net* dst, const View2D& src, const Tokens& tk, int n, int S,
+                                  int col, int hd) {
+  const int cnt = tk.count(n);
   if constexpr (HD > 0 && HD % 4 == 0) {
     Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S * (HD / 4)), [&](int t) {
       const int r = t / (HD / 4), c = (t % (HD / 4)) * 4;
-      *reinterpret_cast<Net4*>(dst + r * HD + c) = ld4(&src(n * S + r, col + c));
+      *reinterpret_cast<Net4*>(dst + r * HD + c) = r < cnt ? ld4(&src(tk.row(n, r), col + c)) : Net4{};
     });
   } else {
     Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S * hd), [&](int t) {
-      dst[t] = src(n * S + t / hd, col + t % hd);
+      const int r = t / hd;
+      dst[t] = r < cnt ? src(tk.row(n, r), col + t % hd) : Net(0);
     });
   }
 }
@@ -163,13 +168,18 @@ using FlatPolicy = Kokkos::RangePolicy<ExecSpace, Kokkos::LaunchBounds<256, 1>,
 using FlatPolicy = RangePolicy;
 #endif
 
-// A head's slice of S consecutive rows, in scratch or in a global array.
+// A head's slice of an atom's tokens: consecutive rows in scratch, or in the
+// token matrix its own row and then its edges'.
 struct Rows {
-  const Net* base;
+  const Net *own, *edges;
   std::size_t stride;
-  KOKKOS_INLINE_FUNCTION const Net* operator()(int r) const { return base + r * stride; }
+  KOKKOS_INLINE_FUNCTION const Net* operator()(int r) const { return r == 0 ? own : edges + (r - 1) * stride; }
 };
-KOKKOS_INLINE_FUNCTION Rows rows(const View2D& v, int row0, int col) { return {&v(row0, col), v.stride(0)}; }
+KOKKOS_INLINE_FUNCTION Rows staged(const Net* base, int stride) { return {base, base + stride, std::size_t(stride)}; }
+KOKKOS_INLINE_FUNCTION Rows rows(const View2D& v, const Tokens& tk, int n, int col) {
+  const std::size_t ld = v.stride(0);
+  return {v.data() + n * ld + col, v.data() + (tk.N + tk.off(n)) * ld + col, ld};
+}
 // Each key's log cf: staged, or from the cutoff factors.
 struct LogCf {
   const Net* staged;
@@ -197,6 +207,7 @@ void launch(const char* name, F f, int N, int H, int S, std::size_t scratch_valu
 template <int HD>
 struct Forward {
   View2D qkv, cf_seq, merged, ml;
+  Tokens tk;
   int S, H, hd;
   Net sc;
   bool save;
@@ -205,9 +216,14 @@ struct Forward {
 
   KOKKOS_INLINE_FUNCTION void token(int n, int h, int sq, Rows K, Rows V, LogCf lcf) const {
     constexpr int CAP = HD > 0 ? HD : kMaxHeadDim;
-    const int nd = HD > 0 ? HD : hd, qo = h * hd;
-    const int row_q = n * S + sq, si = (n * H + h) * S + sq;
-    if (sq > 0 && off(lcf(sq))) {  // padding query
+    const int nd = HD > 0 ? HD : hd, qo = h * hd, cnt = tk.count(n);
+    const int si = (n * H + h) * S + sq;
+    if (sq >= cnt) {  // a slot past the atom's tokens: no row
+      if (save) ml(si, 0) = kOff, ml(si, 1) = Net(0);
+      return;
+    }
+    const int row_q = tk.row(n, sq);
+    if (sq > 0 && off(lcf(sq))) {  // a query on an edge at its cutoff
       for (int d = 0; d < nd; ++d) merged(row_q, qo + d) = Net(0);
       if (save) ml(si, 0) = kOff, ml(si, 1) = Net(0);
       return;
@@ -216,7 +232,7 @@ struct Forward {
     load_row<HD>(q, &qkv(row_q, qo), nd);
     for (int d = 0; d < nd; ++d) acc[d] = Net(0);
     Net mx = kOff, l = Net(0);
-    for (int k = 0; k < S; ++k) {
+    for (int k = 0; k < cnt; ++k) {
       const Net lc = lcf(k);
       if (off(lc)) continue;
       const Net s = dot_row<HD>(K(k), q, nd) * sc + lc;
@@ -235,17 +251,17 @@ struct Forward {
     Net* sk = scratch(m, level, bytes);
     Net* sv = sk + S * nd;
     Net* slc = sv + S * nd;
-    stage<HD>(m, sk, qkv, n, S, D + h * hd, nd);
-    stage<HD>(m, sv, qkv, n, S, 2 * D + h * hd, nd);
+    stage<HD>(m, sk, qkv, tk, n, S, D + h * hd, nd);
+    stage<HD>(m, sv, qkv, tk, n, S, 2 * D + h * hd, nd);
     stage_log_cf(m, slc, cf_seq, n, S);
     m.team_barrier();
     Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S), [&](int sq) {
-      token(n, h, sq, Rows{sk, std::size_t(nd)}, Rows{sv, std::size_t(nd)}, LogCf{slc, nullptr});
+      token(n, h, sq, staged(sk, nd), staged(sv, nd), LogCf{slc, nullptr});
     });
   }
   KOKKOS_INLINE_FUNCTION void operator()(int i) const {
     const int sq = i % S, h = (i / S) % H, n = i / (S * H), D = H * hd;
-    token(n, h, sq, rows(qkv, n * S, D + h * hd), rows(qkv, n * S, 2 * D + h * hd), LogCf{nullptr, &cf_seq(n, 0)});
+    token(n, h, sq, rows(qkv, tk, n, D + h * hd), rows(qkv, tk, n, 2 * D + h * hd), LogCf{nullptr, &cf_seq(n, 0)});
   }
 };
 
@@ -279,18 +295,27 @@ __device__ inline float sum16(float x) {
   return x + __shfl_xor(x, 32);
 }
 
-// A head's slice of S rows of a row-major array, rows past S reading zero.
+// A block's atom: its token count and each slot's row (Tokens).
+struct Atom {
+  const int* off;
+  int N, n, cnt;
+  __device__ Atom(const int* o, int N_, int n_) : off(o), N(N_), n(n_), cnt(o[n_ + 1] - o[n_] + 1) {}
+  __device__ size_t row(int s) const { return s == 0 ? size_t(n) : size_t(N + off[n] + s - 1); }
+};
+// A head's slice of an atom's tokens in a row-major token matrix, the slots
+// past its tokens reading zero.
 struct Slice {
   const float* p;
-  int ld, S;
-  __device__ float at(int r, int d) const { return r < S ? p[(size_t) r * ld + d] : 0.0f; }
+  int ld;
+  Atom a;
+  __device__ float at(int r, int d) const { return r < a.cnt ? p[a.row(r) * ld + d] : 0.0f; }
   template <int W>
   __device__ void chunk(int r, int d0, float* out) const {
-    if (r >= S) {
+    if (r >= a.cnt) {
       for (int j = 0; j < W; ++j) out[j] = 0.0f;
       return;
     }
-    const float* q = p + (size_t) r * ld + d0;
+    const float* q = p + a.row(r) * ld + d0;
     for (int j = 0; j < W; j += 4) {
       const float4 x = *reinterpret_cast<const float4*>(q + j);
       out[j] = x.x, out[j + 1] = x.y, out[j + 2] = x.z, out[j + 3] = x.w;
@@ -307,12 +332,13 @@ __device__ inline float log_cf(const float* cf, int j, int S) {
 // key blocks stream past once, with a running max and sum per query (online
 // softmax) -- each key and value row is read once per (atom, head).
 template <int HD, int NB>
-__global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const float* cf_seq, int ldc, float* merged,
-                                              int ldm, float* ml, int S, int H, float sc, int save) {
+__global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const int* off, int N, const float* cf_seq,
+                                              int ldc, float* merged, int ldm, float* ml, int S, int H, float sc,
+                                              int save) {
   constexpr int W = HD / 4, DT = HD / 16;
   const int n = blockIdx.x / H, h = blockIdx.x % H, l = threadIdx.x, c = l % 16, g = l / 16, D = H * HD;
-  const float* rows = qkv + (size_t) n * S * ldq;
-  const Slice Q{rows + h * HD, ldq, S}, K{rows + D + h * HD, ldq, S}, V{rows + 2 * D + h * HD, ldq, S};
+  const Atom at(off, N, n);
+  const Slice Q{qkv + h * HD, ldq, at}, K{qkv + D + h * HD, ldq, at}, V{qkv + 2 * D + h * HD, ldq, at};
   const float* cf = cf_seq + (size_t) n * ldc;
   float q[NB][W], mx[NB], sum[NB];
   f4 acc[NB][DT];
@@ -352,9 +378,13 @@ __global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const f
     const int i = 16 * I + c;
     const float tot = sum16(sum[I]);
     if (i >= S) continue;
-    const bool live = i == 0 || cf[i] > 0.0f;  // else a padding query: zero out
+    if (i >= at.cnt) {  // a slot past the atom's tokens: no row
+      if (save && g == 0) ml[2 * ((size_t) (n * H + h) * S + i)] = -1e30f, ml[2 * ((size_t) (n * H + h) * S + i) + 1] = 0.0f;
+      continue;
+    }
+    const bool live = i == 0 || cf[i] > 0.0f;  // else an edge at its cutoff: zero out
     const float invl = live && tot > 0.0f ? 1.0f / tot : 0.0f;
-    float* o = merged + (size_t) (n * S + i) * ldm + h * HD;
+    float* o = merged + at.row(i) * ldm + h * HD;
     for (int t = 0; t < DT; ++t)  // acc[I][t][r]: query i, dim 16t + 4g + r
       *reinterpret_cast<float4*>(o + 16 * t + 4 * g) =
           make_float4(acc[I][t][0] * invl, acc[I][t][1] * invl, acc[I][t][2] * invl, acc[I][t][3] * invl);
@@ -372,15 +402,15 @@ __global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const f
 //   keys (lane c a key, all key blocks held, query blocks streamed): S and dP,
 //     dK^T += Q^T dS, dV^T += dO^T A, and the key's dS summed over queries.
 template <int HD, int NB>
-__global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const float* dmerged, const float* merged,
-                                               int ldm, const float* ml, const float* cf_seq, int ldc, float* qkv_adj,
-                                               int lda, float* cfh, int S, int H, float sc) {
+__global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const int* off, int N, const float* dmerged,
+                                               const float* merged, int ldm, const float* ml, const float* cf_seq,
+                                               int ldc, float* qkv_adj, int lda, float* cfh, int S, int H, float sc) {
   constexpr int W = HD / 4, DT = HD / 16;
   __shared__ float s_m[16 * NB], s_l[16 * NB], s_dq[16 * NB], s_lc[16 * NB];
   const int n = blockIdx.x / H, h = blockIdx.x % H, l = threadIdx.x, c = l % 16, g = l / 16, D = H * HD;
-  const float* rows = qkv + (size_t) n * S * ldq;
-  const Slice Q{rows + h * HD, ldq, S}, K{rows + D + h * HD, ldq, S}, V{rows + 2 * D + h * HD, ldq, S};
-  const Slice G{dmerged + (size_t) n * S * ldm + h * HD, ldm, S}, O{merged + (size_t) n * S * ldm + h * HD, ldm, S};
+  const Atom at(off, N, n);
+  const Slice Q{qkv + h * HD, ldq, at}, K{qkv + D + h * HD, ldq, at}, V{qkv + 2 * D + h * HD, ldq, at};
+  const Slice G{dmerged + h * HD, ldm, at}, O{merged + h * HD, ldm, at};
   const float* cf = cf_seq + (size_t) n * ldc;
   const float* mls = ml + 2 * (size_t) (n * H + h) * S;
 
@@ -423,8 +453,8 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
     }
     for (int I = 0; I < NB; ++I) {
       const int i = 16 * I + c;
-      if (i >= S) continue;
-      float* o = qkv_adj + (size_t) (n * S + i) * lda + h * HD;
+      if (i >= at.cnt) continue;
+      float* o = qkv_adj + at.row(i) * lda + h * HD;
       for (int t = 0; t < DT; ++t)
         *reinterpret_cast<float4*>(o + 16 * t + 4 * g) =
             make_float4(acc[I][t][0] * sc, acc[I][t][1] * sc, acc[I][t][2] * sc, acc[I][t][3] * sc);
@@ -468,7 +498,11 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
       const int j = 16 * J + c;
       const float cft = sum16(cfa[J]);
       if (j >= S) continue;
-      float* o = qkv_adj + (size_t) (n * S + j) * lda + D + h * HD;
+      if (j >= at.cnt) {  // no row; its cf share is zero
+        if (g == 0) cfh[(size_t) (n * S + j) * H + h] = 0.0f;
+        continue;
+      }
+      float* o = qkv_adj + at.row(j) * lda + D + h * HD;
       for (int t = 0; t < DT; ++t) {  // dk[J][t][r]: key j, dim 16t + 4g + r
         *reinterpret_cast<float4*>(o + 16 * t + 4 * g) =
             make_float4(dk[J][t][0] * sc, dk[J][t][1] * sc, dk[J][t][2] * sc, dk[J][t][3] * sc);
@@ -553,14 +587,21 @@ __device__ inline float quad_sum(float x) {
 // different banks.
 template <int HD>
 constexpr int pitch = HD + 4;
-// Rows [0, R) of a head's slice at column col of a row-major array into dst,
-// rounded to TF32, rows past S zero.
+// A block's atom: its token count and each slot's row (Tokens).
+struct Atom {
+  const int* off;
+  int N, n, cnt;
+  __device__ Atom(const int* o, int N_, int n_) : off(o), N(N_), n(n_), cnt(o[n_ + 1] - o[n_] + 1) {}
+  __device__ size_t row(int s) const { return s == 0 ? size_t(n) : size_t(N + off[n] + s - 1); }
+};
+// Slots [0, R) of a head's slice at column col of a row-major token matrix into
+// dst, rounded to TF32, slots past the atom's tokens zero.
 template <int HD>
-__device__ void stage(float* dst, const float* src, int ld, int col, int S, int R) {
+__device__ void stage(float* dst, const float* src, int ld, int col, const Atom& at, int R) {
   for (int i = threadIdx.x; i < R * (HD / 4); i += blockDim.x) {
     const int r = i / (HD / 4), c = (i % (HD / 4)) * 4;
     float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
-    if (r < S) x = *reinterpret_cast<const float4*>(src + (size_t) r * ld + col + c);
+    if (r < at.cnt) x = *reinterpret_cast<const float4*>(src + at.row(r) * ld + col + c);
     *reinterpret_cast<float4*>(dst + r * pitch<HD> + c) = make_float4(tf32(x.x), tf32(x.y), tf32(x.z), tf32(x.w));
   }
 }
@@ -570,8 +611,9 @@ __device__ inline float log_cf(const float* cf, int j, int S) {
   return c > 0.0f ? __logf(c) : -1e30f;
 }
 
-// Shared memory, in floats: two head slices of rows (K and V; in the
-// backward's keys pass, Q and dO in their place) and per-token values.
+// Shared memory, in floats, for S slots: two head slices of rows (K and V; in
+// the backward's keys pass, Q and dO in their place) and per-token values. A
+// block uses what its atom's tokens need.
 template <int HD>
 std::size_t forward_floats(int S) { return std::size_t((S + 15) / 16 * 16) * (2 * pitch<HD> + 1); }
 template <int HD>
@@ -580,27 +622,32 @@ std::size_t backward_floats(int S) { return std::size_t((S + 15) / 16 * 16) * (2
 // The forward, online softmax over blocks of 8 keys. Warp w: queries 16w + g
 // (row 0 of its C tiles) and 16w + g + 8 (row 1).
 template <int HD>
-__global__ void forward(const float* qkv, int ldq, const float* cf_seq, int ldc, float* merged, int ldm, float* ml,
-                        int ldml, int S, int H, float sc) {
+__global__ void forward(const float* qkv, int ldq, const int* off, int N, const float* cf_seq, int ldc, float* merged,
+                        int ldm, float* ml, int ldml, int S, int H, float sc) {
   constexpr int P = pitch<HD>, DK = HD / 8;
   extern __shared__ float smem[];
-  const int R = (S + 15) / 16 * 16;
-  float *sk = smem, *sv = sk + R * P, *slc = sv + R * P;
   const int n = blockIdx.x / H, h = blockIdx.x % H, D = H * HD;
-  const float* rows = qkv + (size_t) n * S * ldq;
+  const Atom at(off, N, n);
+  const int R = (at.cnt + 15) / 16 * 16;
+  float *sk = smem, *sv = sk + R * P, *slc = sv + R * P;
   const float* cf = cf_seq + (size_t) n * ldc;
-  stage<HD>(sk, rows, ldq, D + h * HD, S, R);
-  stage<HD>(sv, rows, ldq, 2 * D + h * HD, S, R);
-  for (int r = threadIdx.x; r < R; r += blockDim.x) slc[r] = log_cf(cf, r, S);
+  stage<HD>(sk, qkv, ldq, D + h * HD, at, R);
+  stage<HD>(sv, qkv, ldq, 2 * D + h * HD, at, R);
+  for (int r = threadIdx.x; r < R; r += blockDim.x) slc[r] = log_cf(cf, r, at.cnt);
+  for (int q = at.cnt + threadIdx.x; ml && q < S; q += blockDim.x) {  // the slots past its tokens
+    float* m = ml + (size_t) ((n * H + h) * S + q) * ldml;
+    m[0] = -1e30f, m[1] = 0.0f;
+  }
   const int w = threadIdx.x / 32, l = threadIdx.x % 32, g = l / 4, t = l % 4;
   const int qr[2] = {16 * w + g, 16 * w + g + 8};
   float qa[DK][4];
   for (int c = 0; c < DK; ++c)
     for (int j = 0; j < 4; ++j) {
       const int q = qr[j % 2], d = 8 * c + t + 4 * (j / 2);
-      qa[c][j] = q < S ? tf32(rows[(size_t) q * ldq + h * HD + d]) : 0.0f;
+      qa[c][j] = q < at.cnt ? tf32(qkv[at.row(q) * ldq + h * HD + d]) : 0.0f;
     }
   __syncthreads();
+  if (16 * w >= at.cnt) return;  // a warp past the atom's tokens
   float acc[DK][4], mx[2] = {-1e30f, -1e30f}, sum[2] = {0.0f, 0.0f};
   for (int c = 0; c < DK; ++c)
     for (int j = 0; j < 4; ++j) acc[c][j] = 0.0f;
@@ -628,10 +675,10 @@ __global__ void forward(const float* qkv, int ldq, const float* cf_seq, int ldc,
   for (int i = 0; i < 2; ++i) {
     const int q = qr[i];
     const float tot = quad_sum(sum[i]);
-    if (q >= S) continue;
-    const bool live = q == 0 || cf[q] > 0.0f;  // else a padding query: zero out
+    if (q >= at.cnt) continue;
+    const bool live = q == 0 || cf[q] > 0.0f;  // else an edge at its cutoff: zero out
     const float invl = live && tot > 0.0f ? 1.0f / tot : 0.0f;
-    float* o = merged + (size_t) (n * S + q) * ldm + h * HD;
+    float* o = merged + at.row(q) * ldm + h * HD;
     for (int c = 0; c < DK; ++c)  // acc[c][2i + j]: query q, dim 8c + 2t + j
       *reinterpret_cast<float2*>(o + 8 * c + 2 * t) = make_float2(acc[c][2 * i] * invl, acc[c][2 * i + 1] * invl);
     if (ml && t == 0) {
@@ -650,24 +697,24 @@ __global__ void forward(const float* qkv, int ldq, const float* cf_seq, int ldc,
 // warp's own fragments, so one buffer holds K and V, then Q and dO: two blocks
 // fit an SM where four slices would leave one.
 template <int HD>
-__global__ void backward(const float* qkv, int ldq, const float* dmerged, const float* merged, int ldm, const float* ml,
-                         int ldml, const float* cf_seq, int ldc, float* qkv_adj, int lda, float* cfh, int S, int H,
-                         float sc) {
+__global__ void backward(const float* qkv, int ldq, const int* off, int N, const float* dmerged, const float* merged,
+                         int ldm, const float* ml, int ldml, const float* cf_seq, int ldc, float* qkv_adj, int lda,
+                         float* cfh, int S, int H, float sc) {
   constexpr int P = pitch<HD>, DK = HD / 8;
   extern __shared__ float smem[];
-  const int R = (S + 15) / 16 * 16;
+  const int n = blockIdx.x / H, h = blockIdx.x % H, D = H * HD;
+  const Atom at(off, N, n);
+  const int R = (at.cnt + 15) / 16 * 16;
   float *sk = smem, *sv = sk + R * P, *sq = sk, *sg = sv;  // K, V, then Q, dO
   float *sm = sv + R * P, *sl = sm + R, *sd = sl + R, *slc = sd + R;
-  const int n = blockIdx.x / H, h = blockIdx.x % H, D = H * HD;
-  const float* rows = qkv + (size_t) n * S * ldq;
-  const float* go = dmerged + (size_t) n * S * ldm;
   const float* cf = cf_seq + (size_t) n * ldc;
-  stage<HD>(sk, rows, ldq, D + h * HD, S, R);
-  stage<HD>(sv, rows, ldq, 2 * D + h * HD, S, R);
+  stage<HD>(sk, qkv, ldq, D + h * HD, at, R);
+  stage<HD>(sv, qkv, ldq, 2 * D + h * HD, at, R);
+  for (int q = at.cnt + threadIdx.x; q < S; q += blockDim.x) cfh[(size_t) (n * S + q) * H + h] = 0.0f;
   for (int r = threadIdx.x; r < R; r += blockDim.x) {
     float dq = 0.0f, m = -1e30f, li = 0.0f;
-    if (r < S) {  // Dq in fp32, from the unrounded rows
-      const float *a = go + (size_t) r * ldm + h * HD, *b = merged + (size_t) (n * S + r) * ldm + h * HD;
+    if (r < at.cnt) {  // Dq in fp32, from the unrounded rows
+      const float *a = dmerged + at.row(r) * ldm + h * HD, *b = merged + at.row(r) * ldm + h * HD;
       for (int d = 0; d < HD; d += 4) {
         const float4 x = *reinterpret_cast<const float4*>(a + d), y = *reinterpret_cast<const float4*>(b + d);
         dq += x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w;
@@ -675,11 +722,12 @@ __global__ void backward(const float* qkv, int ldq, const float* dmerged, const 
       const float* mm = ml + (size_t) ((n * H + h) * S + r) * ldml;
       m = mm[0], li = mm[1];
     }
-    sd[r] = dq, sm[r] = m, sl[r] = li, slc[r] = log_cf(cf, r, S);
+    sd[r] = dq, sm[r] = m, sl[r] = li, slc[r] = log_cf(cf, r, at.cnt);
   }
   __syncthreads();
   const int w = threadIdx.x / 32, l = threadIdx.x % 32, g = l / 4, t = l % 4;
   const int r0 = 16 * w + g, rr[2] = {r0, r0 + 8};
+  const bool busy = 16 * w < at.cnt;  // else a warp past the atom's tokens, there for the barriers
   // A fragments of rows r0, r0 + 8: of a staged slice, or from global memory.
   auto frags = [&](const float* x, float (&f)[DK][4]) {
     for (int c = 0; c < DK; ++c)
@@ -689,14 +737,14 @@ __global__ void backward(const float* qkv, int ldq, const float* dmerged, const 
     for (int c = 0; c < DK; ++c)
       for (int j = 0; j < 4; ++j) {
         const int r = rr[j % 2];
-        f[c][j] = r < S ? tf32(x[(size_t) r * ld + 8 * c + t + 4 * (j / 2)]) : 0.0f;
+        f[c][j] = r < at.cnt ? tf32(x[at.row(r) * ld + 8 * c + t + 4 * (j / 2)]) : 0.0f;
       }
   };
   float ka[DK][4], va[DK][4];  // the keys pass's own rows, taken before Q and dO replace them
 
-  {  // Queries.
+  if (busy) {  // Queries.
     float qa[DK][4], ga[DK][4], dq[DK][4];
-    global_frags(rows + h * HD, ldq, qa), global_frags(go + h * HD, ldm, ga);
+    global_frags(qkv + h * HD, ldq, qa), global_frags(dmerged + h * HD, ldm, ga);
     for (int c = 0; c < DK; ++c)
       for (int j = 0; j < 4; ++j) dq[c][j] = 0.0f;
     const float mi[2] = {sm[rr[0]], sm[rr[1]]}, li[2] = {sl[rr[0]], sl[rr[1]]}, di[2] = {sd[rr[0]], sd[rr[1]]};
@@ -718,19 +766,19 @@ __global__ void backward(const float* qkv, int ldq, const float* dmerged, const 
         mma(dq[c], ds[0], ds[2], ds[1], ds[3], sk[k0 * P + 8 * c + g], sk[(k0 + 1) * P + 8 * c + g]);
     }
     for (int i = 0; i < 2; ++i) {
-      if (rr[i] >= S) continue;
-      float* o = qkv_adj + (size_t) (n * S + rr[i]) * lda + h * HD;
+      if (rr[i] >= at.cnt) continue;
+      float* o = qkv_adj + at.row(rr[i]) * lda + h * HD;
       for (int c = 0; c < DK; ++c)
         *reinterpret_cast<float2*>(o + 8 * c + 2 * t) = make_float2(dq[c][2 * i] * sc, dq[c][2 * i + 1] * sc);
     }
   }
-  frags(sk, ka), frags(sv, va);
+  if (busy) frags(sk, ka), frags(sv, va);
   __syncthreads();
-  stage<HD>(sq, rows, ldq, h * HD, S, R);
-  stage<HD>(sg, go, ldm, h * HD, S, R);
+  stage<HD>(sq, qkv, ldq, h * HD, at, R);
+  stage<HD>(sg, dmerged, ldm, h * HD, at, R);
   __syncthreads();
 
-  {  // Keys.
+  if (busy) {  // Keys.
     float dk[DK][4], dv[DK][4];
     for (int c = 0; c < DK; ++c)
       for (int j = 0; j < 4; ++j) dk[c][j] = dv[c][j] = 0.0f;
@@ -758,8 +806,8 @@ __global__ void backward(const float* qkv, int ldq, const float* dmerged, const 
     }
     for (int i = 0; i < 2; ++i) {
       const float cft = quad_sum(cfa[i]);
-      if (rr[i] >= S) continue;
-      float* o = qkv_adj + (size_t) (n * S + rr[i]) * lda + D + h * HD;
+      if (rr[i] >= at.cnt) continue;
+      float* o = qkv_adj + at.row(rr[i]) * lda + D + h * HD;
       for (int c = 0; c < DK; ++c) {
         *reinterpret_cast<float2*>(o + 8 * c + 2 * t) = make_float2(dk[c][2 * i] * sc, dk[c][2 * i + 1] * sc);
         *reinterpret_cast<float2*>(o + D + 8 * c + 2 * t) = make_float2(dv[c][2 * i], dv[c][2 * i + 1]);
@@ -796,41 +844,56 @@ void run(const char* name, K kernel, int blocks, int threads, std::size_t bytes,
 }  // namespace tc
 #endif
 
+// A capacity's dead edge rows of x (Tokens): no atom's, so no kernel above
+// writes them; zero, so what reads every row reads numbers.
+void zero_dead(View2D x, const Tokens& tk) {
+  if (!tk.dead) return;
+  const int N = tk.N, W = x.extent(1), E = x.extent(0) - N;
+  auto off = tk.off;
+  Kokkos::parallel_for(
+      "attn_dead", RangePolicy(0, E * W), KOKKOS_LAMBDA(int i) {
+        if (i / W >= off(N)) x(N + i / W, i % W) = Net(0);
+      });
+}
+
 template <int HD>
 void attention_impl(Workspace& ws, const std::string& key, View2D out, View2D qkv, View2D cf_seq,
-                    const WeightRef& w_out, View1D b_out, int N, int S, int H, int hd,
+                    const WeightRef& w_out, View1D b_out, const Tokens& tk, int S, int H, int hd,
                     double temperature, bool save) {
-  const int D = H * hd;
+  const int D = H * hd, N = tk.N, T = qkv.extent(0);
   const Net sc = Net(1.0 / (Kokkos::sqrt((double) hd) * temperature));
   Workspace::Scope scope(ws);
-  View2D merged = save ? ws.n2(key + ":merged", N * S, D) : ws.tmp(N * S, D);
+  View2D merged = save ? ws.n2(key + ":merged", T, D) : ws.tmp(T, D);
   View2D ml = save ? ws.n2(key + ":ml", N * H * S, 2) : View2D();
+  auto finish = [&] {
+    zero_dead(merged, tk);
+    linear(out, merged, w_out, b_out);
+  };
 #if defined(PET_MFMA)
   if constexpr (HD > 0 && HD % 16 == 0)
     if (mfma::with_blocks<HD>(S, [&](auto nb) {
           mfma::run("attention", [&](hipStream_t st) {
             hipLaunchKernelGGL((mfma::forward<HD, decltype(nb)::value>), dim3(N * H), dim3(64), 0, st, qkv.data(),
-                               int(qkv.stride(0)), cf_seq.data(), int(cf_seq.stride(0)), merged.data(),
-                               int(merged.stride(0)), save ? ml.data() : nullptr, S, H, float(sc), int(save));
+                               int(qkv.stride(0)), tk.off.data(), N, cf_seq.data(), int(cf_seq.stride(0)),
+                               merged.data(), int(merged.stride(0)), save ? ml.data() : nullptr, S, H, float(sc),
+                               int(save));
           });
-        })) {
-      linear(out, merged, w_out, b_out);
-      return;
-    }
+        }))
+      return finish();
 #endif
 #if defined(PET_TC)
   if constexpr (HD > 0 && HD % 8 == 0)
     if (tc::usable(tc::forward_floats<HD>(S))) {
       tc::run("attention", tc::forward<HD>, N * H, (S + 15) / 16 * 32, sizeof(float) * tc::forward_floats<HD>(S),
-              (const float*) qkv.data(), int(qkv.stride(0)), (const float*) cf_seq.data(), int(cf_seq.stride(0)),
-              merged.data(), int(merged.stride(0)), save ? ml.data() : nullptr, save ? int(ml.stride(0)) : 0, S, H,
-              float(sc));
-      linear(out, merged, w_out, b_out);
-      return;
+              (const float*) qkv.data(), int(qkv.stride(0)), (const int*) tk.off.data(), N,
+              (const float*) cf_seq.data(), int(cf_seq.stride(0)), merged.data(), int(merged.stride(0)),
+              save ? ml.data() : nullptr, save ? int(ml.stride(0)) : 0, S, H, float(sc));
+      return finish();
     }
 #endif
-  launch("attention", Forward<HD>{qkv, cf_seq, merged, ml, S, H, hd, sc, save}, N, H, S, 2 * std::size_t(S) * hd + S);
-  linear(out, merged, w_out, b_out);
+  launch("attention", Forward<HD>{qkv, cf_seq, merged, ml, tk, S, H, hd, sc, save}, N, H, S,
+         2 * std::size_t(S) * hd + S);
+  finish();
 }
 
 // The backward, as the forward runs: nothing S x S is ever stored. With
@@ -846,6 +909,7 @@ void attention_impl(Workspace& ws, const std::string& key, View2D out, View2D qk
 template <int HD>
 struct Queries {
   View2D qkv, dmerged, merged, ml, dq_out, cf_seq, qkv_adj;
+  Tokens tk;
   int S, H, hd;
   Net sc;
   int level = 0;
@@ -853,8 +917,10 @@ struct Queries {
 
   KOKKOS_INLINE_FUNCTION void token(int n, int h, int sq, Rows K, Rows V, LogCf lcf) const {
     constexpr int CAP = HD > 0 ? HD : kMaxHeadDim;
-    const int nd = HD > 0 ? HD : hd, qo = h * hd;
-    const int row_q = n * S + sq, si = (n * H + h) * S + sq;
+    const int nd = HD > 0 ? HD : hd, qo = h * hd, cnt = tk.count(n);
+    const int si = (n * H + h) * S + sq;
+    if (sq >= cnt) return (void) (dq_out(si, 0) = Net(0));  // no row
+    const int row_q = tk.row(n, sq);
     const Net m = ml(si, 0), invl = ml(si, 1);
     Net q[CAP], dout[CAP], dq[CAP];
     load_row<HD>(q, &qkv(row_q, qo), nd);
@@ -862,8 +928,8 @@ struct Queries {
     const Net Dq = dot_row<HD>(&merged(row_q, qo), dout, nd);
     for (int d = 0; d < nd; ++d) dq[d] = Net(0);
     dq_out(si, 0) = Dq;
-    if (invl > Net(0))  // else a padding query: no weights, no adjoints
-      for (int k = 0; k < S; ++k) {
+    if (invl > Net(0))  // else a query on an edge at its cutoff: no weights, no adjoints
+      for (int k = 0; k < cnt; ++k) {
         const Net lc = lcf(k);
         if (off(lc)) continue;  // padding key
         const Net a = fast_exp(dot_row<HD>(K(k), q, nd) * sc + lc - m) * invl;
@@ -877,17 +943,17 @@ struct Queries {
     Net* sk = scratch(m, level, bytes);
     Net* sv = sk + S * nd;
     Net* slc = sv + S * nd;
-    stage<HD>(m, sk, qkv, n, S, D + h * hd, nd);
-    stage<HD>(m, sv, qkv, n, S, 2 * D + h * hd, nd);
+    stage<HD>(m, sk, qkv, tk, n, S, D + h * hd, nd);
+    stage<HD>(m, sv, qkv, tk, n, S, 2 * D + h * hd, nd);
     stage_log_cf(m, slc, cf_seq, n, S);
     m.team_barrier();
     Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S), [&](int sq) {
-      token(n, h, sq, Rows{sk, std::size_t(nd)}, Rows{sv, std::size_t(nd)}, LogCf{slc, nullptr});
+      token(n, h, sq, staged(sk, nd), staged(sv, nd), LogCf{slc, nullptr});
     });
   }
   KOKKOS_INLINE_FUNCTION void operator()(int i) const {
     const int sq = i % S, h = (i / S) % H, n = i / (S * H), D = H * hd;
-    token(n, h, sq, rows(qkv, n * S, D + h * hd), rows(qkv, n * S, 2 * D + h * hd), LogCf{nullptr, &cf_seq(n, 0)});
+    token(n, h, sq, rows(qkv, tk, n, D + h * hd), rows(qkv, tk, n, 2 * D + h * hd), LogCf{nullptr, &cf_seq(n, 0)});
   }
 };
 
@@ -896,6 +962,7 @@ struct Queries {
 template <int HD, bool DK, bool DV>
 struct Keys {
   View2D qkv, dmerged, ml, dq_out, cf_seq, qkv_adj, cfh;
+  Tokens tk;
   int S, H, hd;
   Net sc;
   int level = 0;
@@ -908,8 +975,12 @@ struct Keys {
   };
   KOKKOS_INLINE_FUNCTION void token(int n, int h, int sk, Rows Q, Rows G, Stats st) const {
     constexpr int CAP = HD > 0 ? HD : kMaxHeadDim;
-    const int nd = HD > 0 ? HD : hd, D = H * hd, ko = D + h * hd, vo = 2 * D + h * hd;
-    const int row_k = n * S + sk;
+    const int nd = HD > 0 ? HD : hd, D = H * hd, ko = D + h * hd, vo = 2 * D + h * hd, cnt = tk.count(n);
+    if (sk >= cnt) {  // no row; its cf share is zero
+      if constexpr (DK) cfh(n * S + sk, h) = Net(0);
+      return;
+    }
+    const int row_k = tk.row(n, sk);
     Net k[CAP], v[DK ? CAP : 1], dk[DK ? CAP : 1], dv[DV ? CAP : 1];
     Net cf_acc = Net(0);
     for (int d = 0; d < nd; ++d) {
@@ -921,7 +992,7 @@ struct Keys {
       const Net lcf = fast_log(cf);
       load_row<HD>(k, &qkv(row_k, ko), nd);
       if constexpr (DK) load_row<HD>(v, &qkv(row_k, vo), nd);
-      for (int q = 0; q < S; ++q) {
+      for (int q = 0; q < cnt; ++q) {
         const Net invl = st.l[q * st.sm];
         if (invl <= Net(0)) continue;  // padding query
         const Net a = fast_exp(dot_row<HD>(Q(q), k, nd) * sc + lcf - st.m[q * st.sm]) * invl;
@@ -937,7 +1008,7 @@ struct Keys {
       if constexpr (DK) qkv_adj(row_k, ko + d) = dk[d];
       if constexpr (DV) qkv_adj(row_k, vo + d) = dv[d];
     }
-    if constexpr (DK) cfh(row_k, h) = cf_acc;
+    if constexpr (DK) cfh(n * S + sk, h) = cf_acc;
   }
   KOKKOS_INLINE_FUNCTION void operator()(const Member& m) const {
     const int n = m.league_rank() / H, h = m.league_rank() % H, nd = HD > 0 ? HD : hd;
@@ -946,20 +1017,20 @@ struct Keys {
     Net* sm = sg + S * nd;
     Net* sl = sm + S;
     Net* sd = sl + S;
-    stage<HD>(m, sq_, qkv, n, S, h * hd, nd);
-    stage<HD>(m, sg, dmerged, n, S, h * hd, nd);
+    stage<HD>(m, sq_, qkv, tk, n, S, h * hd, nd);
+    stage<HD>(m, sg, dmerged, tk, n, S, h * hd, nd);
     Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S), [&](int r) {
       const int si = (n * H + h) * S + r;
       sm[r] = ml(si, 0), sl[r] = ml(si, 1), sd[r] = dq_out(si, 0);
     });
     m.team_barrier();
     Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S), [&](int sk) {
-      token(n, h, sk, Rows{sq_, std::size_t(nd)}, Rows{sg, std::size_t(nd)}, Stats{sm, sl, sd, 1, 1});
+      token(n, h, sk, staged(sq_, nd), staged(sg, nd), Stats{sm, sl, sd, 1, 1});
     });
   }
   KOKKOS_INLINE_FUNCTION void operator()(int i) const {
     const int sk = i % S, h = (i / S) % H, n = i / (S * H), b = (n * H + h) * S;
-    token(n, h, sk, rows(qkv, n * S, h * hd), rows(dmerged, n * S, h * hd),
+    token(n, h, sk, rows(qkv, tk, n, h * hd), rows(dmerged, tk, n, h * hd),
           Stats{&ml(b, 0), &ml(b, 1), &dq_out(b, 0), ml.stride(0), dq_out.stride(0)});
   }
 };
@@ -988,6 +1059,7 @@ std::size_t shared_per_sm() {
 template <int HD>
 struct Pairs {
   View2D qkv, dmerged, merged, ml, cf_seq, qkv_adj, cfh;
+  Tokens tk;
   int S, H, hd;
   Net sc;
   int level = 0;
@@ -1009,12 +1081,16 @@ struct Pairs {
     Net* sm = slc + S;
     Net* sl = sm + S;
     Net* sd = sl + S;
-    const int row0 = n * S;
-    // The four rows' slices together, so a thread has all its loads in flight.
+    const int cnt = tk.count(n);
+    // The four rows' slices together, so a thread has all its loads in flight;
+    // the slots past the atom's tokens zero.
     Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S * (nd / 4)), [&](int t) {
-      const int r = t / (nd / 4), c = (t % (nd / 4)) * 4, o = r * P + c;
-      const Net4 q = ld4(&qkv(row0 + r, h * hd + c)), k = ld4(&qkv(row0 + r, D + h * hd + c));
-      const Net4 v = ld4(&qkv(row0 + r, 2 * D + h * hd + c)), g = ld4(&dmerged(row0 + r, h * hd + c));
+      const int r = t / (nd / 4), c = (t % (nd / 4)) * 4, o = r * P + c, row = r < cnt ? tk.row(n, r) : 0;
+      Net4 q{}, k{}, v{}, g{};
+      if (r < cnt) {
+        q = ld4(&qkv(row, h * hd + c)), k = ld4(&qkv(row, D + h * hd + c));
+        v = ld4(&qkv(row, 2 * D + h * hd + c)), g = ld4(&dmerged(row, h * hd + c));
+      }
       *reinterpret_cast<Net4*>(sq_ + o) = q, *reinterpret_cast<Net4*>(sk + o) = k;
       *reinterpret_cast<Net4*>(sv + o) = v, *reinterpret_cast<Net4*>(sg + o) = g;
     });
@@ -1024,8 +1100,9 @@ struct Pairs {
       slc[r] = cf > Net(0) ? fast_log(cf) : kOff;
       sm[r] = ml(si, 0), sl[r] = ml(si, 1);
       Net dq = Net(0);  // Dq = dO.out, from global memory
-      for (int d = 0; d < nd; d += 4) {
-        const Net4 g = ld4(&dmerged(row0 + r, h * hd + d)), o = ld4(&merged(row0 + r, h * hd + d));
+      for (int d = 0; d < (r < cnt ? nd : 0); d += 4) {
+        const int row = tk.row(n, r);
+        const Net4 g = ld4(&dmerged(row, h * hd + d)), o = ld4(&merged(row, h * hd + d));
         dq += g.v[0] * o.v[0] + g.v[1] * o.v[1] + g.v[2] * o.v[2] + g.v[3] * o.v[3];
       }
       sd[r] = dq;
@@ -1051,6 +1128,7 @@ struct Pairs {
     // dQ = sc dS K, dK = sc dS^T Q, dV = A^T dO: a thread per (token, four dims).
     Kokkos::parallel_for(Kokkos::TeamThreadRange(m, 3 * S * (nd / 4)), [&](int t) {
       const int which = t / (S * (nd / 4)), r = (t / (nd / 4)) % S, d = (t % (nd / 4)) * 4;
+      if (r >= cnt) return;
       // Row r of dS (which 0), or column r of dS or A, against the rows of K, Q or dO.
       const Net* w = which == 0 ? sds + r * S : which == 1 ? sds + r : sa + r;
       const int ws = which == 0 ? 1 : S;
@@ -1062,12 +1140,12 @@ struct Pairs {
         for (int i = 0; i < 4; ++i) acc[i] += c * y.v[i];
       }
       const Net f = which == 2 ? Net(1) : sc;
-      *reinterpret_cast<Net4*>(&qkv_adj(row0 + r, which * D + h * hd + d)) = {{acc[0] * f, acc[1] * f, acc[2] * f, acc[3] * f}};
+      *reinterpret_cast<Net4*>(&qkv_adj(tk.row(n, r), which * D + h * hd + d)) = {{acc[0] * f, acc[1] * f, acc[2] * f, acc[3] * f}};
     });
     Kokkos::parallel_for(Kokkos::TeamThreadRange(m, S), [&](int k) {
       Net acc = Net(0);
       for (int q = 0; q < S; ++q) acc += sds[q * S + k];
-      cfh(row0 + k, h) = acc;
+      cfh(n * S + k, h) = acc;
     });
   }
 };
@@ -1075,14 +1153,14 @@ struct Pairs {
 template <int HD>
 void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, View2D cf_seq_adj,
                         View2D out_adj, View2D qkv, View2D cf_seq, const WeightRef& w_in,
-                        const WeightRef& w_out, int N, int S, int H, int hd, double temperature,
+                        const WeightRef& w_out, const Tokens& tk, int S, int H, int hd, double temperature,
                         Net beta) {
-  const int D = H * hd;
+  const int D = H * hd, N = tk.N, T = qkv.extent(0);
   const Net sc = Net(1.0 / (Kokkos::sqrt((double) hd) * temperature));
   Workspace::Scope scope(ws);
-  View2D dmerged = ws.tmp(N * S, D);
+  View2D dmerged = ws.tmp(T, D);
   linear_bwd(dmerged, out_adj, w_out, 0);
-  View2D qkv_adj = ws.tmp(N * S, 3 * D);
+  View2D qkv_adj = ws.tmp(T, 3 * D);
   View2D cfh = ws.tmp(N * S, H);  // per key and head: the cf adjoint's share
   View2D dq_out = ws.tmp(N * H * S, 1);  // per query and head: dO.out
   View2D merged = ws.peek2(key + ":merged"), ml = ws.peek2(key + ":ml");
@@ -1097,6 +1175,7 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
           for (int h = 0; h < H; ++h) total += cfh(n * S + sk, h);
           cf_seq_adj(n, sk) += total / cf;
         });
+    zero_dead(qkv_adj, tk);
     linear_bwd(in_adj, qkv_adj, w_in, beta);
   };
 
@@ -1105,9 +1184,9 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
     if (mfma::with_blocks<HD>(S, [&](auto nb) {
           mfma::run("attn_bwd", [&](hipStream_t st) {
             hipLaunchKernelGGL((mfma::backward<HD, decltype(nb)::value>), dim3(N * H), dim3(64), 0, st, qkv.data(),
-                               int(qkv.stride(0)), dmerged.data(), merged.data(), int(merged.stride(0)), ml.data(),
-                               cf_seq.data(), int(cf_seq.stride(0)), qkv_adj.data(), int(qkv_adj.stride(0)),
-                               cfh.data(), S, H, float(sc));
+                               int(qkv.stride(0)), tk.off.data(), N, dmerged.data(), merged.data(),
+                               int(merged.stride(0)), ml.data(), cf_seq.data(), int(cf_seq.stride(0)), qkv_adj.data(),
+                               int(qkv_adj.stride(0)), cfh.data(), S, H, float(sc));
           });
         })) {
       cf_and_input_adjoint();
@@ -1118,8 +1197,9 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
   if constexpr (HD > 0 && HD % 8 == 0)
     if (tc::usable(tc::backward_floats<HD>(S))) {
       tc::run("attn_bwd", tc::backward<HD>, N * H, (S + 15) / 16 * 32, sizeof(float) * tc::backward_floats<HD>(S),
-              (const float*) qkv.data(), int(qkv.stride(0)), (const float*) dmerged.data(),
-              (const float*) merged.data(), int(merged.stride(0)), (const float*) ml.data(), int(ml.stride(0)),
+              (const float*) qkv.data(), int(qkv.stride(0)), (const int*) tk.off.data(), N,
+              (const float*) dmerged.data(), (const float*) merged.data(), int(merged.stride(0)),
+              (const float*) ml.data(), int(ml.stride(0)),
               (const float*) cf_seq.data(), int(cf_seq.stride(0)), qkv_adj.data(), int(qkv_adj.stride(0)),
               cfh.data(), S, H, float(sc));
       cf_and_input_adjoint();
@@ -1136,12 +1216,12 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
     const std::size_t pb = sizeof(Net) * Pairs<HD>::values(S, hd) + 16;
     if (hd % 4 == 0 && pb <= std::size_t(AttnPolicy::scratch_size_max(0)) && (2 * (pb + 1024) <= sm_bytes || hd >= 48)) {
       Kokkos::parallel_for("attn_bwd", AttnPolicy(N * H, kPairThreads).set_scratch_size(0, Kokkos::PerTeam(pb)),
-                           Pairs<HD>{qkv, dmerged, merged, ml, cf_seq, qkv_adj, cfh, S, H, hd, sc, 0, pb});
+                           Pairs<HD>{qkv, dmerged, merged, ml, cf_seq, qkv_adj, cfh, tk, S, H, hd, sc, 0, pb});
       cf_and_input_adjoint();
       return;
     }
   }
-  launch("attn_bwd_queries", Queries<HD>{qkv, dmerged, merged, ml, dq_out, cf_seq, qkv_adj, S, H, hd, sc}, N, H, S,
+  launch("attn_bwd_queries", Queries<HD>{qkv, dmerged, merged, ml, dq_out, cf_seq, qkv_adj, tk, S, H, hd, sc}, N, H, S,
          2 * std::size_t(S) * hd + S);
 
   // From head_dim 32, one keys pass holding k, v, dk and dv takes 374 registers
@@ -1154,7 +1234,7 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
   constexpr bool split = false;
 #endif
   const std::size_t kv = 2 * std::size_t(S) * hd + 3 * S;
-  auto keys = [&](auto tag) { return decltype(tag){qkv, dmerged, ml, dq_out, cf_seq, qkv_adj, cfh, S, H, hd, sc}; };
+  auto keys = [&](auto tag) { return decltype(tag){qkv, dmerged, ml, dq_out, cf_seq, qkv_adj, cfh, tk, S, H, hd, sc}; };
   if constexpr (split) {
     launch("attn_bwd_keys", keys(Keys<HD, true, false>{}), N, H, S, kv);
     launch("attn_bwd_values", keys(Keys<HD, false, true>{}), N, H, S, kv);
@@ -1179,21 +1259,21 @@ bool detail::tf32_attention_available() {
 }
 
 void attention(Workspace& ws, const std::string& key, View2D out, View2D qkv, View2D cf_seq,
-               const WeightRef& w_out, View1D b_out, int N, int S, int heads, int head_dim,
+               const WeightRef& w_out, View1D b_out, const Tokens& tk, int S, int heads, int head_dim,
                double temperature, bool save) {
   with_head_dim(head_dim, [&](auto hd) {
-    attention_impl<decltype(hd)::value>(ws, key, out, qkv, cf_seq, w_out, b_out, N, S, heads,
+    attention_impl<decltype(hd)::value>(ws, key, out, qkv, cf_seq, w_out, b_out, tk, S, heads,
                                         head_dim, temperature, save);
   });
 }
 
 void attention_bwd(Workspace& ws, const std::string& key, View2D in_adj, View2D cf_seq_adj,
                    View2D out_adj, View2D qkv, View2D cf_seq, const WeightRef& w_in,
-                   const WeightRef& w_out, int N, int S, int heads, int head_dim,
+                   const WeightRef& w_out, const Tokens& tk, int S, int heads, int head_dim,
                    double temperature, Net beta) {
   with_head_dim(head_dim, [&](auto hd) {
     attention_bwd_impl<decltype(hd)::value>(ws, key, in_adj, cf_seq_adj, out_adj, qkv, cf_seq,
-                                            w_in, w_out, N, S, heads, head_dim, temperature, beta);
+                                            w_in, w_out, tk, S, heads, head_dim, temperature, beta);
   });
 }
 

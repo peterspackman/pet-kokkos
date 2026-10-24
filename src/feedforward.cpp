@@ -22,7 +22,9 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
   const int D = h_.d_pet, Dn = h_.d_node, A = h_.num_attention_layers;
   const bool save = sav != nullptr;
   const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
-  auto off = pk.off, rev = pk.reverse, centre = pk.center;
+  auto off = pk.off, rev = pk.reverse;
+  const Tokens tk{off, N, dev.edge_capacity};
+  const int T = N + E;  // token rows (Tokens): the atoms', then the edges'
   const bool ln = h_.normalization == Normalization::LayerNorm;
   auto nweight = [&](const std::string& key) { return vec(key + ".weight"); };
   auto nbias = [&](const std::string& key) { return ln ? vec(key + ".bias") : View1D(); };
@@ -52,50 +54,43 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
     View2D input_node = ws_.tmp(N, D);
     linear(input_node, node_cur, mat(tl + ".center_contraction.weight"), vec(tl + ".center_contraction.bias"));
 
-    // Attention over tokens = [input_node ; edge_cur] per atom, gathered as the
-    // norm reads them (into attn_in itself when tokens are not kept). Then its
-    // output split: the central row to the centre expansion, the edge rows onto
-    // the edge residual, eps = attn + edge_in, gathered as eps's norm reads them.
-    // The block's edge output is eps + mlp(norm(eps)), accumulated onto a copy of
-    // eps -- or, when nothing is saved, onto eps itself. The rows the attention's
-    // norm wrote take eps's norm afterwards.
-    View2D out_node = ws_.tmp(N, D);
+    // Attention over the tokens [input_node ; edge_cur], gathered as the norm
+    // reads them (into attn_in itself when tokens are not kept). Its output's
+    // atom rows go to the centre expansion, and its edge rows onto the edge
+    // residual, eps = attn + edge_in, gathered as eps's norm reads them. The
+    // block's edge output is eps + mlp(norm(eps)), accumulated onto a copy of
+    // eps -- or, when nothing is saved, onto eps itself. The rows the
+    // attention's norm wrote take eps's norm afterwards.
     View2D eps = save ? keep(sav->eps[a], "eps", a, E, D) : edge_next;
-    // (A capacity's E can pass N * S.)
-    View2D normed = ws_.tmp(std::max(N * S, E), D);
+    View2D normed = ws_.tmp(T, D);
     View2D edge_norm(normed.data(), E, D);
+    View2D node_exp = ws_.tmp(N, Dn);
     {
       Workspace::Scope attn_scope(ws_);
-      View2D attn_out = ws_.tmp(N * S, D);
+      View2D attn_out = ws_.tmp(T, D);
       {
         Workspace::Scope qkv_scope(ws_);
-        View2D attn_in(normed.data(), N * S, D);
-        View2D tokens = save ? keep(sav->tokens[a], "tok", a, N * S, D) : attn_in;
+        View2D attn_in = normed;
+        View2D tokens = save ? keep(sav->tokens[a], "tok", a, T, D) : attn_in;
         norm_rows("norm_tok", attn_in, tokens, nweight(tl + ".norm_attention"), nbias(tl + ".norm_attention"),
-                  KOKKOS_LAMBDA(int row, int d) {
-                    const int n = row / S, e = off(n) + row % S - 1;
-                    tokens(row, d) = row % S == 0 ? input_node(n, d) : e < off(n + 1) ? edge_cur(e, d) : Net(0);
-                  });
-        View2D qkv = save && save_wide ? keep(sav->qkv[a], "qkv", a, N * S, 3 * D) : ws_.tmp(N * S, 3 * D);
+                  KOKKOS_LAMBDA(int row, int d) { tokens(row, d) = row < N ? input_node(row, d) : edge_cur(row - N, d); });
+        View2D qkv = save && save_wide ? keep(sav->qkv[a], "qkv", a, T, 3 * D) : ws_.tmp(T, 3 * D);
         linear(qkv, attn_in, mat(tl + ".attention.input_linear.weight"), vec(tl + ".attention.input_linear.bias"));
         attention(ws_, key, attn_out, qkv, dev.cf_seq, mat(tl + ".attention.output_linear.weight"),
-                  vec(tl + ".attention.output_linear.bias"), N, S, h_.num_heads, h_.head_dim,
+                  vec(tl + ".attention.output_linear.bias"), tk, S, h_.num_heads, h_.head_dim,
                   h_.attention_temperature, save);
       }
-      Kokkos::parallel_for(
-          "attn_node", RangePolicy(0, N * D), KOKKOS_LAMBDA(int i) { out_node(i / D, i % D) = attn_out(i / D * S, i % D); });
+      linear(node_exp, View2D(attn_out.data(), N, D), mat(tl + ".center_expansion.weight"),
+             vec(tl + ".center_expansion.bias"));
       norm_rows("norm_eps", edge_norm, eps, nweight(tl + ".norm_mlp"), nbias(tl + ".norm_mlp"),
-                KOKKOS_LAMBDA(int k, int d) {
-                  const int n = centre(k);  // a capacity's dead rows: no atom's, no attention
-                  eps(k, d) = (k < off(n + 1) ? attn_out(n * S + k - off(n) + 1, d) : Net(0)) + edge_cur(k, d);
+                KOKKOS_LAMBDA(int k, int d) {  // a capacity's dead rows: no atom's, no attention
+                  eps(k, d) = (k < off(N) ? attn_out(N + k, d) : Net(0)) + edge_cur(k, d);
                   if (save) edge_next(k, d) = eps(k, d);
                 });
     }
 
-    // The node side the same way: node_res = node_in + expansion(central row), the
+    // The node side the same way: node_res = node_in + expansion(atom row), the
     // block's node output node_res + mlp(norm(node_res)).
-    View2D node_exp = ws_.tmp(N, Dn);
-    linear(node_exp, out_node, mat(tl + ".center_expansion.weight"), vec(tl + ".center_expansion.bias"));
     View2D node_res = save ? keep(sav->node_new[a], "nn", a, N, Dn) : node_next;
     const int cw = ffn_pre_width(tl + ".center_mlp"), ew = ffn_pre_width(tl + ".mlp");
     View2D node_norm = ws_.tmp(N, Dn);
@@ -161,6 +156,8 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
   const int D = h_.d_pet, Dn = h_.d_node, A = h_.num_attention_layers;
   const std::string g = "gnn_layers." + std::to_string(L), ls = std::to_string(L);
   auto off = pk.off, rev = pk.reverse;
+  const Tokens tk{off, N, dev.edge_capacity};
+  const int T = N + E;
   // lin(norm(in)): a wide activation the forward did not keep, by the forward's
   // own route.
   auto rebuild = [&](View2D in, const std::string& norm_key, const std::string& lin, bool swiglu_pre) {
@@ -227,23 +224,22 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
     View2D input_node_adj = ws_.tmp(N, D);
     {
       Workspace::Scope scope(ws_);
-      View2D out_node_adj = ws_.tmp(N, D), attn_out_adj = ws_.tmp(N * S, D), attn_in_adj = ws_.tmp(N * S, D);
-      linear_bwd(out_node_adj, node_adj, mat(tl + ".center_expansion.weight"), 0);
+      View2D attn_out_adj = ws_.tmp(T, D), attn_in_adj = ws_.tmp(T, D);
+      linear_bwd(View2D(attn_out_adj.data(), N, D), node_adj, mat(tl + ".center_expansion.weight"), 0);
       Kokkos::parallel_for(
-          "bw_ao", RangePolicy(0, N * S * D), KOKKOS_LAMBDA(int i) {
-            const int row = i / D, d = i % D, n = row / S, k = off(n) + row % S - 1;
-            attn_out_adj(row, d) = row % S == 0 ? out_node_adj(n, d) : k < off(n + 1) ? edge_adj(k, d) : Net(0);
+          "bw_ao", RangePolicy(0, E * D), KOKKOS_LAMBDA(int i) {
+            const int k = i / D, d = i % D;
+            attn_out_adj(N + k, d) = k < off(N) ? edge_adj(k, d) : Net(0);
           });
       attention_bwd(ws_, key, attn_in_adj, cf_seq_adj, attn_out_adj,
                     kept_wide ? sav.qkv[a] : rebuild(sav.tokens[a], tl + ".norm_attention", tl + ".attention.input_linear", false),
                     dev.cf_seq, mat(tl + ".attention.input_linear.weight"),
-                    mat(tl + ".attention.output_linear.weight"), N, S, h_.num_heads, h_.head_dim,
+                    mat(tl + ".attention.output_linear.weight"), tk, S, h_.num_heads, h_.head_dim,
                     h_.attention_temperature, 0);
       norm_rows_bwd("norm_tok_bwd", attn_in_adj, sav.tokens[a], vec(tl + ".norm_attention.weight"),
                     h_.normalization == Normalization::LayerNorm, KOKKOS_LAMBDA(int row, int d, Net g) {
-                      const int n = row / S, k = off(n) + row % S - 1;
-                      if (row % S == 0) input_node_adj(n, d) = g;
-                      else if (k < off(n + 1)) edge_adj(k, d) += g;
+                      if (row < N) input_node_adj(row, d) = g;
+                      else if (row - N < off(N)) edge_adj(row - N, d) += g;  // not a capacity's dead row
                     });
     }
     linear_bwd(node_adj, input_node_adj, mat(tl + ".center_contraction.weight"));

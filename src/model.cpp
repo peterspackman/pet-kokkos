@@ -603,7 +603,8 @@ Recompute PetModel::recompute_tier(int N, int S, int E) const {
   // widest activations (qkv and the edge MLP's pre-activation), and the working
   // set every tier needs.
   const std::size_t G = h_.num_gnn_layers, A = h_.num_attention_layers, D = h_.d_pet, Dh = h_.d_head;
-  const std::size_t NS = std::size_t(N) * S, NE = E, ew = ffn_pre_width("gnn_layers.0.trans.layers.0.mlp");
+  // NS: the token rows (Tokens), an atom's own and one per edge.
+  const std::size_t NS = std::size_t(N) + E, NE = E, ew = ffn_pre_width("gnn_layers.0.trans.layers.0.mlp");
   const bool res = h_.featurizer_type == FeaturizerType::Residual;
   // Residual, per block: qkv, the MLP pre-activation, s1, s2 and the attention's
   // merged heads; wide trades qkv and pre for the block's input tokens.
