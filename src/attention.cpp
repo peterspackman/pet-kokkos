@@ -57,7 +57,7 @@ KOKKOS_INLINE_FUNCTION bool off(Net lc) { return lc < -Net(1e29); }
 // The passes hold several head-sized arrays per thread. On HIP, bounding the
 // team at 256 threads lets the compiler give each thread the registers for them:
 // under the default bound of 1024 an MI250X GCD caps a thread at 128 and they
-// spill (a pbe0-pet relaxation step 1.9x slower). On CUDA the same bound lets
+// spill (a pet-mols-s relaxation step 1.9x slower). On CUDA the same bound lets
 // nvcc spend registers that occupancy needs more.
 #if defined(KOKKOS_ENABLE_HIP)
 using AttnPolicy = Kokkos::TeamPolicy<ExecSpace, Kokkos::LaunchBounds<256, 1>,
@@ -1218,7 +1218,7 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
   if constexpr (kStaged) {
     // Where two teams fit an SM's shared memory (with the driver's 1 KiB each),
     // or head_dim is 48 or more, where the two passes' per-thread arrays spill.
-    // With one team per SM and a small head the two passes are faster: pbe0-pet
+    // With one team per SM and a small head the two passes are faster: pet-mols-s
     // (S = 51, head_dim 32) 1.11 against 1.42 ms per layer; but pet-omat-l
     // (S = 49, head_dim 64) 4.9 against 2.3 for the pairs.
     static const std::size_t sm_bytes = shared_per_sm();

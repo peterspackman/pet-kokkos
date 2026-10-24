@@ -292,7 +292,7 @@ set by environment variable, by `pet::Options`, or as a metatomic option:
 
 **For MD or relaxations on a recent NVIDIA GPU** (A100, H100/H200, RTX 30xx/40xx),
 `PET_GEMM=tf32 PET_ATTN=tf32` is the one to use. Measured against fp32, on
-pet-mad-xs, pet-mad-s, pbe0-pet (pet-mols-s) and pet-omat-l, 648-atom water and
+pet-mad-xs, pet-mad-s, pet-mols-s and pet-omat-l, 648-atom water and
 1728-atom diamond:
 
 | | energy | largest force error |
@@ -312,7 +312,7 @@ What they buy, ms per evaluation with forces:
 | H200, pet-mols-s, 5184-atom water | 98.5 | 51.0 | 39.0 |
 | H200, pet-omat-l, 2592-atom water | 439 | 138 | 116 |
 | RTX 4080 SUPER, pet-mad-s, 648-atom water | 24.5 | 17.3 | 16.7 |
-| RTX 4080 SUPER, pbe0-pet, 1728-atom diamond | 98.9 | 85.6 | 71.9 |
+| RTX 4080 SUPER, pet-mols-s, 1728-atom diamond | 98.9 | 85.6 | 71.9 |
 
 An H200's fp32 runs on its CUDA cores, several times slower than its TF32
 tensor cores, so it gains the most; an RTX 4080's TF32 and fp32 peaks are about
