@@ -64,7 +64,7 @@ baseurl=https://repo.radeon.com/rocm/rhel8/6.3.2/main
 enabled=1
 gpgcheck=0
 REPO
-dnf install -y --disablerepo=epel hip-devel hipcc rocm-llvm rocm-device-libs rocm-cmake rocblas-devel hipblaslt-devel
+dnf install -y --disablerepo=epel hip-devel hipcc rocm-llvm rocm-device-libs rocm-cmake rocblas-devel hipblaslt-devel rocthrust-devel rocprim-devel
 """
 # ROCm's clang looks for the system GCC's libstdc++ (GCC 8 here, absent, and
 # too old for Kokkos's C++20): point it at manylinux's GCC 14 toolset instead.
