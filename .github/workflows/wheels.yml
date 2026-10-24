@@ -2,13 +2,16 @@ name: Wheels
 
 # CPU wheels for PyPI-style installs (pyproject.toml's [tool.cibuildwheel]):
 # Linux x86_64 and aarch64 (OpenMP, OpenBLAS), macOS arm64 (threads,
-# Accelerate), and the sdist, for GPU builds from source. Artifacts only: no
-# publishing yet.
+# Accelerate), and the sdist, for GPU builds from source; on a tag, by hand, or
+# on a pull request that touches the packaging. Artifacts only: no publishing
+# yet.
 
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+  pull_request:
+    paths: ["pyproject.toml", "python/**", ".github/workflows/wheels.yml"]
 
 jobs:
   wheels:
