@@ -339,6 +339,7 @@ __global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const i
   const int n = blockIdx.x / H, h = blockIdx.x % H, l = threadIdx.x, c = l % 16, g = l / 16, D = H * HD;
   const Atom at(off, N, n);
   const Slice Q{qkv + h * HD, ldq, at}, K{qkv + D + h * HD, ldq, at}, V{qkv + 2 * D + h * HD, ldq, at};
+  const int nb = (at.cnt + 15) / 16;  // the blocks the atom's tokens fill; past them, exact zeros
   const float* cf = cf_seq + (size_t) n * ldc;
   float q[NB][W], mx[NB], sum[NB];
   f4 acc[NB][DT];
@@ -348,6 +349,7 @@ __global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const i
     for (int t = 0; t < DT; ++t) acc[I][t] = f4{0, 0, 0, 0};
   }
   for (int J = 0; J < NB; ++J) {
+    if (J >= nb) break;
     float k[W], v[DT][4], lc[4];
     K.chunk<W>(16 * J + c, g * W, k);
     for (int r = 0; r < 4; ++r) {
@@ -355,6 +357,7 @@ __global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const i
       for (int t = 0; t < DT; ++t) v[t][r] = V.at(16 * J + 4 * g + r, 16 * t + c);
     }
     for (int I = 0; I < NB; ++I) {
+      if (I >= nb) continue;
       f4 s = {0, 0, 0, 0};
       for (int t = 0; t < W; ++t) s = mma(k[t], q[I][t], s);  // s[r]: query 16I + c, key 16J + 4g + r
       float x[4], bm = -1e30f;
@@ -411,6 +414,7 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
   const Atom at(off, N, n);
   const Slice Q{qkv + h * HD, ldq, at}, K{qkv + D + h * HD, ldq, at}, V{qkv + 2 * D + h * HD, ldq, at};
   const Slice G{dmerged + h * HD, ldm, at}, O{merged + h * HD, ldm, at};
+  const int nb = (at.cnt + 15) / 16;  // the blocks the atom's tokens fill; past them, exact zeros
   const float* cf = cf_seq + (size_t) n * ldc;
   const float* mls = ml + 2 * (size_t) (n * H + h) * S;
 
@@ -432,6 +436,7 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
       for (int t = 0; t < DT; ++t) acc[I][t] = f4{0, 0, 0, 0};
     }
     for (int J = 0; J < NB; ++J) {
+      if (J >= nb) break;
       float k[W], v[W], ka[DT][4], lc[4];
       K.chunk<W>(16 * J + c, g * W, k);
       V.chunk<W>(16 * J + c, g * W, v);
@@ -440,6 +445,7 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
         for (int t = 0; t < DT; ++t) ka[t][r] = K.at(16 * J + 4 * g + r, 16 * t + c);
       }
       for (int I = 0; I < NB; ++I) {
+        if (I >= nb) continue;
         f4 s = {0, 0, 0, 0}, dp = {0, 0, 0, 0};
         for (int t = 0; t < W; ++t) s = mma(k[t], q[I][t], s), dp = mma(v[t], go[I][t], dp);
         float ds[4];
@@ -473,6 +479,7 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
       for (int t = 0; t < DT; ++t) dk[J][t] = dv[J][t] = f4{0, 0, 0, 0};
     }
     for (int I = 0; I < NB; ++I) {
+      if (I >= nb) break;
       float q[W], go[W], qa[DT][4], ga[DT][4], mi[4], li[4], dqi[4];
       Q.chunk<W>(16 * I + c, g * W, q);
       G.chunk<W>(16 * I + c, g * W, go);
@@ -482,6 +489,7 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
         for (int t = 0; t < DT; ++t) qa[t][r] = Q.at(i, 16 * t + c), ga[t][r] = G.at(i, 16 * t + c);
       }
       for (int J = 0; J < NB; ++J) {
+        if (J >= nb) continue;
         f4 s = {0, 0, 0, 0}, dp = {0, 0, 0, 0};
         for (int t = 0; t < W; ++t) s = mma(q[t], k[J][t], s), dp = mma(go[t], v[J][t], dp);
         float a[4], ds[4];
@@ -516,7 +524,8 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
 
 // Calls f with the number of 16-token blocks as a compile-time constant, for
 // as many as the kernels' register arrays hold (blocks x head_dim <= 256);
-// false when there are more, for the general kernels.
+// false when there are more, for the general kernels. It is the batch's most;
+// a block skips the blocks past its own atom's tokens.
 template <int HD, class F>
 bool with_blocks(int S, F&& f) {
   const int nb = (S + 15) / 16;
