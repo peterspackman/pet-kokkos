@@ -99,6 +99,79 @@ When pet-kokkos is pulled in as a dependency (`add_subdirectory`, CPM or
 FetchContent), the tests and apps are off by default and an existing
 `Kokkos::kokkos` target is reused.
 
+## Python
+
+```bash
+uv pip install pet-kokkos                 # CPU
+uv build --wheel                          # the CPU wheel from this tree
+```
+
+GPU builds are the same package with a local version label, as PyTorch's are
+(`pet-kokkos 0.1.0+cu12`), served from the GitHub releases through an index
+for each, since PyPI takes no local versions:
+
+```bash
+uv pip install pet-kokkos --extra-index-url https://peterspackman.github.io/pet-kokkos/cu12
+```
+
+| Index | GPUs | Needs |
+|---|---|---|
+| `cu12` | NVIDIA, compute capability 8.0+ (A100, RTX 30xx-50xx, H100/H200, B200) | driver for CUDA 12; the CUDA runtime and cuBLAS come from NVIDIA's pip wheels |
+| `cu13` | as `cu12` | driver for CUDA 13 (580+) |
+| `rocm6` | AMD Instinct MI200 (gfx90a), MI300 (gfx942) | ROCm 6 installed |
+| `rocm7` | as `rocm6`, and MI350 (gfx950) | ROCm 7 installed |
+
+In a uv project, pin the package to one:
+
+```toml
+[[tool.uv.index]]
+name = "pet-cu12"
+url = "https://peterspackman.github.io/pet-kokkos/cu12"
+explicit = true
+
+[tool.uv.sources]
+pet-kokkos = { index = "pet-cu12" }
+```
+
+```python
+import pet_kokkos
+from pet_kokkos.ase import PETCalculator
+
+atoms.calc = PETCalculator("pet-mad-s")          # downloads the model on first use
+atoms.get_potential_energy(), atoms.get_forces(), atoms.get_stress()
+
+calc = pet_kokkos.Calculator("pet-mad-s", gemm="tf32", attention="tf32")
+r = calc.compute(numbers, positions, cell, pbc=True)   # energy, energies, forces, virial
+rs = calc.compute_batch([(numbers, positions, cell, True), ...])
+```
+
+A model name not found locally (see Models) is downloaded from the Hugging
+Face repository into `~/.local/share/pet/models`. The ASE calculator keeps a
+Verlet cache of the neighbour topology across steps (`cache_neighbors=True`)
+and reads a charge and spin multiplicity from `atoms.info["charge"]` and
+`atoms.info["spin"]` for models conditioned on them. A wheel built with
+`-Ccmake.define.PET_BUILD_METATOMIC=ON` also carries the metatomic plugin, at
+`pet_kokkos.metatomic_plugin()`.
+
+CPU wheels use OpenMP and OpenBLAS on Linux and Kokkos's C++ threads with
+Accelerate on macOS (Apple's compiler has no OpenMP). A GPU wheel carries
+only its GPU's core: `pet_kokkos.backend()` says which.
+
+- CUDA: one wheel for every NVIDIA GPU from compute capability 8.0. Kokkos
+  builds one architecture, sm_80; `NVCC_APPEND_FLAGS` adds code for sm_89,
+  sm_90, sm_100 and sm_120 and PTX for later GPUs, so each runs code for itself
+  (an sm_80-only build was 6% slower in fp32 on an RTX 4080). The CUDA runtime
+  and cuBLAS are NVIDIA's pip wheels, the ones PyTorch and JAX use, found
+  through the module's RPATH.
+- ROCm: CDNA GPUs only (the attention's matrix-core kernels). It links the
+  system's ROCm (HIP, rocBLAS, hipBLASLt), as CuPy's ROCm wheels do.
+
+`PET_KOKKOS_VARIANT=cu12|cu13|rocm6|rocm7 uv build --wheel` builds one
+yourself, e.g. for another architecture or toolkit (pyproject.toml's overrides
+say what each needs); `python/wheels/` has CI's toolchains. `python/tests`
+checks the package (`uv run --with pytest --with ase pytest python/tests` with
+it installed).
+
 ## metatomic plugin
 
 `-DPET_BUILD_METATOMIC=ON` builds `metatomic/pet-kokkos-metatomic.so`, a
@@ -219,7 +292,7 @@ set by environment variable, by `pet::Options`, or as a metatomic option:
 
 **For MD or relaxations on a recent NVIDIA GPU** (A100, H100/H200, RTX 30xx/40xx),
 `PET_GEMM=tf32 PET_ATTN=tf32` is the one to use. Measured against fp32, on
-pet-mad-xs, pet-mad-s, pbe0-pet (pet-mols-s) and pet-omat-l, 648-atom water and
+pet-mad-xs, pet-mad-s, pet-mols-s and pet-omat-l, 648-atom water and
 1728-atom diamond:
 
 | | energy | largest force error |
@@ -239,7 +312,7 @@ What they buy, ms per evaluation with forces:
 | H200, pet-mols-s, 5184-atom water | 98.5 | 51.0 | 39.0 |
 | H200, pet-omat-l, 2592-atom water | 439 | 138 | 116 |
 | RTX 4080 SUPER, pet-mad-s, 648-atom water | 24.5 | 17.3 | 16.7 |
-| RTX 4080 SUPER, pbe0-pet, 1728-atom diamond | 98.9 | 85.6 | 71.9 |
+| RTX 4080 SUPER, pet-mols-s, 1728-atom diamond | 98.9 | 85.6 | 71.9 |
 
 An H200's fp32 runs on its CUDA cores, several times slower than its TF32
 tensor cores, so it gains the most; an RTX 4080's TF32 and fp32 peaks are about

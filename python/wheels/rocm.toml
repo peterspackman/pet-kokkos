@@ -1,0 +1,30 @@
+# cibuildwheel for the ROCm variants (pyproject.toml's overrides), from the
+# Wheels workflow: PET_KOKKOS_VARIANT=rocm6 or rocm7, PET_ROCM (the release:
+# 6.3.2, 7.0.3) and PET_ROCM_ARCHS (offload targets beside Kokkos's gfx90a)
+# passed in. Built in manylinux_2_28 with AMD's RHEL 8 packages (no GPU
+# needed). ROCm's libraries stay out of the wheel: the system's are used. The
+# CI test only looks for the module.
+[tool.cibuildwheel]
+build-frontend = "build[uv]"
+build = ["cp310-*", "cp311-*", "cp312-*"]
+skip = ["*-musllinux_*", "*_i686", "*_aarch64"]
+test-command = "python -c \"import importlib.metadata as m; assert any(f.name.startswith('_core') for f in m.files('pet-kokkos'))\""
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+environment-pass = ["PET_KOKKOS_VARIANT", "PET_ROCM", "PET_ROCM_ARCHS"]
+before-all = """
+set -e
+cat > /etc/yum.repos.d/rocm.repo <<REPO
+[rocm]
+name=ROCm $PET_ROCM
+baseurl=https://repo.radeon.com/rocm/rhel8/$PET_ROCM/main
+enabled=1
+gpgcheck=0
+REPO
+dnf install -y --disablerepo=epel hip-devel hipcc rocm-llvm rocm-device-libs rocm-cmake rocblas-devel hipblaslt-devel rocthrust-devel rocprim-devel
+"""
+# ROCm's clang looks for the system GCC's libstdc++ (GCC 8 here, absent, and
+# too old for Kokkos's C++20): point it at manylinux's GCC 14 toolset instead.
+environment = { PATH = "/opt/rocm/bin:$PATH", ROCM_PATH = "/opt/rocm", CMAKE_PREFIX_PATH = "/opt/rocm", PET_HIPCC = "/opt/rocm/bin/hipcc", PET_ROCM_CXXFLAGS = "$PET_ROCM_ARCHS --gcc-install-dir=/opt/rh/gcc-toolset-14/root/usr/lib/gcc/x86_64-redhat-linux/14" }
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude 'libamdhip64.so*' --exclude 'librocblas.so*' --exclude 'libhipblaslt.so*' --exclude 'libhsa-runtime64.so*' --exclude 'libamd_comgr.so*' --exclude 'librocprofiler-register.so*' --exclude 'libdrm*' --exclude 'libnuma.so*' --exclude 'libelf.so*'"

@@ -2,7 +2,7 @@
 """Re-emit a PET golden with the reference evaluated in float64.
 
 The shipped goldens are float32 end to end (every stored value is exactly
-representable as a float32), so for the pbe0 model -- whose per-atom energies are
+representable as a float32), so for pet-mols-s -- whose per-atom energies are
 ~-1036 eV because the composition energies are full atomic DFT totals -- one fp32
 ulp is 1.2e-4 eV per atom, ~1e-3 eV on the total. That is the floor the C++ is
 being measured against, and it is ~100x coarser than for pet-mad-xs purely because

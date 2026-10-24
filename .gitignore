@@ -26,3 +26,4 @@ dist/
 .DS_Store
 *.swp
 build-models/
+build-py/

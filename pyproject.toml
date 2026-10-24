@@ -1,0 +1,123 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pet-kokkos"
+dynamic = ["version", "dependencies"]
+description = "PET machine-learned interatomic potentials (PET-MAD, ...) on Kokkos: CPU and GPU"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+ase = ["ase>=3.23"]
+test = ["pytest>=8", "ase>=3.23"]
+
+[project.urls]
+Source = "https://github.com/peterspackman/pet-kokkos"
+Models = "https://huggingface.co/peterspackman/pet-kokkos-models"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+experimental = true
+build-dir = "build-py/{wheel_tag}"
+wheel.packages = ["python/pet_kokkos"]
+# Only the package: not Kokkos's or the C++ library's own install rules.
+install.components = ["python"]
+# The module uses Python's stable ABI from 3.12: one wheel for 3.12 and later.
+wheel.py-api = "cp312"
+sdist.exclude = ["build*", "models", ".venv", "lammps/examples/*.data"]
+
+# The version, and numpy plus a GPU variant's libraries: python/wheel_meta (a
+# plugin in the tree, which scikit-build-core still calls experimental).
+[tool.scikit-build.metadata.version]
+provider = "pet_variant"
+provider-path = "python/wheel_meta"
+
+[tool.scikit-build.metadata.dependencies]
+provider = "pet_variant"
+provider-path = "python/wheel_meta"
+
+# A wheel is the library and its Python module: no tests, tools or install of
+# the C++ library. The backend defaults to OpenMP on Linux and Kokkos's threads
+# on macOS (Apple's compiler has no OpenMP); PET_KOKKOS_VARIANT picks a GPU
+# build (the overrides below), or pass your own, e.g.
+#   uv build --wheel -Ccmake.define.PET_BACKEND=cuda -Ccmake.define.Kokkos_ARCH_HOPPER90=ON
+# Wheels for other machines need PET_ARCH_NATIVE off (the default here).
+[tool.scikit-build.cmake.define]
+PET_BUILD_PYTHON = "ON"
+PET_BUILD_TESTS = "OFF"
+PET_BUILD_APPS = "OFF"
+PET_INSTALL = "OFF"
+PET_ARCH_NATIVE = "OFF"
+PET_WITH_VESIN = "OFF"
+PET_BACKEND = { env = "PET_BACKEND", default = "openmp" }
+
+[[tool.scikit-build.overrides]]
+if.platform-system = "darwin"
+inherit.cmake.define = "append"  # not replace: the defines above still hold
+cmake.define.PET_BACKEND = { env = "PET_BACKEND", default = "threads" }
+
+# ---- GPU variants: PET_KOKKOS_VARIANT=cu12|cu13|rocm6|rocm7 ------------------
+#
+# CUDA (cu12, cu13): one wheel for every GPU from compute capability 8.0.
+# Kokkos builds one architecture, sm_80 (and runs code built for an older GPU
+# than the one it finds); NVCC_APPEND_FLAGS, which Kokkos's nvcc_wrapper does
+# not see, adds code for later GPUs, so each runs code for itself (an
+# sm_80-only build was 6% slower in fp32 on an RTX 4080). By hand:
+#   PET_KOKKOS_VARIANT=cu12 PET_NVCC_WRAPPER=<kokkos>/bin/nvcc_wrapper \
+#     NVCC_APPEND_FLAGS="-gencode=arch=compute_90,code=sm_90 ..." uv build --wheel
+#
+# ROCm (rocm6, rocm7): MI200 (gfx90a, Kokkos's architecture) and MI300 (gfx942,
+# from PET_ROCM_CXXFLAGS), CDNA only (the attention's matrix-core kernels). It
+# links the system's ROCm, as CuPy's ROCm wheels do. No host OpenMP: ROCm's
+# clang would need its OpenMP runtime installed and shipped, for host work
+# that is small next to the GPU's.
+[[tool.scikit-build.overrides]]
+if.env.PET_KOKKOS_VARIANT = "cu12"
+inherit.cmake.define = "append"
+build-dir = "build-py/cu12-{wheel_tag}"
+cmake.define = { PET_BACKEND = "cuda", Kokkos_ARCH_AMPERE80 = "ON", PET_PYTHON_NVIDIA_WHEELS = "ON", CMAKE_CXX_COMPILER = { env = "PET_NVCC_WRAPPER", default = "nvcc_wrapper" } }
+
+[[tool.scikit-build.overrides]]
+if.env.PET_KOKKOS_VARIANT = "cu13"
+inherit.cmake.define = "append"
+build-dir = "build-py/cu13-{wheel_tag}"
+cmake.define = { PET_BACKEND = "cuda", Kokkos_ARCH_AMPERE80 = "ON", PET_PYTHON_NVIDIA_WHEELS = "ON", CMAKE_CXX_COMPILER = { env = "PET_NVCC_WRAPPER", default = "nvcc_wrapper" } }
+
+[[tool.scikit-build.overrides]]
+if.env.PET_KOKKOS_VARIANT = "rocm6"
+inherit.cmake.define = "append"
+build-dir = "build-py/rocm6-{wheel_tag}"
+cmake.define = { PET_BACKEND = "hip", Kokkos_ARCH_AMD_GFX90A = "ON", GPU_TARGETS = "gfx90a", PET_HOST_OPENMP = "OFF", CMAKE_CXX_FLAGS = { env = "PET_ROCM_CXXFLAGS", default = "--offload-arch=gfx942" }, CMAKE_CXX_COMPILER = { env = "PET_HIPCC", default = "hipcc" } }
+
+[[tool.scikit-build.overrides]]
+if.env.PET_KOKKOS_VARIANT = "rocm7"
+inherit.cmake.define = "append"
+build-dir = "build-py/rocm7-{wheel_tag}"
+cmake.define = { PET_BACKEND = "hip", Kokkos_ARCH_AMD_GFX90A = "ON", GPU_TARGETS = "gfx90a", PET_HOST_OPENMP = "OFF", CMAKE_CXX_FLAGS = { env = "PET_ROCM_CXXFLAGS", default = "--offload-arch=gfx942" }, CMAKE_CXX_COMPILER = { env = "PET_HIPCC", default = "hipcc" } }
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+
+# ---- wheels (cibuildwheel, with uv) ------------------------------------------
+#
+# CPU wheels: OpenMP + OpenBLAS on Linux (bundled by auditwheel), Kokkos's
+# threads + Accelerate on macOS. From Python 3.12 one abi3 wheel serves every
+# later version. The tests download pet-mad-xs (17 MB) from Hugging Face; the
+# goldens' own checkpoints are not published, so those tests skip.
+[tool.cibuildwheel]
+build-frontend = "build[uv]"
+build = ["cp310-*", "cp311-*", "cp312-*"]
+skip = ["*-musllinux_*", "*_i686", "*-win32"]
+test-requires = ["pytest", "ase"]
+test-command = "python -c \"import pet_kokkos; pet_kokkos.download('pet-mad-xs')\" && pytest -q -W ignore::FutureWarning {project}/python/tests"
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+before-all = "dnf install -y openblas-devel || (dnf install -y dnf-plugins-core && dnf config-manager --set-enabled powertools && dnf install -y openblas-devel)"
+
+[tool.cibuildwheel.macos]
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
