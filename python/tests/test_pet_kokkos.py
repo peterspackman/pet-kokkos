@@ -91,12 +91,14 @@ def test_ase_forces_and_stress_match_finite_differences():
     atoms.set_cell(atoms.cell * [[1.0, 0.0, 0.0], [0.02, 1.0, 0.0], [0.0, -0.01, 1.0]], scale_atoms=True)
     atoms.calc = PETCalculator("pet-mad-xs")
     forces, stress = atoms.get_forces(), atoms.get_stress()
-    num_forces = atoms.calc.calculate_numerical_forces(atoms, d=1e-3)
-    num_stress = atoms.calc.calculate_numerical_stress(atoms, d=1e-5)
-    # fp32 network: finite differences carry its noise.
-    assert np.max(np.abs(forces - num_forces)) <= 5e-3
-    assert np.max(np.abs(stress - num_stress)) <= 5e-4
+    # Before the finite differences, which leave their last strained step's results behind.
     assert atoms.calc.results["energies"].sum() == pytest.approx(atoms.get_potential_energy(), abs=1e-4)
+    num_forces = atoms.calc.calculate_numerical_forces(atoms, d=1e-3)
+    # A strain step below ~1e-4 drowns in the fp32 network's rounding (1e-5
+    # gives ~5e-4 eV/A^3 of noise); at 1e-3 the two agree to ~1e-5.
+    num_stress = atoms.calc.calculate_numerical_stress(atoms, d=1e-3)
+    assert np.max(np.abs(forces - num_forces)) <= 5e-3
+    assert np.max(np.abs(stress - num_stress)) <= 1e-4
 
 
 def test_backend_and_closing():
