@@ -4,6 +4,8 @@
 #include "pet/gemm.hpp"
 #include "pet/ozaki.hpp"
 
+#include <cstdint>
+
 namespace pet {
 
 // Every GEMM in the network has a weight as its second operand and comes through
@@ -21,6 +23,17 @@ static void weight_gemm(char tw, Net beta, View2D out, View2D in, const WeightRe
 
 void linear(View2D out, View2D in, const WeightRef& W, View1D b, Net beta) { weight_gemm('T', beta, out, in, W, b); }
 
+// The elementwise passes take four values a thread where their buffers allow
+// (contiguous, aligned to four values, a multiple of four long): one 16-byte
+// load or store, not four, and no row and column to work out. An H200 ran the
+// one-value passes at about half its bandwidth. The arithmetic per value is
+// the same either way.
+static bool quads(const View2D& v) {
+  return v.span_is_contiguous() && v.size() % 4 == 0 &&
+         reinterpret_cast<std::uintptr_t>(v.data()) % sizeof(Quad) == 0;
+}
+KOKKOS_INLINE_FUNCTION Quad& quad(Net* p, std::size_t q) { return reinterpret_cast<Quad*>(p)[q]; }
+
 void linear_bwd(View2D in_adj, View2D out_adj, const WeightRef& W, Net beta) {
   weight_gemm('N', beta, in_adj, out_adj, W);
 }
@@ -31,6 +44,17 @@ void linear_silu(View2D out, View2D pre, View2D in, const WeightRef& W, View1D b
   linear(out, in, W, b);
   const int n = out.extent(0) * out.extent(1);
   const bool save = pre.data() != nullptr;
+  if (quads(out) && (!save || quads(pre))) {
+    Net *o = out.data(), *p = pre.data();
+    Kokkos::parallel_for(
+        "silu", RangePolicy(0, n / 4), KOKKOS_LAMBDA(int q) {
+          Quad z = quad(o, q);
+          if (save) quad(p, q) = z;
+          for (int j = 0; j < 4; ++j) z.v[j] = silu(z.v[j]);
+          quad(o, q) = z;
+        });
+    return;
+  }
   View1D o(out.data(), n), p(pre.data(), save ? n : 0);
   Kokkos::parallel_for(
       "silu", RangePolicy(0, n), KOKKOS_LAMBDA(int i) {
@@ -42,6 +66,20 @@ void linear_silu(View2D out, View2D pre, View2D in, const WeightRef& W, View1D b
 
 void silu_bwd(View2D grad, View2D pre) {
   const int n = grad.extent(0) * grad.extent(1);
+  if (quads(grad) && quads(pre)) {
+    Net *g = grad.data(), *p = pre.data();
+    Kokkos::parallel_for(
+        "silu_bwd", RangePolicy(0, n / 4), KOKKOS_LAMBDA(int q) {
+          const Quad x = quad(p, q);
+          Quad y = quad(g, q);
+          for (int j = 0; j < 4; ++j) {
+            const Net sg = sigmoid(x.v[j]);
+            y.v[j] *= sg * (Net(1) + x.v[j] * (Net(1) - sg));
+          }
+          quad(g, q) = y;
+        });
+    return;
+  }
   View1D g(grad.data(), n), p(pre.data(), n);
   Kokkos::parallel_for(
       "silu_bwd", RangePolicy(0, n), KOKKOS_LAMBDA(int i) {
@@ -97,6 +135,17 @@ void swiglu_in(View2D pre, View2D h, View2D in, const WeightRef& w_in, View1D b_
   linear(pre, in, w_in, b_in);
   if (!h.data()) return;
   const int F = h.extent(1);
+  if (quads(h) && quads(pre) && pre.size() == 2 * h.size()) {
+    // Flat: h's value j is pre's 2j and 2j + 1 (pre rows are twice as wide).
+    Net *hp = h.data(), *pp = pre.data();
+    Kokkos::parallel_for(
+        "swiglu", RangePolicy(0, int(h.size() / 4)), KOKKOS_LAMBDA(int q) {
+          const Quad a = quad(pp, 2 * q), b = quad(pp, 2 * q + 1);
+          quad(hp, q) = {{a.v[0] * sigmoid(a.v[1]), a.v[2] * sigmoid(a.v[3]), b.v[0] * sigmoid(b.v[1]),
+                          b.v[2] * sigmoid(b.v[3])}};
+        });
+    return;
+  }
   Kokkos::parallel_for(
       "swiglu", RangePolicy(0, h.extent(0) * F), KOKKOS_LAMBDA(int i) {
         const int r = i / F, c = i % F;
@@ -120,13 +169,31 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
   if (w_out.split || !swiglu_bwd_fused(pre_adj, out_adj, w_out.v, pre)) {
     View2D h_adj = ws.tmp(R, F);
     linear_bwd(h_adj, out_adj, w_out, 0);
-    Kokkos::parallel_for(
-        "swiglu_bwd", RangePolicy(0, R * F), KOKKOS_LAMBDA(int i) {
-          const int r = i / F, c = i % F;
-          const Net v = pre(r, 2 * c), sg = sigmoid(pre(r, 2 * c + 1));
-          pre_adj(r, 2 * c) = h_adj(r, c) * sg;
-          pre_adj(r, 2 * c + 1) = h_adj(r, c) * v * sg * (Net(1) - sg);
-        });
+    if (quads(h_adj) && quads(pre) && quads(pre_adj)) {
+      Net *ha = h_adj.data(), *pp = pre.data(), *pa = pre_adj.data();
+      Kokkos::parallel_for(
+          "swiglu_bwd", RangePolicy(0, R * F / 4), KOKKOS_LAMBDA(int q) {
+            const Quad g = quad(ha, q);
+            for (int half = 0; half < 2; ++half) {
+              const Quad x = quad(pp, 2 * q + half);
+              Quad y;
+              for (int j = 0; j < 2; ++j) {
+                const Net v = x.v[2 * j], sg = sigmoid(x.v[2 * j + 1]), gj = g.v[2 * half + j];
+                y.v[2 * j] = gj * sg;
+                y.v[2 * j + 1] = gj * v * sg * (Net(1) - sg);
+              }
+              quad(pa, 2 * q + half) = y;
+            }
+          });
+    } else {
+      Kokkos::parallel_for(
+          "swiglu_bwd", RangePolicy(0, R * F), KOKKOS_LAMBDA(int i) {
+            const int r = i / F, c = i % F;
+            const Net v = pre(r, 2 * c), sg = sigmoid(pre(r, 2 * c + 1));
+            pre_adj(r, 2 * c) = h_adj(r, c) * sg;
+            pre_adj(r, 2 * c + 1) = h_adj(r, c) * v * sg * (Net(1) - sg);
+          });
+    }
   }
   linear_bwd(in_adj, pre_adj, w_in, beta);
 }
