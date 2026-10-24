@@ -99,6 +99,40 @@ When pet-kokkos is pulled in as a dependency (`add_subdirectory`, CPM or
 FetchContent), the tests and apps are off by default and an existing
 `Kokkos::kokkos` target is reused.
 
+## Python
+
+```bash
+uv pip install pet-kokkos            # CPU wheel (not on PyPI yet: build it as below)
+uv build --wheel                     # from this tree: OpenMP on Linux, threads on macOS
+uv build --wheel -Ccmake.define.PET_BACKEND=cuda -Ccmake.define.Kokkos_ARCH_HOPPER90=ON   # a GPU build
+```
+
+```python
+import pet_kokkos
+from pet_kokkos.ase import PETCalculator
+
+atoms.calc = PETCalculator("pet-mad-s")          # downloads the model on first use
+atoms.get_potential_energy(), atoms.get_forces(), atoms.get_stress()
+
+calc = pet_kokkos.Calculator("pet-mad-s", gemm="tf32", attention="tf32")
+r = calc.compute(numbers, positions, cell, pbc=True)   # energy, energies, forces, virial
+rs = calc.compute_batch([(numbers, positions, cell, True), ...])
+```
+
+A model name not found locally (see Models) is downloaded from the Hugging
+Face repository into `~/.local/share/pet/models`. The ASE calculator keeps a
+Verlet cache of the neighbour topology across steps (`cache_neighbors=True`)
+and reads a charge and spin multiplicity from `atoms.info["charge"]` and
+`atoms.info["spin"]` for models conditioned on them. A wheel built with
+`-Ccmake.define.PET_BUILD_METATOMIC=ON` also carries the metatomic plugin, at
+`pet_kokkos.metatomic_plugin()`.
+
+CPU wheels use OpenMP and OpenBLAS on Linux and Kokkos's C++ threads with
+Accelerate on macOS (Apple's compiler has no OpenMP); a GPU build is one
+backend and one architecture (Kokkos's), so GPU users build from source for
+now. `python/tests` checks the package (`uv run --with pytest --with ase pytest
+python/tests` with it installed).
+
 ## metatomic plugin
 
 `-DPET_BUILD_METATOMIC=ON` builds `metatomic/pet-kokkos-metatomic.so`, a
