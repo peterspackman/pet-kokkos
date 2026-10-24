@@ -62,7 +62,7 @@ set -e
 arch=$(uname -m | sed s/aarch64/sbsa/)
 dnf install -y dnf-plugins-core
 dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/$arch/cuda-rhel8.repo
-dnf install -y cuda-nvcc-12-8 cuda-cudart-devel-12-8 libcublas-devel-12-8
+dnf install -y cuda-nvcc-12-8 cuda-cudart-devel-12-8 cuda-driver-devel-12-8 cuda-cccl-12-8 libcublas-devel-12-8
 curl -fsSL -o /usr/local/bin/nvcc_wrapper https://raw.githubusercontent.com/kokkos/kokkos/5.2.2/bin/nvcc_wrapper
 chmod +x /usr/local/bin/nvcc_wrapper
 """

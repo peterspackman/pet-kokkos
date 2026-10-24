@@ -64,7 +64,7 @@ baseurl=https://repo.radeon.com/rocm/rhel8/6.3.2/main
 enabled=1
 gpgcheck=0
 REPO
-dnf install -y hip-devel hipcc rocm-llvm rocm-device-libs rocm-cmake rocblas-devel hipblaslt-devel
+dnf install -y --disablerepo=epel hip-devel hipcc rocm-llvm rocm-device-libs rocm-cmake rocblas-devel hipblaslt-devel
 """
 environment = { PATH = "/opt/rocm/bin:$PATH", ROCM_PATH = "/opt/rocm", CMAKE_PREFIX_PATH = "/opt/rocm", PET_HIPCC = "/opt/rocm/bin/hipcc" }
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude 'libamdhip64.so*' --exclude 'librocblas.so*' --exclude 'libhipblaslt.so*' --exclude 'libhsa-runtime64.so*' --exclude 'libamd_comgr.so*' --exclude 'librocprofiler-register.so*' --exclude 'libdrm*' --exclude 'libnuma.so*' --exclude 'libelf.so*'"
