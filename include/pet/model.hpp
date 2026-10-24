@@ -148,8 +148,8 @@ struct CompressFold {
 
 // The kept edges, packed: row e of every edge tensor in the model is a real edge,
 // where the builders' slot layout pads every atom up to M. Atom n's edges are
-// [off(n), off(n+1)), in slot order. Attention keeps the padded [N, M+1] token
-// layout: token (n, 1 + m) is edge off(n) + m when that is below off(n+1).
+// [off(n), off(n+1)), in slot order. Attention's tokens are the atoms' rows and
+// then these (Tokens, src/ops.hpp).
 struct PackedEdges {
   int E = 0;
   IView1D off;         // [N+1]

@@ -25,11 +25,24 @@ void linear(View2D out, View2D in, const WeightRef& W, View1D b, Net beta) { wei
 
 // The elementwise passes take four values a thread where their buffers allow
 // (contiguous, aligned to four values, a multiple of four long): one 16-byte
-// load or store, not four, and no row and column to work out. An H200 ran the
-// one-value passes at about half its bandwidth. The arithmetic per value is
-// the same either way.
+// load or store, not four, and no row and column to work out. The arithmetic
+// per value is the same either way. On an H200 that took pet-mad-s on 5184
+// water 33.3 -> 31.2 ms; on an MI250X GCD the one-value passes were 2% faster,
+// so AMD keeps them.
+#if defined(KOKKOS_ENABLE_HIP)
+constexpr bool kQuadPasses = false;
+#else
+constexpr bool kQuadPasses = true;
+#endif
+struct alignas(4 * sizeof(Net)) Quad {
+  Net v[4];
+};
 static bool quads(const View2D& v) {
-  return v.span_is_contiguous() && v.size() % 4 == 0 &&
+  return kQuadPasses && v.span_is_contiguous() && v.size() % 4 == 0 &&
+         reinterpret_cast<std::uintptr_t>(v.data()) % sizeof(Quad) == 0;
+}
+static bool quad_rows(const View2D& v) {
+  return kQuadPasses && v.extent(1) % 4 == 0 && v.stride(0) % 4 == 0 &&
          reinterpret_cast<std::uintptr_t>(v.data()) % sizeof(Quad) == 0;
 }
 KOKKOS_INLINE_FUNCTION Quad& quad(Net* p, std::size_t q) { return reinterpret_cast<Quad*>(p)[q]; }
@@ -215,6 +228,26 @@ void compress_fwd(View2D out, View2D sav, const CompressFold& f, View2D input_ed
   auto nsp = pk.species;
   auto ev = pk.vec;
   auto dist = pk.dist;
+  if (quads(out) && (!save || quads(sav)) && quad_rows(tab) && D % 4 == 0 &&
+      reinterpret_cast<std::uintptr_t>(b.data()) % sizeof(Quad) == 0) {
+    Net *o = out.data(), *sv = sav.data();
+    Kokkos::parallel_for(
+        "compress", RangePolicy(0, int(out.size() / 4)), KOKKOS_LAMBDA(int q) {
+          const int k = 4 * q / D, d0 = 4 * q % D;
+          const Quad pre = gemm ? quad(o, q) : Quad{};
+          const Net e0 = ev(k, 0), e1 = ev(k, 1), e2 = ev(k, 2), e3 = dist(k);
+          Quad z, y;
+          for (int j = 0; j < 4; ++j) {
+            const int d = d0 + j;
+            z.v[j] = (gemm ? pre.v[j] : Net(0)) + b(d) + tab(nsp(k), d) + wx(d, 0) * e0 + wx(d, 1) * e1 +
+                     wx(d, 2) * e2 + wx(d, 3) * e3;
+            y.v[j] = silu(z.v[j]);
+          }
+          if (save) quad(sv, q) = z;
+          quad(o, q) = y;
+        });
+    return;
+  }
   Kokkos::parallel_for(
       "compress", RangePolicy(0, out.extent(0) * D), KOKKOS_LAMBDA(int i) {
         const int k = i / D, d = i % D;
@@ -225,14 +258,17 @@ void compress_fwd(View2D out, View2D sav, const CompressFold& f, View2D input_ed
       });
 }
 
-// One warp per edge: silu' in place, then the four geometry sums as one reduction.
-// Nothing is computed for the species blocks, which are constants.
+// One warp per edge, several edges a block (as the norms: one 32-thread block an
+// edge leaves a large GPU at its limit of resident blocks): silu' in place,
+// then the four geometry sums as one reduction. Nothing is computed for the
+// species blocks, which are constants.
 void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, View2D ie_adj) {
-  const int D = g.extent(1);
+  const int D = g.extent(1), E = g.extent(0);
   auto wx = f.wx;
   Kokkos::parallel_for(
-      "compress_bwd", TeamPolicy(g.extent(0), 1, kLanes), KOKKOS_LAMBDA(const Team& t) {
-        const int r = t.league_rank();
+      "compress_bwd", norm_policy(E), KOKKOS_LAMBDA(const Team& t) {
+        const int r = t.league_rank() * kNormRows + t.team_rank();
+        if (r >= E) return;
         Net a0 = 0, a1 = 0, a2 = 0, a3 = 0;
         Kokkos::parallel_reduce(
             Kokkos::ThreadVectorRange(t, D),
