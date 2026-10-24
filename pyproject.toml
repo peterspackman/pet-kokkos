@@ -13,6 +13,9 @@ dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
 ase = ["ase>=3.23"]
+# GPU cores (python/gpu/): used instead of the CPU one when installed.
+cuda12 = ["pet-kokkos-cuda12"]
+rocm6 = ["pet-kokkos-rocm6"]
 test = ["pytest>=8", "ase>=3.23"]
 
 [project.urls]
@@ -50,6 +53,7 @@ PET_BACKEND = { env = "PET_BACKEND", default = "openmp" }
 
 [[tool.scikit-build.overrides]]
 if.platform-system = "darwin"
+inherit.cmake.define = "append"  # not replace: the defines above still hold
 cmake.define.PET_BACKEND = { env = "PET_BACKEND", default = "threads" }
 
 [tool.pytest.ini_options]

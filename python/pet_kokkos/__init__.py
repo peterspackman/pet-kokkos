@@ -22,7 +22,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from . import _core
+from ._backend import core as _core
 from .models import data_dir, download, resolve
 
 __all__ = ["Calculator", "backend", "download", "data_dir", "metatomic_plugin"]
@@ -31,7 +31,8 @@ _live: "weakref.WeakSet[Calculator]" = weakref.WeakSet()
 
 
 def backend() -> str:
-    """The Kokkos execution space this build computes on."""
+    """The Kokkos execution space this process computes on (Serial, OpenMP,
+    Threads, Cuda, HIP): the CPU core's, or an installed GPU package's."""
     return _core.backend()
 
 
@@ -39,7 +40,7 @@ def metatomic_plugin() -> str | None:
     """The bundled metatomic plugin's path, when this build carries one."""
     from pathlib import Path
 
-    path = Path(__file__).with_name("pet-kokkos-metatomic.so")
+    path = Path(_core.__file__).with_name("pet-kokkos-metatomic.so")
     return str(path) if path.exists() else None
 
 

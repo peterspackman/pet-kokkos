@@ -32,6 +32,32 @@ jobs:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
 
+  # The GPU cores (python/gpu/): CUDA 12 for x86_64 and aarch64, ROCm 6 for
+  # x86_64. Built without a GPU; tested on real hardware by hand.
+  gpu:
+    name: ${{ matrix.package }} ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { package: cuda12, os: ubuntu-24.04 }
+          - { package: cuda12, os: ubuntu-24.04-arm }
+          - { package: rocm6, os: ubuntu-24.04 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      # The toolkits are large: make room on the runner first.
+      - run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: pypa/cibuildwheel@v3.2
+        with:
+          package-dir: python/gpu/${{ matrix.package }}
+          output-dir: wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.package }}-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
   sdist:
     runs-on: ubuntu-24.04
     steps:

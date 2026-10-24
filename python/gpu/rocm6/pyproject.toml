@@ -1,0 +1,70 @@
+# pet-kokkos-rocm6: the compiled core for AMD Instinct GPUs, built from the
+# repository root into pet_kokkos_rocm6. Kokkos builds for gfx90a (MI200, its
+# one architecture); CMAKE_CXX_FLAGS adds gfx942 (MI300). The attention's
+# matrix-core kernels are CDNA's, so no consumer (RDNA) targets. It links the
+# system's ROCm 6 (HIP, rocBLAS, hipBLASLt), which must be installed, as CuPy's
+# ROCm wheels do.
+#   uv build --wheel   (hipcc on the PATH, ROCm under /opt/rocm or ROCM_PATH)
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pet-kokkos-rocm6"
+dynamic = ["version"]
+description = "pet-kokkos for AMD Instinct GPUs (ROCm 6; MI200, MI300): install as pet-kokkos[rocm6]"
+requires-python = ">=3.10"
+license = { file = "../../../LICENSE" }
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.source-dir = "../../.."
+build-dir = "build-py/{wheel_tag}"
+wheel.packages = ["pet_kokkos_rocm6"]
+install.components = ["python"]
+wheel.py-api = "cp312"
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "../../../CMakeLists.txt"
+regex = 'project\(\s*pet_kokkos\s+VERSION\s+(?P<value>[0-9.]+)'
+
+[tool.scikit-build.cmake.define]
+PET_BUILD_PYTHON = "ON"
+PET_BUILD_TESTS = "OFF"
+PET_BUILD_APPS = "OFF"
+PET_INSTALL = "OFF"
+PET_ARCH_NATIVE = "OFF"
+PET_WITH_VESIN = "OFF"
+PET_BACKEND = "hip"
+Kokkos_ARCH_AMD_GFX90A = "ON"
+GPU_TARGETS = "gfx90a"
+CMAKE_CXX_FLAGS = "--offload-arch=gfx942"
+PET_PYTHON_PACKAGE = "pet_kokkos_rocm6"
+CMAKE_CXX_COMPILER = { env = "PET_HIPCC", default = "hipcc" }
+
+# ---- wheels (cibuildwheel, with uv) ------------------------------------------
+# Built in manylinux_2_28 with ROCm 6.3.2 from AMD's RHEL 8 repository (a GPU
+# is not needed to build). ROCm's libraries stay out of the wheel: the system's
+# are used. The CI test only imports the package.
+[tool.cibuildwheel]
+build-frontend = "build[uv]"
+build = ["cp310-*", "cp311-*", "cp312-*"]
+skip = ["*-musllinux_*", "*_i686", "*_aarch64"]
+test-command = "python -c \"import pet_kokkos_rocm6\""
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+before-all = """
+set -e
+cat > /etc/yum.repos.d/rocm.repo <<'REPO'
+[rocm]
+name=ROCm 6.3.2
+baseurl=https://repo.radeon.com/rocm/rhel8/6.3.2/main
+enabled=1
+gpgcheck=0
+REPO
+dnf install -y hip-devel hipcc rocm-llvm rocm-device-libs rocm-cmake rocblas-devel hipblaslt-devel
+"""
+environment = { PATH = "/opt/rocm/bin:$PATH", ROCM_PATH = "/opt/rocm", CMAKE_PREFIX_PATH = "/opt/rocm", PET_HIPCC = "/opt/rocm/bin/hipcc" }
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude 'libamdhip64.so*' --exclude 'librocblas.so*' --exclude 'libhipblaslt.so*' --exclude 'libhsa-runtime64.so*' --exclude 'libamd_comgr.so*' --exclude 'librocprofiler-register.so*' --exclude 'libdrm*' --exclude 'libnuma.so*' --exclude 'libelf.so*'"

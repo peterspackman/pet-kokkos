@@ -15,7 +15,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-from . import _core
+from ._backend import core as _core
 
 REPOSITORY = "peterspackman/pet-kokkos-models"
 _URL = "https://huggingface.co/{repo}/resolve/main/{file}"

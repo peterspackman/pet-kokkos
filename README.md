@@ -102,9 +102,10 @@ FetchContent), the tests and apps are off by default and an existing
 ## Python
 
 ```bash
-uv pip install pet-kokkos            # CPU wheel (not on PyPI yet: build it as below)
-uv build --wheel                     # from this tree: OpenMP on Linux, threads on macOS
-uv build --wheel -Ccmake.define.PET_BACKEND=cuda -Ccmake.define.Kokkos_ARCH_HOPPER90=ON   # a GPU build
+uv pip install pet-kokkos                 # CPU (not on PyPI yet: built by the Wheels workflow)
+uv pip install "pet-kokkos[cuda12]"       # + the NVIDIA GPU core (compute capability 8.0+)
+uv pip install "pet-kokkos[rocm6]"        # + the AMD Instinct core (MI200, MI300; needs ROCm 6)
+uv build --wheel                          # the CPU wheel from this tree
 ```
 
 ```python
@@ -128,10 +129,25 @@ and reads a charge and spin multiplicity from `atoms.info["charge"]` and
 `pet_kokkos.metatomic_plugin()`.
 
 CPU wheels use OpenMP and OpenBLAS on Linux and Kokkos's C++ threads with
-Accelerate on macOS (Apple's compiler has no OpenMP); a GPU build is one
-backend and one architecture (Kokkos's), so GPU users build from source for
-now. `python/tests` checks the package (`uv run --with pytest --with ase pytest
-python/tests` with it installed).
+Accelerate on macOS (Apple's compiler has no OpenMP). The GPU cores are
+separate packages (`python/gpu/`), as JAX's are: `pet_kokkos` uses one when it
+is installed, and `PET_KOKKOS_DEVICE=cpu|cuda|rocm` chooses explicitly.
+
+- `pet-kokkos-cuda12`: one wheel for every NVIDIA GPU from compute capability
+  8.0 (A100, RTX 30xx/40xx, H100/H200 and later). Kokkos builds one
+  architecture, sm_80; `NVCC_APPEND_FLAGS` adds sm_89 and sm_90 code and
+  compute_90 PTX, so each GPU runs code for itself (an sm_80-only build was 6%
+  slower in fp32 on an RTX 4080). The CUDA runtime and cuBLAS come from
+  NVIDIA's pip wheels (`nvidia-cublas-cu12`, ...), the ones PyTorch and JAX
+  use, found through the module's RPATH.
+- `pet-kokkos-rocm6`: MI200 (gfx90a) and MI300 (gfx942). It links the
+  system's ROCm 6 (HIP, rocBLAS, hipBLASLt), which must be installed, as with
+  CuPy's ROCm wheels.
+
+To build one yourself, e.g. for another architecture or toolkit:
+`cd python/gpu/cuda12 && PET_NVCC_WRAPPER=<kokkos>/bin/nvcc_wrapper uv build
+--wheel`. `python/tests` checks the package (`uv run --with pytest --with ase
+pytest python/tests` with it installed).
 
 ## metatomic plugin
 
