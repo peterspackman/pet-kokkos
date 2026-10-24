@@ -1,40 +1,32 @@
-"""Which compiled core this process uses.
+"""The compiled core, with a useful error when a GPU build cannot load it.
 
-The CPU core ships in pet_kokkos itself. A GPU package -- pet-kokkos-cuda12,
-pet-kokkos-rocm6, installed as the extras pet-kokkos[cuda12], ... -- carries
-its own, and is used when installed. PET_KOKKOS_DEVICE=cpu, cuda or rocm
-chooses explicitly. A GPU core that is installed but cannot load (no driver,
-say) falls back to the CPU one with a warning, unless it was asked for.
+Each wheel carries one core: the CPU one, or a GPU variant's (version
+0.1.0+cu12, +rocm6, ...), which needs that GPU's driver and libraries.
 """
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import os
-import warnings
-
-GPU_PACKAGES = ["pet_kokkos_cuda12", "pet_kokkos_rocm6"]
+from importlib import metadata
 
 
-def _load():
-    want = os.environ.get("PET_KOKKOS_DEVICE", "").strip().lower()
-    if want == "cpu":
-        return importlib.import_module("pet_kokkos._core")
-    for name in GPU_PACKAGES:
-        if want and want not in name:
-            continue
-        if importlib.util.find_spec(name) is None:
-            continue
-        try:
-            return importlib.import_module(f"{name}._core")
-        except ImportError as e:
-            if want:
-                raise
-            warnings.warn(f"pet_kokkos: {name} is installed but did not load ({e}); using the CPU core", RuntimeWarning)
-    if want:
-        raise ImportError(f"pet_kokkos: PET_KOKKOS_DEVICE={want}, but no such GPU package is installed")
-    return importlib.import_module("pet_kokkos._core")
+def _variant() -> str:
+    try:
+        return metadata.version("pet-kokkos").partition("+")[2]
+    except metadata.PackageNotFoundError:  # a build tree, not an installed wheel
+        return ""
 
 
-core = _load()
+try:
+    from . import _core as core
+except ImportError as e:
+    v = _variant()
+    if not v:
+        raise
+    need = {
+        "cu": "an NVIDIA driver (libcuda.so.1) and the nvidia-* CUDA wheels",
+        "rocm": "ROCm installed, its libraries (libamdhip64, rocBLAS, hipBLASLt) on the library path",
+    }["cu" if v.startswith("cu") else "rocm"]
+    raise ImportError(
+        f"pet_kokkos {metadata.version('pet-kokkos')} is a GPU build ({v}) and needs {need}: {e}. "
+        "For the CPU build: uv pip install --reinstall pet-kokkos --index-url https://pypi.org/simple"
+    ) from e

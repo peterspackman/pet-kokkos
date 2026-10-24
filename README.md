@@ -102,10 +102,35 @@ FetchContent), the tests and apps are off by default and an existing
 ## Python
 
 ```bash
-uv pip install pet-kokkos                 # CPU (not on PyPI yet: built by the Wheels workflow)
-uv pip install "pet-kokkos[cuda12]"       # + the NVIDIA GPU core (compute capability 8.0+)
-uv pip install "pet-kokkos[rocm6]"        # + the AMD Instinct core (MI200, MI300; needs ROCm 6)
+uv pip install pet-kokkos                 # CPU
 uv build --wheel                          # the CPU wheel from this tree
+```
+
+GPU builds are the same package with a local version label, as PyTorch's are
+(`pet-kokkos 0.1.0+cu12`), served from the GitHub releases through an index
+for each, since PyPI takes no local versions:
+
+```bash
+uv pip install pet-kokkos --extra-index-url https://peterspackman.github.io/pet-kokkos/cu12
+```
+
+| Index | GPUs | Needs |
+|---|---|---|
+| `cu12` | NVIDIA, compute capability 8.0+ (A100, RTX 30xx-50xx, H100/H200, B200) | driver for CUDA 12; the CUDA runtime and cuBLAS come from NVIDIA's pip wheels |
+| `cu13` | as `cu12` | driver for CUDA 13 (580+) |
+| `rocm6` | AMD Instinct MI200 (gfx90a), MI300 (gfx942) | ROCm 6 installed |
+| `rocm7` | as `rocm6`, and MI350 (gfx950) | ROCm 7 installed |
+
+In a uv project, pin the package to one:
+
+```toml
+[[tool.uv.index]]
+name = "pet-cu12"
+url = "https://peterspackman.github.io/pet-kokkos/cu12"
+explicit = true
+
+[tool.uv.sources]
+pet-kokkos = { index = "pet-cu12" }
 ```
 
 ```python
@@ -129,25 +154,23 @@ and reads a charge and spin multiplicity from `atoms.info["charge"]` and
 `pet_kokkos.metatomic_plugin()`.
 
 CPU wheels use OpenMP and OpenBLAS on Linux and Kokkos's C++ threads with
-Accelerate on macOS (Apple's compiler has no OpenMP). The GPU cores are
-separate packages (`python/gpu/`), as JAX's are: `pet_kokkos` uses one when it
-is installed, and `PET_KOKKOS_DEVICE=cpu|cuda|rocm` chooses explicitly.
+Accelerate on macOS (Apple's compiler has no OpenMP). A GPU wheel carries
+only its GPU's core: `pet_kokkos.backend()` says which.
 
-- `pet-kokkos-cuda12`: one wheel for every NVIDIA GPU from compute capability
-  8.0 (A100, RTX 30xx/40xx, H100/H200 and later). Kokkos builds one
-  architecture, sm_80; `NVCC_APPEND_FLAGS` adds sm_89 and sm_90 code and
-  compute_90 PTX, so each GPU runs code for itself (an sm_80-only build was 6%
-  slower in fp32 on an RTX 4080). The CUDA runtime and cuBLAS come from
-  NVIDIA's pip wheels (`nvidia-cublas-cu12`, ...), the ones PyTorch and JAX
-  use, found through the module's RPATH.
-- `pet-kokkos-rocm6`: MI200 (gfx90a) and MI300 (gfx942). It links the
-  system's ROCm 6 (HIP, rocBLAS, hipBLASLt), which must be installed, as with
-  CuPy's ROCm wheels.
+- CUDA: one wheel for every NVIDIA GPU from compute capability 8.0. Kokkos
+  builds one architecture, sm_80; `NVCC_APPEND_FLAGS` adds code for sm_89,
+  sm_90, sm_100 and sm_120 and PTX for later GPUs, so each runs code for itself
+  (an sm_80-only build was 6% slower in fp32 on an RTX 4080). The CUDA runtime
+  and cuBLAS are NVIDIA's pip wheels, the ones PyTorch and JAX use, found
+  through the module's RPATH.
+- ROCm: CDNA GPUs only (the attention's matrix-core kernels). It links the
+  system's ROCm (HIP, rocBLAS, hipBLASLt), as CuPy's ROCm wheels do.
 
-To build one yourself, e.g. for another architecture or toolkit:
-`cd python/gpu/cuda12 && PET_NVCC_WRAPPER=<kokkos>/bin/nvcc_wrapper uv build
---wheel`. `python/tests` checks the package (`uv run --with pytest --with ase
-pytest python/tests` with it installed).
+`PET_KOKKOS_VARIANT=cu12|cu13|rocm6|rocm7 uv build --wheel` builds one
+yourself, e.g. for another architecture or toolkit (pyproject.toml's overrides
+say what each needs); `python/wheels/` has CI's toolchains. `python/tests`
+checks the package (`uv run --with pytest --with ase pytest python/tests` with
+it installed).
 
 ## metatomic plugin
 

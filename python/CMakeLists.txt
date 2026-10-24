@@ -1,13 +1,11 @@
 # The Python package's compiled module, _core (nanobind). It carries
 # pet-kokkos and Kokkos inside, their symbols kept to itself, like the metatomic
 # plugin. A wheel build (pyproject.toml, scikit-build-core) installs it, and the
-# plugin when that is built too, into PET_PYTHON_PACKAGE: pet_kokkos for the
-# CPU wheel, or a GPU package's own (pet_kokkos_cuda12, ...; python/gpu/).
+# plugin when that is built too, into pet_kokkos.
 
-set(PET_PYTHON_PACKAGE "pet_kokkos" CACHE STRING "Python package the module installs into")
-# A CUDA package finds the CUDA runtime and cuBLAS in NVIDIA's pip wheels
-# (nvidia-cuda-runtime-cu12, nvidia-cublas-cu12), installed next to it in
-# site-packages, rather than bundling them.
+# A CUDA wheel finds the CUDA runtime and cuBLAS in NVIDIA's pip wheels
+# (nvidia/cu12's under cublas/ and cuda_runtime/, CUDA 13's under cu13/),
+# installed next to it in site-packages, rather than bundling them.
 option(PET_PYTHON_NVIDIA_WHEELS "Find the CUDA libraries in NVIDIA's pip wheels" OFF)
 
 find_package(Python 3.9 REQUIRED COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT})
@@ -28,7 +26,7 @@ if(PET_PYTHON_NVIDIA_WHEELS)
         "${_nv}/cublas/lib;${_nv}/cuda_runtime/lib;${_nv}/cu13/lib")
 endif()
 
-install(TARGETS _core LIBRARY DESTINATION ${PET_PYTHON_PACKAGE} COMPONENT python)
+install(TARGETS _core LIBRARY DESTINATION pet_kokkos COMPONENT python)
 if(PET_BUILD_METATOMIC)
-    install(TARGETS pet_metatomic LIBRARY DESTINATION ${PET_PYTHON_PACKAGE} COMPONENT python)
+    install(TARGETS pet_metatomic LIBRARY DESTINATION pet_kokkos COMPONENT python)
 endif()

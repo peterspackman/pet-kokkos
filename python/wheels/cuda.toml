@@ -1,0 +1,30 @@
+# cibuildwheel for the CUDA variants (pyproject.toml's overrides), from the
+# Wheels workflow: PET_KOKKOS_VARIANT=cu12 or cu13 and PET_CUDA, the toolkit
+# (12-8, 13-0), passed in. Built in manylinux_2_28 with NVIDIA's RHEL 8
+# packages (no GPU needed) and Kokkos's nvcc_wrapper. sm_80 is Kokkos's
+# architecture; NVCC_APPEND_FLAGS adds code for Ada (sm_89), Hopper (sm_90)
+# and Blackwell (sm_100, sm_120), and compute_120 PTX for later GPUs. The CUDA
+# libraries stay out of the wheel: NVIDIA's pip wheels provide them. The CI
+# test only looks for the module, the runners having no GPU.
+[tool.cibuildwheel]
+build-frontend = "build[uv]"
+build = ["cp310-*", "cp311-*", "cp312-*"]
+skip = ["*-musllinux_*", "*_i686"]
+test-command = "python -c \"import importlib.metadata as m; assert any(f.name.startswith('_core') for f in m.files('pet-kokkos'))\""
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+environment-pass = ["PET_KOKKOS_VARIANT", "PET_CUDA"]
+before-all = """
+set -e
+arch=$(uname -m | sed s/aarch64/sbsa/)
+dnf install -y dnf-plugins-core
+dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/$arch/cuda-rhel8.repo
+dnf install -y cuda-nvcc-$PET_CUDA cuda-cudart-devel-$PET_CUDA cuda-driver-devel-$PET_CUDA cuda-cccl-$PET_CUDA libcublas-devel-$PET_CUDA
+ln -sfn /usr/local/cuda-$(echo $PET_CUDA | tr - .) /usr/local/cuda
+curl -fsSL -o /usr/local/bin/nvcc_wrapper https://raw.githubusercontent.com/kokkos/kokkos/5.2.2/bin/nvcc_wrapper
+chmod +x /usr/local/bin/nvcc_wrapper
+"""
+environment = { PATH = "/usr/local/cuda/bin:$PATH", CUDA_HOME = "/usr/local/cuda", PET_NVCC_WRAPPER = "/usr/local/bin/nvcc_wrapper", NVCC_APPEND_FLAGS = "-gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100 -gencode=arch=compute_120,code=sm_120 -gencode=arch=compute_120,code=compute_120" }
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude libcuda.so.1 --exclude 'libcudart.so.*' --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*'"

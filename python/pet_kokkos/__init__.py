@@ -32,7 +32,7 @@ _live: "weakref.WeakSet[Calculator]" = weakref.WeakSet()
 
 def backend() -> str:
     """The Kokkos execution space this process computes on (Serial, OpenMP,
-    Threads, Cuda, HIP): the CPU core's, or an installed GPU package's."""
+    Threads, Cuda, HIP): this build's."""
     return _core.backend()
 
 
