@@ -11,7 +11,7 @@
 namespace pet {
 
 void PetModel::residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D input_edge,
-                              View2D node_out, View2D edge_out, ResidualSaves* sav, bool save_wide) {
+                              View2D tokens, ResidualSaves* sav, bool save_wide) {
   const int N = dev.centres(), S = dev.max_neighbors + 1, E = pk.E;
   const int D = h_.d_pet, A = h_.num_attention_layers;
   auto off = pk.off;
@@ -24,19 +24,15 @@ void PetModel::residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, 
     return ws_.n2("rs_" + name + "_" + sav->tag + "_" + std::to_string(a), r, c);
   };
 
-  View2D node_L = ws_.n2("re_node_L", N, D);
-  gather(node_L, mat("node_embedders." + ls + ".weight").v, dev.species);
-  View2D cpre = ws_.n2("re_cpre", E, D), et = ws_.n2("re_et", E, D);
+  // The tokens [node_L ; et] (Tokens), written in place: the species embedding
+  // into the atom rows, compress into the edge rows. They become the layer's
+  // output there, the caller's node and edge features.
+  gather(View2D(tokens.data(), N, D), mat("node_embedders." + ls + ".weight").v, dev.species);
+  View2D cpre = ws_.n2("re_cpre", E, D);
   if (save) sav->cpre = ws_.n2("rs_cpre_" + sav->tag, E, D);
   compress_fwd(cpre, save ? sav->cpre : View2D(), compress_fold(L), input_edge, pk);
-  linear(et, cpre, mat(g + ".compress.2.weight"), vec(g + ".compress.2.bias"));
-
-  View2D tokens = ws_.n2("re_tokens", T, D);
-  Kokkos::parallel_for(
-      "re_tok", RangePolicy(0, T * D), KOKKOS_LAMBDA(int i) {
-        const int row = i / D, d = i % D;
-        tokens(row, d) = row < N ? node_L(row, d) : et(row - N, d);
-      });
+  linear(View2D(tokens.data() + std::size_t(N) * D, E, D), cpre, mat(g + ".compress.2.weight"),
+         vec(g + ".compress.2.bias"));
 
   // PostLN: tokens = norm(tokens + attention(tokens)), then norm(t + mlp(t)).
   for (int a = 0; a < A; ++a) {
@@ -63,13 +59,6 @@ void PetModel::residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, 
     }
     norm(tokens, s2, tl + ".norm_mlp", tok_a);  // s2 += tok_a first
   }
-
-  Kokkos::parallel_for(
-      "re_split", RangePolicy(0, T * D), KOKKOS_LAMBDA(int i) {
-        const int row = i / D, d = i % D;
-        if (row < N) node_out(row, d) = tokens(row, d);
-        else edge_out(row - N, d) = tokens(row, d);
-      });
 }
 
 DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
@@ -111,15 +100,19 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   const bool keep_wide = rc == Recompute::Never, ckpt = grad && rc == Recompute::Layers;
   std::vector<ResidualSaves> sav(grad && !ckpt ? G : 0);
   std::vector<View2D> inputs(ckpt ? G : 0);
+  // Each layer's tokens (Tokens): its atom rows and edge rows are its node and
+  // edge features.
+  auto atom_rows = [&](View2D t) { return View2D(t.data(), N, D); };
+  auto edge_rows = [&](View2D t) { return View2D(t.data() + std::size_t(N) * D, E, D); };
   std::vector<View2D> node_feat(G), edge_feat(G);
 
   for (int L = 0; L < G; ++L) {
     const std::string ls = std::to_string(L);
     if (ckpt) copy(inputs[L] = ws_.n2("rck_ie_" + ls, E, D), input_edge);
     if (!sav.empty()) sav[L].tag = ls;
-    View2D node_out = node_feat[L] = ws_.n2("re_nfeat_" + ls, N, D);
-    View2D edge_out = edge_feat[L] = ws_.n2("re_efeat_" + ls, E, D);
-    residual_layer(dev, pk, L, input_edge, node_out, edge_out, sav.empty() ? nullptr : &sav[L], keep_wide);
+    const View2D tokens = ws_.n2("re_tokens_" + ls, T, D);
+    View2D node_out = node_feat[L] = atom_rows(tokens), edge_out = edge_feat[L] = edge_rows(tokens);
+    residual_layer(dev, pk, L, input_edge, tokens, sav.empty() ? nullptr : &sav[L], keep_wide);
     if (cond.extent(0) == (std::size_t) N)
       Kokkos::parallel_for(
           "re_cond_add", RangePolicy(0, N * D), KOKKOS_LAMBDA(int i) { node_out(i / D, i % D) += cond(i / D, i % D); });
@@ -149,11 +142,12 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
   Kokkos::deep_copy(ExecSpace(), x4_adj, Net(0));
   Kokkos::deep_copy(ExecSpace(), cf_seq_adj, Net(0));
   View1D cutoff_adj = ws_.n1("re_cutoff_adj", E);
-  std::vector<View2D> node_adj(G), edge_adj(G);  // of each layer's read-out features
+  // Of each layer's read-out features: the adjoint of its tokens, by rows.
+  std::vector<View2D> tokens_adj_of(G), node_adj(G), edge_adj(G);
   for (int L = 0; L < G; ++L) {
-    node_adj[L] = ws_.n2("re_nfa_" + std::to_string(L), N, D), edge_adj[L] = ws_.n2("re_efa_" + std::to_string(L), E, D);
-    if (L >= R)  // a layer with no read-out of its own
-      Kokkos::deep_copy(ExecSpace(), node_adj[L], Net(0)), Kokkos::deep_copy(ExecSpace(), edge_adj[L], Net(0));
+    tokens_adj_of[L] = ws_.n2("re_fa_" + std::to_string(L), T, D);
+    node_adj[L] = atom_rows(tokens_adj_of[L]), edge_adj[L] = edge_rows(tokens_adj_of[L]);
+    if (L >= R) Kokkos::deep_copy(ExecSpace(), tokens_adj_of[L], Net(0));  // a layer with no read-out of its own
   }
   for (int i = 0; i < R; ++i) readout_bwd(rs, i, pk, N, node_adj[i], edge_adj[i], cutoff_adj, i > 0);
 
@@ -175,11 +169,11 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     ResidualSaves one;
     if (ckpt) {
       one.tag = "r";  // one shared set of saves
-      residual_layer(dev, pk, L, inputs[L], ws_.n2("re_nfeat_r", N, D), ws_.n2("re_efeat_r", E, D), &one, false);
+      residual_layer(dev, pk, L, inputs[L], ws_.n2("re_tokens_r", T, D), &one, false);
     }
     const ResidualSaves& s = ckpt ? one : sav[L];
     const bool kept_wide = keep_wide && !ckpt;
-    auto efa = edge_adj[L], nfa = node_adj[L];
+    auto efa = edge_adj[L];
     if (L + 1 < G) {  // message passing: half of the next input's adjoint, from the reverse edge
       const View2D partner = remote ? swap_rows(ie_adj, Net(0.5)) : View2D();
       Kokkos::parallel_for(
@@ -188,12 +182,9 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
             efa(k, d) += r >= 0 ? Net(0.5) * ie_adj(r, d) : remote && ro(k) >= 0 ? partner(ro(k), d) : Net(0);
           });
     }
-    View2D tokens_adj = ws_.n2("re_tokens_adj", T, D);
-    Kokkos::parallel_for(
-        "reb_tok", RangePolicy(0, T * D), KOKKOS_LAMBDA(int i) {
-          const int row = i / D, d = i % D;
-          tokens_adj(row, d) = row < N ? nfa(row, d) : row - N < off(N) ? efa(row - N, d) : Net(0);
-        });
+    // The read-out's adjoint is the tokens' already (a capacity's dead edge rows
+    // carry what they carry: no live row reads them).
+    View2D tokens_adj = tokens_adj_of[L];
 
     for (int a = A - 1; a >= 0; --a) {
       const std::string tl = g + ".trans.layers." + std::to_string(a);

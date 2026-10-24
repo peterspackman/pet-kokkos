@@ -277,10 +277,12 @@ class PetModel {
   void ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, int L, const LayerSaves& sav,
                     bool kept_wide, View2D node_adj, View2D input_edge_adj, View2D x4_adj,
                     View2D cf_seq_adj);
-  // One residual GNN layer from input_edge to its read-out features; sav null
-  // saves nothing, save_wide keeps qkv and the MLP pre-activation.
+  // One residual GNN layer from input_edge to its read-out features: tokens
+  // [N + E, d_pet] (Tokens) are filled and left holding them, the atom rows the
+  // node features and the edge rows the edge features. sav null saves nothing,
+  // save_wide keeps qkv and the MLP pre-activation.
   void residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D input_edge,
-                      View2D node_out, View2D edge_out, ResidualSaves* sav, bool save_wide);
+                      View2D tokens, ResidualSaves* sav, bool save_wide);
   PackedEdges pack_edges(const DeviceEdgeData& dev);
   View2D conditioning(const DeviceEdgeData& dev);
   void readout_bwd(const ReadoutSaves& sav, int i, const PackedEdges& pk, int N, View2D node_adj,
