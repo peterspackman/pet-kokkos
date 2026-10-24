@@ -372,6 +372,8 @@ TEST_CASE("a structure's answer does not depend on the batch it is in", "[model]
 TEST_CASE("the GEMM's tile does not change the answer", "[model][determinism]") {
   // The batch invariance above rests on this: every CUTLASS tile runs the same
   // per-element FMA chain, so the tile -- chosen by the GEMM's size -- is free.
+  // On a host backend without a CBLAS (CI) it runs the naive loop for minutes.
+  if (quick()) SKIP("PET_TEST_QUICK is set");
   if (!pet::batch_invariant_gemms()) {
     WARN("this build's GEMMs are not batch-invariant; skipping the tile check");
     return;
