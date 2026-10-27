@@ -132,7 +132,10 @@ class Calculator:
 
 @atexit.register
 def _shutdown() -> None:
-    # Every model's device memory must go before Kokkos does.
+    # Every model's device memory must go before Kokkos does. The wrappers may
+    # outlive us (IPython's Out history holds them), so drop their cores here
+    # too, or nanobind reports them as leaked.
     for calc in list(_live):
         calc.close()
+        del calc._calc
     _core._finalize()

@@ -5,6 +5,8 @@ A model that is not installed skips its tests rather than being downloaded.
 """
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -109,3 +111,18 @@ def test_backend_and_closing():
     calc.close()
     with pytest.raises(RuntimeError):
         calc.compute([14], [[0.0, 0.0, 0.0]])
+
+
+def test_no_leak_warning_when_a_calculator_outlives_the_interpreter():
+    # As in IPython, whose Out history keeps calculators past atexit: an extra
+    # reference that is never dropped.
+    if _core.find_model("pet-mad-xs") is None:
+        pytest.skip("model pet-mad-xs is not installed")
+    script = (
+        "import ctypes, pet_kokkos\n"
+        "calc = pet_kokkos.Calculator('pet-mad-xs')\n"
+        "ctypes.pythonapi.Py_IncRef(ctypes.py_object(calc))\n"
+    )
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert "leaked" not in run.stderr, run.stderr
