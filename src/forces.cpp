@@ -19,20 +19,20 @@ namespace {
 
 // The smooth cutoff factors' derivatives in the distance, in float like the
 // factors themselves (pet/cutoff.hpp).
-KOKKOS_INLINE_FUNCTION double bump_ddist(double d, double rc, double w) {
+KOKKOS_INLINE_FUNCTION Real bump_ddist(Real d, Real rc, Real w) {
   const float x = (float) ((d - (rc - w)) / w);
   if (x <= 0.0f || x >= 1.0f) return 0.0;
   const float si = Kokkos::sin((float) detail::PET_PI * x);
   const float t = Kokkos::tanh(Kokkos::cos((float) detail::PET_PI * x) / si);
   const float du = (-(float) detail::PET_PI / (si * si)) / (float) w;
-  return 0.5 * (1.0 - (double) (t * t)) * (double) du;
+  return Real(0.5) * (Real(1.0) - (Real) (t * t)) * (Real) du;
 }
-KOKKOS_INLINE_FUNCTION double cosine_ddist(double d, double rc, double w) {
+KOKKOS_INLINE_FUNCTION Real cosine_ddist(Real d, Real rc, Real w) {
   const float x = (float) ((d - (rc - w)) / w);
   if (x <= 0.0f || x >= 1.0f) return 0.0;
-  return 0.5 * (double) (-(float) detail::PET_PI * Kokkos::sin((float) detail::PET_PI * x)) / w;
+  return Real(0.5) * (Real) (-(float) detail::PET_PI * Kokkos::sin((float) detail::PET_PI * x)) / w;
 }
-KOKKOS_INLINE_FUNCTION double cutoff_ddist(double d, double rc, double w, bool bump) {
+KOKKOS_INLINE_FUNCTION Real cutoff_ddist(Real d, Real rc, Real w, bool bump) {
   return bump ? bump_ddist(d, rc, w) : cosine_ddist(d, rc, w);
 }
 
@@ -42,14 +42,14 @@ KOKKOS_INLINE_FUNCTION double cutoff_ddist(double d, double rc, double w, bool b
 //   F(a) = sum over a's edges k of [g(k) - g(reverse(k))],
 // which each atom gathers alone, in edge order.
 void fold_edge_gradients(Workspace& ws, RView2D grad, const PackedEdges& pk, IView1D sid, int N,
-                         int NS, double scale, RView2D forces, RView2D vir9) {
+                         int NS, Real scale, RView2D forces, RView2D vir9) {
   RView2D vir_atom = ws.r2("fold:vir_atom", N, 9);
   auto off = pk.off, rev = pk.reverse;
   auto vec = pk.vec;
   const int nc = pk.off.extent(0) - 1;  // atoms with edges; the rest are only neighbours
   Kokkos::parallel_for(
       "fold_forces", RangePolicy(0, N), KOKKOS_LAMBDA(int i) {
-        double f[3] = {0, 0, 0}, w[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+        Real f[3] = {0, 0, 0}, w[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
         for (int k = i < nc ? off(i) : 0; k < (i < nc ? off(i + 1) : 0); ++k) {
           for (int c = 0; c < 3; ++c) f[c] += grad(k, c);
           for (int a = 0; a < 3; ++a)
@@ -72,7 +72,7 @@ void fold_edge_gradients(Workspace& ws, RView2D grad, const PackedEdges& pk, IVi
 // The scheme always tapers with the bump function, whatever the model's own
 // cutoff function: metatrain's adaptive_cutoff.py does, and so do the forwards.
 void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h, RView1D probes,
-                       int P, RView1D adapted_adj, double scale, RView2D forces, RView2D vir9,
+                       int P, RView1D adapted_adj, Real scale, RView2D forces, RView2D vir9,
                        RView2D edge_grad) {
   const int N = dev.n_atoms, E = dev.n_raw, NS = dev.n_struct;
   const bool solver = h.adaptive_cutoff_method == AdaptiveCutoffMethod::Solver;
@@ -81,7 +81,7 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
   auto sid = dev.struct_id;
   auto dist = dev.raw_dist;
   auto vec = dev.raw_vec;
-  const double width = h.cutoff_width_adaptive, target = h.num_neighbors_adaptive;
+  const Real width = h.cutoff_width_adaptive, target = h.num_neighbors_adaptive;
   RView1D gmag = ws.r1("ad:gmag", E);
 
   if (solver) {
@@ -97,8 +97,8 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
     Kokkos::parallel_for(
         "ad_gmag_solver", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
           const int c = center(e);
-          const double d = dist(e);
-          if (d <= 0.0 || dn(c) <= 0.0) return (void) (gmag(e) = 0.0);
+          const Real d = dist(e);
+          if (d <= Real(0.0) || dn(c) <= Real(0.0)) return (void) (gmag(e) = Real(0.0));
           gmag(e) = scale * adapted_adj(c) * (-bump_ddist(d, r(c), width) / dn(c)) / d;
         });
   } else {
@@ -114,7 +114,7 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
     const bool have_eff = (int) eff.extent(0) == N && (int) eff.extent(1) == P;
     if (!have_eff) {
       eff = ws.r2("ad:eff", N, P);
-      Kokkos::deep_copy(ExecSpace(), eff, 0.0);
+      Kokkos::deep_copy(ExecSpace(), eff, Real(0.0));
       Kokkos::parallel_for(
           "ad_eff", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
             for (int p = 0; p < P; ++p) Kokkos::atomic_add(&eff(center(e), p), detail::dev_bump_cutoff(dist(e), probes(p), width));
@@ -126,46 +126,46 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
     Kokkos::parallel_for(
         "ad_diff", RangePolicy(0, N * P), KOKKOS_LAMBDA(int i) {
           const int a = i / P, p = i % P;
-          const double x = (double) p / (P - 1);
+          const Real x = (Real) p / (P - 1);
           diff(a, p) = eff(a, p) - target + target * x * x * x;
         });
     Kokkos::parallel_for(
         "ad_grad", RangePolicy(0, N * P), KOKKOS_LAMBDA(int i) {
           const int a = i / P, p = i % P;
-          const double g = p == 0       ? diff(a, 1) - diff(a, 0)
+          const Real g = p == 0       ? diff(a, 1) - diff(a, 0)
                            : p == P - 1 ? diff(a, P - 1) - diff(a, P - 2)
-                                        : 0.5 * (diff(a, p + 1) - diff(a, p - 1));
-          const double ag = Kokkos::fabs(g);
-          grad(a, p) = (ag > 1e-12) ? ag : 1e-12;
-          gsign(a, p) = (ag >= 1e-12) ? ((g > 0.0) ? 1.0 : (g < 0.0 ? -1.0 : 0.0)) : 0.0;
+                                        : Real(0.5) * (diff(a, p + 1) - diff(a, p - 1));
+          const Real ag = Kokkos::fabs(g);
+          grad(a, p) = (ag > Real(1e-12)) ? ag : Real(1e-12);
+          gsign(a, p) = (ag >= Real(1e-12)) ? ((g > Real(0.0)) ? Real(1.0) : (g < Real(0.0) ? -Real(1.0) : Real(0.0))) : Real(0.0);
         });
     Kokkos::parallel_for(
         "ad_w", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
-          double mx = -1e300;
+          Real mx = -1e300;
           for (int p = 0; p < P; ++p) {
-            w(a, p) = -0.5 * (diff(a, p) / grad(a, p)) * (diff(a, p) / grad(a, p));
+            w(a, p) = -Real(0.5) * (diff(a, p) / grad(a, p)) * (diff(a, p) / grad(a, p));
             if (w(a, p) > mx) mx = w(a, p);
           }
-          double s = 0.0;
+          Real s = 0.0;
           for (int p = 0; p < P; ++p) s += (w(a, p) = Kokkos::exp(w(a, p) - mx));
-          double c = 0.0;
+          Real c = 0.0;
           for (int p = 0; p < P; ++p) c += probes(p) * (w(a, p) /= s);
           cutoff(a) = c;
         });
     Kokkos::parallel_for(
         "ad_C", RangePolicy(0, N * P), KOKKOS_LAMBDA(int i) {
           const int a = i / P, p = i % P;
-          const double A = adapted_adj(a) * w(a, p) * (probes(p) - cutoff(a));
-          const double gd = grad(a, p);
+          const Real A = adapted_adj(a) * w(a, p) * (probes(p) - cutoff(a));
+          const Real gd = grad(a, p);
           diff_adj(a, p) = A * (-(diff(a, p) / (gd * gd)));
           Cq(a, p) = A * (diff(a, p) * diff(a, p) / (gd * gd * gd)) * gsign(a, p);
         });
     Kokkos::parallel_for(
         "ad_B", RangePolicy(0, N * P), KOKKOS_LAMBDA(int i) {  // adjoint of torch.gradient
           const int a = i / P, r = i % P;
-          double B = 0.0;
-          if (r - 1 >= 1 && r - 1 <= P - 2) B += 0.5 * Cq(a, r - 1);
-          if (r + 1 >= 1 && r + 1 <= P - 2) B += -0.5 * Cq(a, r + 1);
+          Real B = 0.0;
+          if (r - 1 >= 1 && r - 1 <= P - 2) B += Real(0.5) * Cq(a, r - 1);
+          if (r + 1 >= 1 && r + 1 <= P - 2) B += -Real(0.5) * Cq(a, r + 1);
           if (r == 1) B += Cq(a, 0);
           if (r == 0) B += -Cq(a, 0);
           if (r == P - 1) B += Cq(a, P - 1);
@@ -178,12 +178,12 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
     // engine's skin -- touches none.
     Kokkos::parallel_for(
         "ad_gmag_grid", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
-          const double d = dist(e);
-          if (d <= 0.0) return (void) (gmag(e) = 0.0);
-          const double p0 = probes(0), dp = P > 1 ? probes(1) - probes(0) : 1.0;
+          const Real d = dist(e);
+          if (d <= Real(0.0)) return (void) (gmag(e) = Real(0.0));
+          const Real p0 = probes(0), dp = P > 1 ? probes(1) - probes(0) : Real(1.0);
           const int lo = Kokkos::max((int) Kokkos::floor((d - p0) / dp), 0);
           const int hi = Kokkos::min((int) Kokkos::ceil((d + width - p0) / dp) + 1, P);
-          double da = 0.0;
+          Real da = 0.0;
           for (int p = lo; p < hi; ++p) da += diff_adj(center(e), p) * bump_ddist(d, probes(p), width);
           gmag(e) = scale * da / d;
         });
@@ -201,7 +201,7 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
         "ad_scatter", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
           const int c = center(e), j = neigh(e), b = NS > 1 ? sid(c) : 0;
           for (int x = 0; x < 3; ++x) {
-            const double g = gmag(e) * vec(e, x);
+            const Real g = gmag(e) * vec(e, x);
             Kokkos::atomic_add(&forces(c, x), g);
             Kokkos::atomic_add(&forces(j, x), -g);
             for (int y = 0; y < 3; ++y) Kokkos::atomic_add(&vir9(b, y * 3 + x), vec(e, y) * g);
@@ -215,16 +215,16 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
   // partials are combined in a fixed order -- the same bits every run.
   RView2D vir_atom = ws.r2("ad:vir_atom", N, 9);
   constexpr int kSums = 12;  // force, then the virial
-  const std::size_t shmem = sizeof(double) * kLanes * kSums;
+  const std::size_t shmem = sizeof(Real) * kLanes * kSums;
   Kokkos::parallel_for(
       "ad_gather", TeamPolicy(N, 1, kLanes).set_scratch_size(0, Kokkos::PerTeam(shmem)),
       KOKKOS_LAMBDA(const TeamPolicy::member_type& m) {
         const int a = m.league_rank();
-        double* part = (double*) m.team_scratch(0).get_shmem(shmem);
+        Real* part = (Real*) m.team_scratch(0).get_shmem(shmem);
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(m, kLanes), [&](int l) {
-          double s[kSums] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+          Real s[kSums] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
           for (int e = roff(a) + l; e < roff(a + 1); e += kLanes) {
-            const double ge = gmag(e), gr = rrev(e) >= 0 ? gmag(rrev(e)) : 0.0;
+            const Real ge = gmag(e), gr = rrev(e) >= 0 ? gmag(rrev(e)) : Real(0.0);
             for (int c = 0; c < 3; ++c) s[c] += (ge + gr) * vec(e, c);
             for (int x = 0; x < 3; ++x)
               for (int y = 0; y < 3; ++y) s[3 + x * 3 + y] += vec(e, x) * ge * vec(e, y);
@@ -233,7 +233,7 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
         });
         m.team_barrier();
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(m, kSums), [&](int t) {
-          double s = 0.0;
+          Real s = 0.0;
           for (int l = 0; l < kLanes; ++l) s += part[l * kSums + t];
           if (t < 3) forces(a, t) += s;
           else vir_atom(a, t - 3) = s;
@@ -273,10 +273,10 @@ void sum_by_structure(RView2D x, IView1D soff, RView2D out, bool acc) {
       "struct_sum", TeamPolicy(out.extent(0) * T, 1, kLanes), KOKKOS_LAMBDA(const TeamPolicy::member_type& m) {
         const int b = m.league_rank() / T, t = m.league_rank() % T;
         const int a0 = soff(b), a1 = soff(b + 1);
-        double s = 0.0;
+        Real s = 0.0;
         Kokkos::parallel_reduce(
             Kokkos::ThreadVectorRange(m, kLanes),
-            [&](int l, double& part) {
+            [&](int l, Real& part) {
               for (int a = a0 + l; a < a1; a += kLanes) part += x(a, t);
             },
             s);
@@ -289,7 +289,7 @@ namespace {
 // The adaptive cutoff's share: each kept edge's pair-cutoff adjoint, half to
 // each end, then back through each atom's cutoff to its raw edges.
 void adaptive_part(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h, RView1D probes, int n_probes,
-                   const PackedEdges& pk, RView1D pc_adj, double scale, RView2D forces, RView2D vir9,
+                   const PackedEdges& pk, RView1D pc_adj, Real scale, RView2D forces, RView2D vir9,
                    RView2D edge_grad) {
   const int N = dev.n_atoms;
   auto off = pk.off, rev = pk.reverse;
@@ -297,10 +297,10 @@ void adaptive_part(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h, RV
   const int nc = pk.off.extent(0) - 1;
   Kokkos::parallel_for(
       "adapted_adj", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
-        double s = 0.0;
+        Real s = 0.0;
         for (int k = a < nc ? off(a) : 0; k < (a < nc ? off(a + 1) : 0); ++k) {
-          s += 0.5 * pc_adj(k);
-          if (rev(k) >= 0) s += 0.5 * pc_adj(rev(k));
+          s += Real(0.5) * pc_adj(k);
+          if (rev(k) >= 0) s += Real(0.5) * pc_adj(rev(k));
         }
         adapted_adj(a) = s;
       });
@@ -314,7 +314,7 @@ void adaptive_part(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h, RV
           "remote_adapted", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
             for (int k = ooff(a); k < ooff(a + 1); ++k) {
               const int s = slot(oedge(k)), p = s >= 0 ? slot_edge(s) : -1;
-              if (p >= 0) adapted_adj(a) += 0.5 * pc_adj(p);
+              if (p >= 0) adapted_adj(a) += Real(0.5) * pc_adj(p);
             }
           });
     }
@@ -331,7 +331,7 @@ void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdg
                        RView2D& edge_grad) {
   const int N = dev.n_atoms, E = pk.E;
   const bool adaptive = h.adaptive(), bump = h.cutoff_function == CutoffFunction::Bump;
-  const double width = h.cutoff_width;
+  const Real width = h.cutoff_width;
 
   // dE/dv per edge: through (v, |v|) directly, and through |v| into the cutoff
   // factor, which the readout and the attention bias both use. With an adaptive
@@ -351,10 +351,10 @@ void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdg
           return;
         }
         const int n = center(k), m = k - off(n);
-        const double cutoff_total = cutoff_adj(k) + cf_seq_adj(n, 1 + m);
-        const double dcut_dd = cutoff_ddist(dist(k), pcut(k), width, bump);
-        const double dist_adj = x4_adj(k, 3) + cutoff_total * dcut_dd;
-        const double invd = (dist(k) > 0.0) ? 1.0 / dist(k) : 0.0;
+        const Real cutoff_total = cutoff_adj(k) + cf_seq_adj(n, 1 + m);
+        const Real dcut_dd = cutoff_ddist(dist(k), pcut(k), width, bump);
+        const Real dist_adj = x4_adj(k, 3) + cutoff_total * dcut_dd;
+        const Real invd = (dist(k) > Real(0.0)) ? Real(1.0) / dist(k) : Real(0.0);
         for (int c = 0; c < 3; ++c) grad(k, c) = x4_adj(k, c) + dist_adj * vec(k, c) * invd;
         if (adaptive) pc_adj(k) = -cutoff_total * dcut_dd;
       });
@@ -372,7 +372,7 @@ void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdg
     Kokkos::parallel_for(
         "raw_edge_grad", RangePolicy(0, R), KOKKOS_LAMBDA(int e) {
           const int k = slot(e) >= 0 ? slot_edge(slot(e)) : -1;
-          for (int c = 0; c < 3; ++c) edge_grad(e, c) = k >= 0 ? scale * grad(k, c) : 0.0;
+          for (int c = 0; c < 3; ++c) edge_grad(e, c) = k >= 0 ? scale * grad(k, c) : Real(0.0);
         });
   } else {
     edge_grad = RView2D();

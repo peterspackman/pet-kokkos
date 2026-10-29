@@ -24,20 +24,20 @@ namespace pet {
 // Images to search along each lattice vector (cell rows) for `cutoff`: the
 // device twin of detail::image_ranges; `periodic` is a bitmask of the periodic
 // axes.
-KOKKOS_INLINE_FUNCTION
-void image_ranges_rows(const double cell[9], double cutoff, int periodic, int n[3]) {
+template <class T>
+KOKKOS_INLINE_FUNCTION void image_ranges_rows(const T cell[9], T cutoff, int periodic, int n[3]) {
   n[0] = n[1] = n[2] = 0;
-  const double a[3] = {cell[0], cell[1], cell[2]};
-  const double b[3] = {cell[3], cell[4], cell[5]};
-  const double c[3] = {cell[6], cell[7], cell[8]};
-  const double bc[3] = {b[1]*c[2]-b[2]*c[1], b[2]*c[0]-b[0]*c[2], b[0]*c[1]-b[1]*c[0]};
-  const double ca[3] = {c[1]*a[2]-c[2]*a[1], c[2]*a[0]-c[0]*a[2], c[0]*a[1]-c[1]*a[0]};
-  const double ab[3] = {a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]};
-  const double vol = Kokkos::fabs(a[0]*bc[0] + a[1]*bc[1] + a[2]*bc[2]);
-  if (vol < 1e-12) return;
-  const double nbc = Kokkos::sqrt(bc[0]*bc[0]+bc[1]*bc[1]+bc[2]*bc[2]);
-  const double nca = Kokkos::sqrt(ca[0]*ca[0]+ca[1]*ca[1]+ca[2]*ca[2]);
-  const double nab = Kokkos::sqrt(ab[0]*ab[0]+ab[1]*ab[1]+ab[2]*ab[2]);
+  const T a[3] = {cell[0], cell[1], cell[2]};
+  const T b[3] = {cell[3], cell[4], cell[5]};
+  const T c[3] = {cell[6], cell[7], cell[8]};
+  const T bc[3] = {b[1]*c[2]-b[2]*c[1], b[2]*c[0]-b[0]*c[2], b[0]*c[1]-b[1]*c[0]};
+  const T ca[3] = {c[1]*a[2]-c[2]*a[1], c[2]*a[0]-c[0]*a[2], c[0]*a[1]-c[1]*a[0]};
+  const T ab[3] = {a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]};
+  const T vol = Kokkos::fabs(a[0]*bc[0] + a[1]*bc[1] + a[2]*bc[2]);
+  if (vol < T(1e-12)) return;
+  const T nbc = Kokkos::sqrt(bc[0]*bc[0]+bc[1]*bc[1]+bc[2]*bc[2]);
+  const T nca = Kokkos::sqrt(ca[0]*ca[0]+ca[1]*ca[1]+ca[2]*ca[2]);
+  const T nab = Kokkos::sqrt(ab[0]*ab[0]+ab[1]*ab[1]+ab[2]*ab[2]);
   if (periodic & 1) n[0] = (int) Kokkos::ceil(cutoff / (vol / nbc));
   if (periodic & 2) n[1] = (int) Kokkos::ceil(cutoff / (vol / nca));
   if (periodic & 4) n[2] = (int) Kokkos::ceil(cutoff / (vol / nab));

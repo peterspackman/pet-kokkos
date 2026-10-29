@@ -25,40 +25,40 @@ using Atom = AtomTeams::member_type;
 // clamped, no gradient).
 void solver_cutoffs(const Hypers& h, int N, IView1D roff, RView1D re_dist, RView1D acut, RView1D ar,
                     RView1D adn) {
-  const double target = h.num_neighbors_adaptive, rmax = h.cutoff, inv_rmax = 1.0 / rmax;
-  const double width = h.cutoff_width_adaptive, lo_bound = rmax * detail::PET_SOLVER_MIN_CUTOFF_FACTOR;
+  const Real target = h.num_neighbors_adaptive, rmax = h.cutoff, inv_rmax = Real(1.0) / rmax;
+  const Real width = h.cutoff_width_adaptive, lo_bound = rmax * Real(detail::PET_SOLVER_MIN_CUTOFF_FACTOR);
   Kokkos::parallel_for(
       "pet_adapt_solver", AtomTeams(N, 1, kLanes), KOKKOS_LAMBDA(const Atom& t) {
         const int a = t.league_rank();
-        auto count = [&](double r, double& n, double& dn) {
+        auto count = [&](Real r, Real& n, Real& dn) {
           n = dn = 0.0;
           Kokkos::parallel_reduce(
               Kokkos::ThreadVectorRange(t, roff(a), roff(a + 1)),
-              [&](int e, double& sn, double& sdn) {
+              [&](int e, Real& sn, Real& sdn) {
                 sn += detail::dev_bump_cutoff(re_dist(e), r, width);
                 sdn += detail::dev_bump_dcutoff_dr(re_dist(e), r, width);
               },
               n, dn);
-          const double x = r * inv_rmax;
+          const Real x = r * inv_rmax;
           n += target * x * x * x;
-          dn += 3.0 * target * x * x * inv_rmax;
+          dn += Real(3.0) * target * x * x * inv_rmax;
         };
-        double r_lo = 0.0, r_hi = rmax, r = 0.5 * rmax, n, dn;
+        Real r_lo = 0.0, r_hi = rmax, r = Real(0.5) * rmax, n, dn;
         for (int it = 0; it < detail::PET_SOLVER_ITERS; ++it) {
           count(r, n, dn);
-          const double f = n - target;
-          if (f <= 0.0) r_lo = r; else r_hi = r;
+          const Real f = n - target;
+          if (f <= Real(0.0)) r_lo = r; else r_hi = r;
           // Newton, unless it would leave the bracket (on a flat shoulder): bisect.
-          const double r_newton = r - f / Kokkos::fmax(dn, detail::PET_SOLVER_DN_FLOOR);
-          r = (r_newton >= r_lo && r_newton <= r_hi) ? r_newton : 0.5 * (r_lo + r_hi);
+          const Real r_newton = r - f / Kokkos::fmax(dn, Real(detail::PET_SOLVER_DN_FLOOR));
+          r = (r_newton >= r_lo && r_newton <= r_hi) ? r_newton : Real(0.5) * (r_lo + r_hi);
         }
         count(r, n, dn);
-        const double dn_root = Kokkos::fmax(dn, detail::PET_SOLVER_DN_FLOOR);
-        const double adapted = Kokkos::fmin(Kokkos::fmax(r - (n - target) / dn_root, lo_bound), rmax);
+        const Real dn_root = Kokkos::fmax(dn, Real(detail::PET_SOLVER_DN_FLOOR));
+        const Real adapted = Kokkos::fmin(Kokkos::fmax(r - (n - target) / dn_root, lo_bound), rmax);
         Kokkos::single(Kokkos::PerThread(t), [&] {
           acut(a) = adapted;
           ar(a) = r;
-          adn(a) = (adapted > lo_bound && adapted < rmax) ? dn_root : 0.0;
+          adn(a) = (adapted > lo_bound && adapted < rmax) ? dn_root : Real(0.0);
         });
       });
 }
@@ -77,7 +77,7 @@ void solver_cutoffs(const Hypers& h, int N, IView1D roff, RView1D re_dist, RView
 // thousand atoms).
 RView2D grid_cutoffs(Workspace& ws, const Hypers& h, int N, IView1D roff, RView1D re_dist, RView1D probes,
                      int P, RView1D acut) {
-  const double target = h.num_neighbors_adaptive, width = h.cutoff_width_adaptive;
+  const Real target = h.num_neighbors_adaptive, width = h.cutoff_width_adaptive;
   Kokkos::deep_copy(ExecSpace(), acut, h.cutoff);
   if (P == 0) return RView2D();
   const int E = re_dist.extent(0);
@@ -85,7 +85,7 @@ RView2D grid_cutoffs(Workspace& ws, const Hypers& h, int N, IView1D roff, RView1
   IView1D p_start = ws.i1("nef:p_start", E), p_full = ws.i1("nef:p_full", E);
   Kokkos::parallel_for(
       "pet_adapt_bounds", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
-        const double d = re_dist(e), p0 = probes(0), dp = (P > 1) ? (probes(1) - probes(0)) : 1.0;
+        const Real d = re_dist(e), p0 = probes(0), dp = (P > 1) ? (probes(1) - probes(0)) : Real(1.0);
         p_full(e) = Kokkos::clamp((int) Kokkos::ceil((d + width - p0) / dp), 0, P);  // first 1
         p_start(e) = Kokkos::max((int) Kokkos::floor((d - p0) / dp) + 1, 0);        // first > 0
       });
@@ -94,7 +94,7 @@ RView2D grid_cutoffs(Workspace& ws, const Hypers& h, int N, IView1D roff, RView1
         const int a = m.league_rank();
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(m, P), [&](int p) {
           int ones = 0;
-          double smooth = 0.0;
+          Real smooth = 0.0;
           for (int e = roff(a); e < roff(a + 1); ++e) {
             if (p >= p_full(e)) ++ones;
             else if (p >= p_start(e)) smooth += detail::dev_bump_cutoff(re_dist(e), probes(p), width);
@@ -106,27 +106,27 @@ RView2D grid_cutoffs(Workspace& ws, const Hypers& h, int N, IView1D roff, RView1
   Kokkos::parallel_for(
       "pet_adapt_diff", RangePolicy(0, N * P), KOKKOS_LAMBDA(int i) {
         const int a = i / P, p = i % P;
-        const double x = (P > 1) ? (double) p / (P - 1) : 0.0;
+        const Real x = (P > 1) ? (Real) p / (P - 1) : Real(0.0);
         diff(a, p) = eff(a, p) - target + target * x * x * x;
       });
   Kokkos::parallel_for(
       "pet_adapt_grad", RangePolicy(0, N * P), KOKKOS_LAMBDA(int i) {  // torch.gradient
         const int a = i / P, p = i % P;
-        if (P == 1) return (void) (grad(a, 0) = Kokkos::fabs(diff(a, 0)) * 0.5 + 1e-12);
-        const double g = p == 0       ? diff(a, 1) - diff(a, 0)
+        if (P == 1) return (void) (grad(a, 0) = Kokkos::fabs(diff(a, 0)) * Real(0.5) + Real(1e-12));
+        const Real g = p == 0       ? diff(a, 1) - diff(a, 0)
                          : p == P - 1 ? diff(a, P - 1) - diff(a, P - 2)
-                                      : 0.5 * (diff(a, p + 1) - diff(a, p - 1));
-        grad(a, p) = Kokkos::fmax(Kokkos::fabs(g), 1e-12);
+                                      : Real(0.5) * (diff(a, p + 1) - diff(a, p - 1));
+        grad(a, p) = Kokkos::fmax(Kokkos::fabs(g), Real(1e-12));
       });
   Kokkos::parallel_for(
       "pet_adapt_softmax", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
-        double mx = -1e300, sum = 0.0, acc = 0.0;
+        Real mx = -1e300, sum = 0.0, acc = 0.0;
         for (int p = 0; p < P; ++p) {
-          const double r = diff(a, p) / grad(a, p), lw = -0.5 * r * r;
+          const Real r = diff(a, p) / grad(a, p), lw = -Real(0.5) * r * r;
           mx = (lw > mx) ? lw : mx;
         }
         for (int p = 0; p < P; ++p) {
-          const double r = diff(a, p) / grad(a, p), w = Kokkos::exp(-0.5 * r * r - mx);
+          const Real r = diff(a, p) / grad(a, p), w = Kokkos::exp(-Real(0.5) * r * r - mx);
           sum += w;
           acc += probes(p) * w;
         }
@@ -214,7 +214,7 @@ void edge_topology(Workspace& ws, EdgeMap& edge_map, DeviceEdgeData& dev, int N,
 void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D probes, int P, int& m_high,
                    int m_fixed, IView1D overflow, int e_fixed) {
   const bool adaptive = h.adaptive(), bump = h.cutoff_function == CutoffFunction::Bump;
-  const double width = h.cutoff_width, cutoff = h.cutoff;
+  const Real width = h.cutoff_width, cutoff = h.cutoff;
   const int N = dev.n_atoms, NC = dev.centres(), E = dev.n_raw;
   auto roff = dev.raw_off, raw_rev = dev.raw_reverse, re_i = dev.raw_center, re_j = dev.raw_neigh;
   auto re_dist = dev.raw_dist;
@@ -240,7 +240,7 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
   Kokkos::deep_copy(ExecSpace(), count, 0);
   Kokkos::parallel_for(
       "pet_keep", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
-        const double rc = adaptive ? 0.5 * (acut(re_i(e)) + acut(re_j(e))) : cutoff;
+        const Real rc = adaptive ? Real(0.5) * (acut(re_i(e)) + acut(re_j(e))) : cutoff;
         rcv(e) = rc;
         keep(e) = re_dist(e) <= rc;
         if (keep(e)) {
@@ -318,7 +318,7 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
   Kokkos::parallel_for(
       "pet_cfseq", RangePolicy(0, NC * S), KOKKOS_LAMBDA(int i) {
         const int n = i / S, s = i % S;
-        cf_seq(n, s) = s == 0 ? static_cast<Net>(1.0) : cut(n * M + s - 1);
+        cf_seq(n, s) = s == 0 ? static_cast<Net>(Real(1.0)) : cut(n * M + s - 1);
       });
 }
 
@@ -351,9 +351,11 @@ DeviceEdgeData build_device_edge_data(const System& sys, const Hypers& h,
     sh[3 * e] = r.sa, sh[3 * e + 1] = r.sb, sh[3 * e + 2] = r.sc;
     v[3 * e] = r.vx, v[3 * e + 1] = r.vy, v[3 * e + 2] = r.vz;
   }
+  // The host data converted to the view's type (Real may be float).
   auto up = [](const auto& host, auto dev) {
-    Kokkos::deep_copy(dev, Kokkos::View<const typename decltype(dev)::value_type*, Kokkos::HostSpace>(
-                               host.data(), host.size()));
+    using T = typename decltype(dev)::value_type;
+    std::vector<T> conv(host.begin(), host.end());
+    Kokkos::deep_copy(dev, Kokkos::View<const T*, Kokkos::HostSpace>(conv.data(), conv.size()));
     return dev;
   };
   IView1D species = up(sp, IView1D("species", N)), re_i = up(i_, IView1D("re_i", E)), re_j = up(j_, IView1D("re_j", E));
