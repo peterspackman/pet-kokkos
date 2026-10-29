@@ -1,7 +1,7 @@
 // Dense GEMM: C = alpha op(A) op(B) + beta C (+ bias on every row), on
-// row-major Net views, through the vendor BLAS (cuBLAS, rocBLAS), a CBLAS on the
-// host (PET_HAVE_CBLAS), or else a naive Kokkos loop. The only linear algebra
-// PET needs.
+// row-major Net views, through the vendor BLAS (cuBLAS, rocBLAS, Kokkos's
+// metal_gemm on Apple GPUs), a CBLAS on the host (PET_HAVE_CBLAS), or else a
+// naive Kokkos loop. The only linear algebra PET needs.
 //
 // A row-major [r,c] matrix is the column-major [c,r] one, so each call computes
 // C^T = op(B)^T op(A)^T: B and A swap places, and so do m and n.
@@ -321,6 +321,12 @@ inline void gemm(char transA, char transB, Net alpha, const View2D& A, const Vie
               ta ? rocblas_operation_transpose : rocblas_operation_none, n, m, k, alpha, B.data(),
               ldb, A.data(), lda, beta, C.data(), ldc);
   if (has_bias) add_bias(C, bias);
+#elif defined(KOKKOS_ENABLE_METAL)
+  // Row-major, as the views are.
+  auto pitch = [](const View2D& V) { return int(std::max<std::size_t>({V.stride(0), V.extent(1), 1})); };
+  // The bias in the GEMM's epilogue.
+  Kokkos::Experimental::metal_gemm(ta, tb, m, n, k, alpha, A.data(), pitch(A), B.data(), pitch(B), beta,
+                                   C.data(), pitch(C), has_bias ? bias.data() : nullptr);
 #elif defined(PET_HAVE_CBLAS)
   if (m == 0 || n == 0) return;
   // The rows' pitch, at least a row (BLAS insists, even for an empty or one-row

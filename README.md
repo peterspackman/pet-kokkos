@@ -3,8 +3,8 @@
 A C++ implementation of [PET](https://arxiv.org/abs/2305.19302) (Point Edge Transformer) machine-learning
 interatomic potentials, the [upet](https://github.com/lab-cosmo/upet) / PET-MAD
 family, built on Kokkos. It computes energies, forces and the virial without
-needing libtorch, and runs on CPUs (serial or OpenMP), NVIDIA GPUs (CUDA) and
-AMD GPUs (HIP).
+needing libtorch, and runs on CPUs (serial or OpenMP), NVIDIA GPUs (CUDA),
+AMD GPUs (HIP) and Apple GPUs (Metal, with a Kokkos fork; see below).
 
 The API may still change before a first release.
 
@@ -80,9 +80,10 @@ the compiler yourself.
 
 CMake options:
 
-- `PET_BACKEND`: `serial`, `openmp`, `cuda` or `hip`. If a `Kokkos::kokkos`
-  target already exists, its backend is used.
-- `PET_PRECISION`: `mixed` (default), `fp32` or `fp64`; see below.
+- `PET_BACKEND`: `serial`, `openmp`, `cuda`, `hip` or `metal`. If a
+  `Kokkos::kokkos` target already exists, its backend is used.
+- `PET_PRECISION`: `mixed` (default; `fp32` for `metal`), `fp32` or `fp64`;
+  see below.
 - `PET_WITH_CUTLASS`: fused GEMM kernels with CUTLASS (CUDA only; on if found).
 - `PET_WITH_VESIN`: use [vesin](https://github.com/Luthaf/vesin) for the host
   neighbour search (on if found).
@@ -98,6 +99,26 @@ CMake options:
 When pet-kokkos is pulled in as a dependency (`add_subdirectory`, CPM or
 FetchContent), the tests and apps are off by default and an existing
 `Kokkos::kokkos` target is reused.
+
+### Apple GPUs
+
+The Metal backend is not in upstream Kokkos but in a fork,
+[kokkos-metal](https://github.com/peterspackman/kokkos-metal), which
+`PET_BACKEND=metal` fetches. Its kernels are compiled through a clang plugin,
+so it needs Homebrew's LLVM:
+
+```bash
+cmake -B build-metal -G Ninja -DPET_BACKEND=metal \
+  -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++
+cmake --build build-metal -j
+```
+
+`-DCPM_Kokkos_SOURCE=/path/to/kokkos-metal` builds against a local checkout
+of the fork instead.
+
+Apple GPUs have no fp64, so `metal` builds default to `PET_PRECISION=fp32`.
+With forces, pet-mad-xs takes ~8 ms on 64-atom diamond, 31 ms on 648-atom
+water and 134 ms on 1728-atom diamond on an M3 Pro.
 
 ## Python
 
