@@ -27,7 +27,7 @@ struct CellSearch {
   IView1D sid, abin, goff, bstart, batom;
   IView2D gnc, gnr;
   RView2D posw, scell;
-  double cutoff2;
+  Real cutoff2;
 
   // hits(bin_start, n_members, shift) for each of atom gi's candidate bins,
   // where `shift` is that bin's lattice image.
@@ -49,12 +49,12 @@ struct CellSearch {
         }
   }
   // v <- the vector from gi to candidate j's image, v[3] <- its square; true if an edge.
-  KOKKOS_INLINE_FUNCTION bool edge(int gi, int j, const int* sh, double* v) const {
+  KOKKOS_INLINE_FUNCTION bool edge(int gi, int j, const int* sh, Real* v) const {
     const int b = sid(gi);
     for (int d = 0; d < 3; ++d)  // in this order: the image offset first, then the atom
       v[d] = posw(j, d) + (sh[0] * scell(b, d) + sh[1] * scell(b, 3 + d) + sh[2] * scell(b, 6 + d) - posw(gi, d));
     v[3] = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-    return v[3] >= 1e-24 && v[3] <= cutoff2;
+    return v[3] >= Real(1e-24) && v[3] <= cutoff2;
   }
 };
 
@@ -74,9 +74,10 @@ DeviceSearch& device_search() {
 }
 
 RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D& posw,
-                               const RView2D& cinv, double cutoff) {
+                               const RView2D& cinv, double cutoff_d) {
+  const Real cutoff = Real(cutoff_d);
   const int Ntot = g.Ntot, B = g.B;
-  const double cutoff2 = cutoff * cutoff;
+  const Real cutoff2 = cutoff * cutoff;
   const IView1D& sid = g.sid;
   const IView1D& sper = g.sper;
   const IView1D& scnt = g.scnt;
@@ -92,15 +93,15 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
   IView1D gbins = ws.i1("cl_bins", B), goff = ws.i1("cl_off", B + 1);
   Kokkos::parallel_for(
       "cl_grid", RangePolicy(0, B), KOKKOS_LAMBDA(int b) {
-        const double a0=scell(b,0),a1=scell(b,1),a2=scell(b,2),
+        const Real a0=scell(b,0),a1=scell(b,1),a2=scell(b,2),
                      b0=scell(b,3),b1=scell(b,4),b2=scell(b,5),
                      c0=scell(b,6),c1=scell(b,7),c2=scell(b,8);
         // Interplanar spacings: volume over the area of the opposite face.
-        const double bc[3] = {b1*c2-b2*c1, b2*c0-b0*c2, b0*c1-b1*c0};
-        const double ca[3] = {c1*a2-c2*a1, c2*a0-c0*a2, c0*a1-c1*a0};
-        const double ab[3] = {a1*b2-a2*b1, a2*b0-a0*b2, a0*b1-a1*b0};
-        const double vol = Kokkos::fabs(a0*bc[0] + a1*bc[1] + a2*bc[2]);
-        const double area[3] = {Kokkos::sqrt(bc[0]*bc[0]+bc[1]*bc[1]+bc[2]*bc[2]),
+        const Real bc[3] = {b1*c2-b2*c1, b2*c0-b0*c2, b0*c1-b1*c0};
+        const Real ca[3] = {c1*a2-c2*a1, c2*a0-c0*a2, c0*a1-c1*a0};
+        const Real ab[3] = {a1*b2-a2*b1, a2*b0-a0*b2, a0*b1-a1*b0};
+        const Real vol = Kokkos::fabs(a0*bc[0] + a1*bc[1] + a2*bc[2]);
+        const Real area[3] = {Kokkos::sqrt(bc[0]*bc[0]+bc[1]*bc[1]+bc[2]*bc[2]),
                                 Kokkos::sqrt(ca[0]*ca[0]+ca[1]*ca[1]+ca[2]*ca[2]),
                                 Kokkos::sqrt(ab[0]*ab[0]+ab[1]*ab[1]+ab[2]*ab[2])};
         int nb = 1;
@@ -109,7 +110,7 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
         // the walk below is then the brute force's own -- images in order, the
         // atoms by index, the same vector arithmetic -- so its edges come out the
         // same to the bit whichever search the rest of its batch called for.
-        const double cell[9] = {a0, a1, a2, b0, b1, b2, c0, c1, c2};
+        const Real cell[9] = {a0, a1, a2, b0, b1, b2, c0, c1, c2};
         int rng[3];
         image_ranges_rows(cell, cutoff, sper(b), rng);
         if (scnt(b) < kCellListMinAtoms &&
@@ -120,13 +121,13 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
         }
         for (int d = 0; d < 3; ++d) {
           int nc = 1, nr = 0;
-          if (sper(b) && vol > 1e-12 && area[d] > 0.0) {
-            const double perp = vol / area[d];
+          if (sper(b) && vol > Real(1e-12) && area[d] > Real(0.0)) {
+            const Real perp = vol / area[d];
             nc = (int) Kokkos::floor(perp / cutoff);
             if (nc < 1) nc = 1;
             // Bin width along d. At least `cutoff` whenever the box is, so the
             // search reaches one bin; narrower boxes need proportionally more.
-            const double w = perp / (double) nc;
+            const Real w = perp / (Real) nc;
             nr = (int) Kokkos::ceil(cutoff / w);
             if (nr < 1) nr = 1;
           }
@@ -153,12 +154,12 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
         const int b = sid(gi);
         int ijk[3] = {0, 0, 0};
         if (sper(b)) {
-          const double x = posw(gi, 0), y = posw(gi, 1), z = posw(gi, 2);
+          const Real x = posw(gi, 0), y = posw(gi, 1), z = posw(gi, 2);
           // posw is already wrapped, so the fractional coordinate is in [0, 1);
           // the clamp only guards the boundary, where rounding can land on 1.0.
           for (int d = 0; d < 3; ++d) {
-            const double f = x * cinv(b, d) + y * cinv(b, 3 + d) + z * cinv(b, 6 + d);
-            int c = (int) Kokkos::floor(f * (double) gnc(b, d));
+            const Real f = x * cinv(b, d) + y * cinv(b, 3 + d) + z * cinv(b, 6 + d);
+            int c = (int) Kokkos::floor(f * (Real) gnc(b, d));
             if (c < 0) c = 0;
             if (c >= gnc(b, d)) c = gnc(b, d) - 1;
             ijk[d] = c;
@@ -219,7 +220,7 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
         cs.visit(gi, [&](int k0, int nk, const int* sh) {
           int found = 0;
           Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(t, nk), [&](int q, int& c) {
-            double v[4];
+            Real v[4];
             c += cs.edge(gi, batom(k0 + q), sh, v);
           }, found);
           e += found;
@@ -253,7 +254,7 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
           int found = 0;
           Kokkos::parallel_scan(Kokkos::ThreadVectorRange(t, nk), [&](int q, int& pos, bool final) {
             const int j = batom(k0 + q);
-            double v[4];
+            Real v[4];
             const bool hit = cs.edge(gi, j, sh, v);
             if (final && hit) {
               const int w = e + pos;
