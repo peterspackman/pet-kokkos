@@ -22,26 +22,26 @@ struct BruteSearch {
   IView1D sid, soff, scnt, sper;
 
   template <class Hit>
-  KOKKOS_INLINE_FUNCTION void visit(int gi, const int rng[3], double r2, Hit&& hit) const {
+  KOKKOS_INLINE_FUNCTION void visit(int gi, const int rng[3], Real r2, Hit&& hit) const {
     const int b = sid(gi), j0 = soff(b), j1 = soff(b) + scnt(b);
-    const double xi = posw(gi, 0), yi = posw(gi, 1), zi = posw(gi, 2);
+    const Real xi = posw(gi, 0), yi = posw(gi, 1), zi = posw(gi, 2);
     for (int sa = -rng[0]; sa <= rng[0]; ++sa)
       for (int sb = -rng[1]; sb <= rng[1]; ++sb)
         for (int sc = -rng[2]; sc <= rng[2]; ++sc) {
-          const double shx = sa * scell(b, 0) + sb * scell(b, 3) + sc * scell(b, 6) - xi;
-          const double shy = sa * scell(b, 1) + sb * scell(b, 4) + sc * scell(b, 7) - yi;
-          const double shz = sa * scell(b, 2) + sb * scell(b, 5) + sc * scell(b, 8) - zi;
+          const Real shx = sa * scell(b, 0) + sb * scell(b, 3) + sc * scell(b, 6) - xi;
+          const Real shy = sa * scell(b, 1) + sb * scell(b, 4) + sc * scell(b, 7) - yi;
+          const Real shz = sa * scell(b, 2) + sb * scell(b, 5) + sc * scell(b, 8) - zi;
           for (int j = j0; j < j1; ++j) {
-            const double v[3] = {posw(j, 0) + shx, posw(j, 1) + shy, posw(j, 2) + shz};
-            const double d2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-            if (d2 >= 1e-24 && d2 <= r2) hit(j, sa, sb, sc, v, d2);
+            const Real v[3] = {posw(j, 0) + shx, posw(j, 1) + shy, posw(j, 2) + shz};
+            const Real d2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+            if (d2 >= Real(1e-24) && d2 <= r2) hit(j, sa, sb, sc, v, d2);
           }
         }
   }
   // Image ranges for `radius` in structure b's cell, now: a cell relaxation can
   // need more images than the starting cell did.
-  KOKKOS_INLINE_FUNCTION void ranges(int b, double radius, int rng[3]) const {
-    const double c[9] = {scell(b, 0), scell(b, 1), scell(b, 2), scell(b, 3), scell(b, 4),
+  KOKKOS_INLINE_FUNCTION void ranges(int b, Real radius, int rng[3]) const {
+    const Real c[9] = {scell(b, 0), scell(b, 1), scell(b, 2), scell(b, 3), scell(b, 4),
                          scell(b, 5), scell(b, 6), scell(b, 7), scell(b, 8)};
     image_ranges_rows(c, radius, sper(b), rng);
   }
@@ -77,10 +77,10 @@ Wrapped wrap_positions(Workspace& ws, const DeviceGeom& g) {
   IView2D wrapi = ws.i2("pet_wrapi", N, 3);
   Kokkos::parallel_for(
       "pet_cellinv", RangePolicy(0, B), KOKKOS_LAMBDA(int b) {
-        const double a0 = scell(b, 0), a1 = scell(b, 1), a2 = scell(b, 2), b0 = scell(b, 3), b1 = scell(b, 4),
+        const Real a0 = scell(b, 0), a1 = scell(b, 1), a2 = scell(b, 2), b0 = scell(b, 3), b1 = scell(b, 4),
                      b2 = scell(b, 5), c0 = scell(b, 6), c1 = scell(b, 7), c2 = scell(b, 8);
-        const double det = a0 * (b1 * c2 - b2 * c1) - a1 * (b0 * c2 - b2 * c0) + a2 * (b0 * c1 - b1 * c0);
-        const double id = (det != 0.0) ? 1.0 / det : 0.0;
+        const Real det = a0 * (b1 * c2 - b2 * c1) - a1 * (b0 * c2 - b2 * c0) + a2 * (b0 * c1 - b1 * c0);
+        const Real id = (det != Real(0.0)) ? Real(1.0) / det : Real(0.0);
         cinv(b, 0) = (b1 * c2 - b2 * c1) * id, cinv(b, 1) = (a2 * c1 - a1 * c2) * id, cinv(b, 2) = (a1 * b2 - a2 * b1) * id;
         cinv(b, 3) = (b2 * c0 - b0 * c2) * id, cinv(b, 4) = (a0 * c2 - a2 * c0) * id, cinv(b, 5) = (a2 * b0 - a0 * b2) * id;
         cinv(b, 6) = (b0 * c1 - b1 * c0) * id, cinv(b, 7) = (a1 * c0 - a0 * c1) * id, cinv(b, 8) = (a0 * b1 - a1 * b0) * id;
@@ -92,11 +92,11 @@ Wrapped wrap_positions(Workspace& ws, const DeviceGeom& g) {
           for (int d = 0; d < 3; ++d) posw(i, d) = pos(i, d), wrapi(i, d) = 0;
           return;
         }
-        const double x = pos(i, 0), y = pos(i, 1), z = pos(i, 2);
-        double f[3];
+        const Real x = pos(i, 0), y = pos(i, 1), z = pos(i, 2);
+        Real f[3];
         for (int d = 0; d < 3; ++d) {
           f[d] = x * cinv(b, d) + y * cinv(b, 3 + d) + z * cinv(b, 6 + d);  // fractional
-          const double w = (sper(b) >> d & 1) ? Kokkos::floor(f[d]) : 0.0;
+          const Real w = (sper(b) >> d & 1) ? Kokkos::floor(f[d]) : Real(0.0);
           f[d] -= w;
           wrapi(i, d) = (int) w;
         }
@@ -108,7 +108,7 @@ Wrapped wrap_positions(Workspace& ws, const DeviceGeom& g) {
 // Every pair within `radius`, each atom's contiguously in a fixed order: from a
 // cell list for large batches, a brute-force search for small ones. Images are
 // relative to the wrapped positions.
-RawEdges search(Workspace& ws, const DeviceGeom& g, const Wrapped& w, double radius) {
+RawEdges search(Workspace& ws, const DeviceGeom& g, const Wrapped& w, Real radius) {
   const int N = g.Ntot;
   const BruteSearch bs{w.posw, g.scell, g.sid, g.soff, g.scnt, g.sper};
   bool cells = device_search() == DeviceSearch::CellList;
@@ -131,14 +131,14 @@ RawEdges search(Workspace& ws, const DeviceGeom& g, const Wrapped& w, double rad
   if (cells) return build_raw_edges_cells(ws, g, w.posw, w.cinv, radius);
 
   auto sid = g.sid;
-  const double r2 = radius * radius;
+  const Real r2 = radius * radius;
   RawEdges re;
   IView1D ecnt = ws.i1("pet_ecnt", N), eoff = re.offsets = ws.i1("pet_eoff", N + 1);
   Kokkos::parallel_for(
       "pet_neigh_count", RangePolicy(0, N), KOKKOS_LAMBDA(int gi) {
         int rng[3], n = 0;
         bs.ranges(sid(gi), radius, rng);
-        bs.visit(gi, rng, r2, [&](int, int, int, int, const double*, double) { ++n; });
+        bs.visit(gi, rng, r2, [&](int, int, int, int, const Real*, Real) { ++n; });
         ecnt(gi) = n;
       });
   const int E = re.count = prefix_sum(ecnt, eoff, N);
@@ -150,7 +150,7 @@ RawEdges search(Workspace& ws, const DeviceGeom& g, const Wrapped& w, double rad
       "pet_neigh_fill", RangePolicy(0, N), KOKKOS_LAMBDA(int gi) {
         int rng[3], e = eoff(gi);
         bs.ranges(sid(gi), radius, rng);
-        bs.visit(gi, rng, r2, [&](int j, int sa, int sb, int sc, const double* v, double d2) {
+        bs.visit(gi, rng, r2, [&](int j, int sa, int sb, int sc, const Real* v, Real d2) {
           re_i(e) = gi, re_j(e) = j;
           re_shift(e, 0) = sa, re_shift(e, 1) = sb, re_shift(e, 2) = sc;
           re_vec(e, 0) = v[0], re_vec(e, 1) = v[1], re_vec(e, 2) = v[2];
@@ -162,7 +162,7 @@ RawEdges search(Workspace& ws, const DeviceGeom& g, const Wrapped& w, double rad
 
 // Search again: the pairs within cutoff + skin, their images unwrapped, their
 // topology, and the batch they were found in, for the checks that follow.
-void cache_search(NefCache& c, Workspace& ws, const DeviceGeom& g, double reach) {
+void cache_search(NefCache& c, Workspace& ws, const DeviceGeom& g, Real reach) {
   const int N = g.Ntot, B = g.B;
   const Wrapped w = wrap_positions(ws, g);
   const RawEdges re = search(ws, g, w, reach);
@@ -262,7 +262,7 @@ void cache_reassemble(NefCache& c, const DeviceGeom& g, IView1D slot_ref, IView1
 DeviceEdgeData cached_edges(NefCache& c, Workspace& ws, const DeviceGeom& g, const Hypers& h,
                             const RView1D& probes, int P, int& m_high) {
   const int N = g.Ntot, B = g.B;
-  const double skin = NefCache::kSkin, reach = h.cutoff + skin, big = 1e300;
+  const Real skin = NefCache::kSkin, reach = h.cutoff + skin, big = 1e300;
   auto pos = g.pos, scell = g.scell;
   auto sid = g.sid, soff = g.soff, scnt = g.scnt, staged = g.staged;
 
@@ -278,10 +278,10 @@ DeviceEdgeData cached_edges(NefCache& c, Workspace& ws, const DeviceGeom& g, con
         "nef_check_cells", RangePolicy(0, B), KOKKOS_LAMBDA(int kc) {
           const int b0 = staged(kc), r = (b0 >= 0 && b0 < cap) ? slot_of(b0) : -1;
           const bool ok = r >= 0 && rscnt(r) == scnt(kc);
-          double e2 = 0.0;
+          Real e2 = 0.0;
           for (int a = 0; ok && a < 3; ++a)
             for (int d = 0; d < 3; ++d) {
-              double x = a == d ? -1.0 : 0.0;
+              Real x = a == d ? -Real(1.0) : Real(0.0);
               for (int k = 0; k < 3; ++k) x += cinv0(r, 3 * a + k) * scell(kc, 3 * k + d);
               e2 += x * x;
             }
@@ -289,14 +289,14 @@ DeviceEdgeData cached_edges(NefCache& c, Workspace& ws, const DeviceGeom& g, con
           slot_ref(kc) = r;
           slot_ecnt(kc) = ok ? reoff(r + 1) - reoff(r) : 0;
         });
-    using Max = Kokkos::Max<double, MemSpace>;
+    using Max = Kokkos::Max<Real, MemSpace>;
     Kokkos::parallel_reduce(
         "nef_check_moves", RangePolicy(0, N),
-        KOKKOS_LAMBDA(int i, double& m) {
+        KOKKOS_LAMBDA(int i, Real& m) {
           const int kc = sid(i), r = slot_ref(kc);
           if (!(eps(kc) < big)) return (void) (m = big);
           const int a0 = rsoff(r) + i - soff(kc);
-          double ds[3], x[3], d2 = 0.0;
+          Real ds[3], x[3], d2 = 0.0;
           for (int d = 0; d < 3; ++d) {
             ds[d] = 0.0;
             for (int k = 0; k < 3; ++k) ds[d] += (pos(i, k) - pos0(a0, k)) * cinv0(r, 3 * k + d);
@@ -305,23 +305,23 @@ DeviceEdgeData cached_edges(NefCache& c, Workspace& ws, const DeviceGeom& g, con
             x[d] = ds[0] * scell(kc, d) + ds[1] * scell(kc, 3 + d) + ds[2] * scell(kc, 6 + d);
             d2 += x[d] * x[d];
           }
-          m = Kokkos::max(m, 2.0 * Kokkos::sqrt(d2) + reach * eps(kc));
+          m = Kokkos::max(m, Real(2.0 * Kokkos::sqrt(d2) + reach * eps(kc)));
         },
         Max(Kokkos::subview(out, 0)));
     Kokkos::parallel_reduce(
         "nef_check_slots", RangePolicy(0, B),
-        KOKKOS_LAMBDA(int kc, double& m) {
-          const double lost = eps(kc) < big ? 0.0 : 2.0, moved = (kc >= cur_B || cur_staged(kc) != staged(kc)) ? 1.0 : 0.0;
-          m = Kokkos::max(m, Kokkos::max(lost, moved));
+        KOKKOS_LAMBDA(int kc, Real& m) {
+          const Real lost = eps(kc) < big ? Real(0.0) : Real(2.0), moved = (kc >= cur_B || cur_staged(kc) != staged(kc)) ? Real(1.0) : Real(0.0);
+          m = Kokkos::max(m, Real(Kokkos::max(lost, moved)));
         },
         Max(Kokkos::subview(out, 1)));
     Kokkos::parallel_reduce(
-        "nef_check_edges", RangePolicy(0, B), KOKKOS_LAMBDA(int kc, double& s) { s += slot_ecnt(kc); },
-        Kokkos::Sum<double, MemSpace>(Kokkos::subview(out, 2)));
+        "nef_check_edges", RangePolicy(0, B), KOKKOS_LAMBDA(int kc, Real& s) { s += slot_ecnt(kc); },
+        Kokkos::Sum<Real, MemSpace>(Kokkos::subview(out, 2)));
     const auto o = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
     const bool worst_ok = N == 0 || o(0) < skin;
-    again = !worst_ok || o(1) >= 2.0 || c.ref.orphan_off.extent(0) > 0;
-    if (!again && (o(1) >= 1.0 || B != c.cur_B || N != c.cur_N)) cache_reassemble(c, g, slot_ref, slot_ecnt, (int) o(2));
+    again = !worst_ok || o(1) >= Real(2.0) || c.ref.orphan_off.extent(0) > 0;
+    if (!again && (o(1) >= Real(1.0) || B != c.cur_B || N != c.cur_N)) cache_reassemble(c, g, slot_ref, slot_ecnt, (int) o(2));
   }
   if (again) cache_search(c, ws, g, reach);
 
@@ -335,13 +335,13 @@ DeviceEdgeData cached_edges(NefCache& c, Workspace& ws, const DeviceGeom& g, con
   Kokkos::parallel_for(
       "nef_vectors", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
         const int i = ri(e), j = rj(e), b = sid(i);
-        double d2 = 0.0;
+        Real d2 = 0.0;
         for (int d = 0; d < 3; ++d) {
-          const double x =
+          const Real x =
               pos(j, d) + (cs(e, 0) * scell(b, d) + cs(e, 1) * scell(b, 3 + d) + cs(e, 2) * scell(b, 6 + d)) - pos(i, d);
           vec(e, d) = x, d2 += x * x;
         }
-        dist(e) = d2 > 1e-24 ? Kokkos::sqrt(d2) : 1e30;  // a coincident pair weighs nothing
+        dist(e) = d2 > Real(1e-24) ? Kokkos::sqrt(d2) : Real(1e30);  // a coincident pair weighs nothing
       });
   dev.species = g.spec;
   dev.struct_id = sid;
@@ -491,18 +491,18 @@ void EdgeSession::set(const DeviceEdgeListView& v, const std::vector<int>& speci
 
   // The pairs, a warp per centre. With images, each neighbour becomes the owned
   // atom it is an image of, with the shift between them in fractional terms.
-  double inv[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  Real inv[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   if (image) {
     if (!v.cell || !v.positions) throw std::runtime_error("pet: images need the positions and the cell");
     const double* c = v.cell;
-    const double det = c[0] * (c[4] * c[8] - c[5] * c[7]) - c[1] * (c[3] * c[8] - c[5] * c[6]) + c[2] * (c[3] * c[7] - c[4] * c[6]);
+    const Real det = c[0] * (c[4] * c[8] - c[5] * c[7]) - c[1] * (c[3] * c[8] - c[5] * c[6]) + c[2] * (c[3] * c[7] - c[4] * c[6]);
     if (std::fabs(det) < 1e-12) throw std::runtime_error("pet: images need a cell with volume");
     // inv such that f = d . inv for d = f . cell (cell rows the lattice vectors).
     inv[0] = (c[4] * c[8] - c[5] * c[7]) / det, inv[1] = (c[2] * c[7] - c[1] * c[8]) / det, inv[2] = (c[1] * c[5] - c[2] * c[4]) / det;
     inv[3] = (c[5] * c[6] - c[3] * c[8]) / det, inv[4] = (c[0] * c[8] - c[2] * c[6]) / det, inv[5] = (c[2] * c[3] - c[0] * c[5]) / det;
     inv[6] = (c[3] * c[7] - c[4] * c[6]) / det, inv[7] = (c[1] * c[6] - c[0] * c[7]) / det, inv[8] = (c[0] * c[4] - c[1] * c[3]) / det;
   }
-  const double i0 = inv[0], i1 = inv[1], i2 = inv[2], i3 = inv[3], i4 = inv[4], i5 = inv[5], i6 = inv[6], i7 = inv[7], i8 = inv[8];
+  const Real i0 = inv[0], i1 = inv[1], i2 = inv[2], i3 = inv[3], i4 = inv[4], i5 = inv[5], i6 = inv[6], i7 = inv[7], i8 = inv[8];
   const double* x = v.positions;
   IView1D re_i = ws.i1("md:re_i", E), re_j = ws.i1("md:re_j", E);
   IView2D re_shift = ws.i2("md:re_shift", E, 3);
@@ -523,7 +523,7 @@ void EdgeSession::set(const DeviceEdgeListView& v, const std::vector<int>& speci
                   lw = Kokkos::max(lw, 1 << 30);
                   o = j;
                 } else {
-                  const double d0 = x[3 * j] - x[3 * o], d1 = x[3 * j + 1] - x[3 * o + 1], d2 = x[3 * j + 2] - x[3 * o + 2];
+                  const Real d0 = x[3 * j] - x[3 * o], d1 = x[3 * j + 1] - x[3 * o + 1], d2 = x[3 * j + 2] - x[3 * o + 2];
                   a = (int) Kokkos::round(d0 * i0 + d1 * i3 + d2 * i6);
                   b = (int) Kokkos::round(d0 * i1 + d1 * i4 + d2 * i7);
                   c = (int) Kokkos::round(d0 * i2 + d1 * i5 + d2 * i8);
@@ -738,12 +738,12 @@ const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device,
   Kokkos::parallel_for(
       "md_vectors", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
         const int i = re_i(e), j = re_j(e), a = sh(e, 0), b = sh(e, 1), c = sh(e, 2);
-        const double x = pos(j, 0) + (a * hc(0) + b * hc(3) + c * hc(6)) - pos(i, 0);
-        const double y = pos(j, 1) + (a * hc(1) + b * hc(4) + c * hc(7)) - pos(i, 1);
-        const double z = pos(j, 2) + (a * hc(2) + b * hc(5) + c * hc(8)) - pos(i, 2);
-        const double d2 = x * x + y * y + z * z;
+        const Real x = pos(j, 0) + (a * hc(0) + b * hc(3) + c * hc(6)) - pos(i, 0);
+        const Real y = pos(j, 1) + (a * hc(1) + b * hc(4) + c * hc(7)) - pos(i, 1);
+        const Real z = pos(j, 2) + (a * hc(2) + b * hc(5) + c * hc(8)) - pos(i, 2);
+        const Real d2 = x * x + y * y + z * z;
         vec(e, 0) = x, vec(e, 1) = y, vec(e, 2) = z;
-        dist(e) = d2 > 1e-24 ? Kokkos::sqrt(d2) : 1e30;  // a coincident pair weighs nothing
+        dist(e) = d2 > Real(1e-24) ? Kokkos::sqrt(d2) : Real(1e30);  // a coincident pair weighs nothing
       });
   int m_high = 0;
   if (!fixed) {
