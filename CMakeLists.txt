@@ -69,13 +69,14 @@ option(PET_USE_BLAS "Host builds: the GEMMs through a CBLAS (OpenBLAS, MKL, ...)
 option(PET_HOST_OPENMP "GPU builds: OpenMP for the host" ON)
 
 # threads: Kokkos's own C++ threads, for host compilers without OpenMP (Apple's).
-set(PET_BACKEND "serial" CACHE STRING "Kokkos backend: serial, openmp, threads, cuda, hip")
-set_property(CACHE PET_BACKEND PROPERTY STRINGS serial openmp threads cuda hip)
+# metal: Apple GPUs, with the Metal backend of a Kokkos fork (fetched below).
+set(PET_BACKEND "serial" CACHE STRING "Kokkos backend: serial, openmp, threads, cuda, hip, metal")
+set_property(CACHE PET_BACKEND PROPERTY STRINGS serial openmp threads cuda hip metal)
 # Inside an application that brings its own Kokkos (LAMMPS's KOKKOS package),
 # that Kokkos's device is ours: in-tree it leaves Kokkos_ENABLE_*, installed
 # Kokkos_DEVICES.
 if(TARGET Kokkos::kokkos)
-    foreach(dev CUDA HIP OPENMP THREADS)
+    foreach(dev CUDA HIP METAL OPENMP THREADS)
         if(Kokkos_ENABLE_${dev} OR "${dev}" IN_LIST Kokkos_DEVICES)
             string(TOLOWER ${dev} PET_BACKEND)
             break()
@@ -92,7 +93,14 @@ endif()
 #   fp32            : everything single. Fastest on consumer GPUs.
 #   fp64            : everything double. Slow on consumer GPUs (1/64 rate on
 #                     GeForce); a correctness instrument, not a speed mode.
-set(PET_PRECISION "mixed" CACHE STRING "PET precision: mixed | fp32 | fp64")
+# Apple GPUs have no fp64 (Kokkos's Metal backend emulates it, slowly): fp32
+# by default there.
+if(PET_BACKEND STREQUAL "metal")
+    set(_pet_default_precision "fp32")
+else()
+    set(_pet_default_precision "mixed")
+endif()
+set(PET_PRECISION "${_pet_default_precision}" CACHE STRING "PET precision: mixed | fp32 | fp64")
 set_property(CACHE PET_PRECISION PROPERTY STRINGS mixed fp32 fp64)
 
 if(PET_ARCH_NATIVE AND NOT PET_BACKEND STREQUAL "cuda")
@@ -128,6 +136,7 @@ if(NOT TARGET Kokkos::kokkos)
     set(Kokkos_ENABLE_CUDA   OFF CACHE BOOL "" FORCE)
     set(Kokkos_ENABLE_HIP    OFF CACHE BOOL "" FORCE)
     set(Kokkos_ENABLE_THREADS OFF CACHE BOOL "" FORCE)
+    set(Kokkos_ENABLE_METAL   OFF CACHE BOOL "" FORCE)
 
     if(PET_BACKEND STREQUAL "openmp")
         set(Kokkos_ENABLE_OPENMP ON CACHE BOOL "" FORCE)
@@ -141,14 +150,25 @@ if(NOT TARGET Kokkos::kokkos)
     elseif(PET_BACKEND STREQUAL "hip")
         set(Kokkos_ENABLE_HIP    ON CACHE BOOL "" FORCE)
         set(Kokkos_ENABLE_OPENMP ${PET_HOST_OPENMP} CACHE BOOL "" FORCE)
+    elseif(PET_BACKEND STREQUAL "metal")
+        set(Kokkos_ENABLE_METAL ON CACHE BOOL "" FORCE)
     elseif(NOT PET_BACKEND STREQUAL "serial")
-        message(FATAL_ERROR "PET_BACKEND must be one of: serial, openmp, threads, cuda, hip")
+        message(FATAL_ERROR "PET_BACKEND must be one of: serial, openmp, threads, cuda, hip, metal")
     endif()
 
+    # The Metal backend is not in upstream Kokkos: a fork of 5.2.2 with it,
+    # pinned to a commit of its metal branch.
+    if(PET_BACKEND STREQUAL "metal")
+        set(_pet_kokkos_repo peterspackman/kokkos-metal)
+        set(_pet_kokkos_tag f030258c7aabb0898d1b068831a3d54aceb22082)
+    else()
+        set(_pet_kokkos_repo kokkos/kokkos)
+        set(_pet_kokkos_tag 5.2.2)
+    endif()
     CPMAddPackage(
         NAME Kokkos
-        GITHUB_REPOSITORY kokkos/kokkos
-        GIT_TAG 5.2.2
+        GITHUB_REPOSITORY ${_pet_kokkos_repo}
+        GIT_TAG ${_pet_kokkos_tag}
     )
 else()
     message(STATUS "pet-kokkos: using the consumer's Kokkos::kokkos (${PET_BACKEND})")
