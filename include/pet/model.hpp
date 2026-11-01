@@ -290,6 +290,9 @@ class PetModel {
   const Uncertainty& last_uncertainty() const { return uq_last_; }
   // Replay repeated evaluations as one CUDA graph (graph.hpp). On by default.
   void set_graphs(bool on) { graphs_ = on; }
+  // Give the scratch pool back, after an allocation failed: every view it handed
+  // out is stale (and no recorded graph will replay over them).
+  void release_workspace() { ws_.release(); }
   bool graphs() const { return graphs_; }
   std::size_t ws_generation() const { return ws_.generation(); }
 

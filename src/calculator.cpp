@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -205,6 +206,7 @@ struct Calculator::Impl {
   // stay where it recorded them.
   RView1D resp_vdot;
   IView1D resp_slot;
+  int resp_chunk_cap = 0;  // directions per pass after one ran out of memory; 0 = none yet
 
   std::vector<int> atomic_types;
 
@@ -367,13 +369,17 @@ Calculator::Response Calculator::response(const System& system, int K, const std
   std::size_t free_b = 0, total_b = 0;
   device_memory(I.opts, free_b, total_b);
   const double per_dir = 1.5 * double(I.model.bytes_per_slot()) * double(N) * double(std::max(1, ed.max_neighbors));
-  const int chunk = std::max(1, std::min(std::max(K, 1), int(0.5 * double(total_b) / per_dir)));
+  // The estimate can be short (a supercell's pool holds more than the saves): a
+  // pass that runs out of memory gives the pool back and runs again at half the
+  // directions, and later calls start from there.
+  int chunk = std::max(1, std::min(std::max(K, 1), int(0.5 * double(total_b) / per_dir)));
+  if (I.resp_chunk_cap > 0) chunk = std::min(chunk, I.resp_chunk_cap);
 
   Response r;
   r.K = K;
   r.forces.assign(std::size_t(K) * N * 3, 0.0);
   r.virial.assign(std::size_t(K) * 6, 0.0);
-  for (int k0 = 0; k0 < std::max(K, 1); k0 += chunk) {
+  for (int k0 = 0; k0 < std::max(K, 1);) {
     const int kc = std::min(chunk, K - k0);
     DeviceEdgeData dev = I.model.upload_edge_data(ed, true);
     const std::size_t nv = std::size_t(std::max(chunk, 1)) * R * 3;
@@ -401,7 +407,16 @@ Calculator::Response Calculator::response(const System& system, int K, const std
       }
     Kokkos::deep_copy(vdot, hv);
     dev.raw_slot = raw_slot;
-    const HvpOut o = I.model.hvp(dev, std::max(kc, 0), vdot);
+    HvpOut o;
+    try {
+      o = I.model.hvp(dev, std::max(kc, 0), vdot);
+    } catch (const std::exception& e) {
+      const bool oom = dynamic_cast<const std::bad_alloc*>(&e) || std::strstr(e.what(), "failed to allocate");
+      if (!oom || kc <= 1) throw;
+      I.model.release_workspace();
+      I.resp_chunk_cap = chunk = std::max(1, kc / 2);
+      continue;
+    }
     if (k0 == 0) {
       auto f = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.forces);
       r.base.assign(f.data(), f.data() + std::size_t(N) * 3);
@@ -415,6 +430,7 @@ Calculator::Response Calculator::response(const System& system, int K, const std
                            0.5 * (w(k, 5) + w(k, 7))};
       std::copy(v, v + 6, r.virial.begin() + std::size_t(k0 + k) * 6);
     }
+    k0 += kc;
   }
   return r;
 }
