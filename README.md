@@ -175,33 +175,63 @@ it installed).
 ### Second derivatives
 
 `pet_kokkos.properties` computes Hessians, vibrational modes, phonons (via
-phonopy, `pip install pet-kokkos[phonons]`) and elastic tensors from central
-differences of the forces and virial. All the displaced structures for a
-property go through one batched evaluation:
+phonopy, `pip install pet-kokkos[phonons]`) and elastic tensors:
 
 ```python
 from pet_kokkos import properties
 vib = properties.vibrations(calc, molecule)              # cm^-1, rigid modes projected out
 el = properties.elastic_tensor(calc, crystal)            # relaxed-ion C, GPa, no relaxations
 ph = properties.phonons(calc, crystal, [2, 2, 2])        # a phonopy.Phonopy with force constants
-H = properties.hessian(calc, atoms, points=4, step=0.005)
+H = properties.hessian(calc, atoms, method="fd", points=4, step=0.005)
 ```
 
-The stencil can be set: `points` (2, 4 or 6), `step` (Å), `strain_step`.
-Measured against an fp64 build, fp32's own noise is not what limits the
-accuracy; the stencil's truncation error is:
+They are all built on the derivatives of the forces and virial along a set of
+directions (atomic displacements, strains), which come one of two ways:
 
-| | frequencies | elastic constants |
-|---|---|---|
-| `points=2, step=0.0025` (default) | ~0.1 cm⁻¹ | ~0.02 GPa |
-| `points=4, step=0.005` | ~0.03 cm⁻¹ | ~0.01 GPa |
-| any stencil, TF32 GEMMs or attention | 1–20 cm⁻¹ | 1.5–8 GPa |
+- `method="exact"`: a Hessian-vector product. The network's forward and its
+  hand-written backward are differentiated along every direction at once
+  (forward-over-reverse), so there is no step and no truncation error. The
+  K directions run as extra rows of the same GEMMs. `Calculator.response`
+  exposes it directly. It is only available for the feedforward featurizer
+  (pet-mad, pet-omol) with the solver adaptive cutoff or none.
+- `method="fd"`: central differences of the forces, every displaced structure
+  of a property in one batched evaluation. The stencil can be set: `points`
+  (2, 4 or 6), `step` (Å), `strain_step`. It works with any model.
 
-These were measured on benzene, the CO2 crystal and silicon, with pet-mad-s
-and pet-mols-s. TF32 is refused unless `allow_reduced_precision=True`. With
-pet-mad-s on an RTX 4080 SUPER, a 48-atom anthracene cell's elastic tensor
-takes 0.8 s, and its 2×2×2 phonons (36 symmetry-reduced displacements of 384
-atoms) take 1.1 s.
+`method="auto"`, the default, takes the exact product where the model has it.
+Measured against the exact product in an fp64 build:
+
+| | Hessian | frequencies | elastic constants |
+|---|---|---|---|
+| exact, fp32 | ~3e-5 eV/Å² | ~0.0005 cm⁻¹ | <0.0001 GPa |
+| `fd`, `points=2, step=0.0025` | ~5e-3 eV/Å² | ~0.1 cm⁻¹ | ~0.02 GPa |
+| `fd`, `points=4, step=0.005` | ~1e-3 eV/Å² | ~0.02 cm⁻¹ | ~0.01 GPa |
+| `fd`, TF32 GEMMs or attention | | 1–20 cm⁻¹ | 1.5–8 GPa |
+
+These were measured on benzene, the CO2 crystal and silicon with pet-mad-s.
+fp32's own noise is not what limits the finite differences; the stencil's
+truncation is. Near soft or unstable modes the relaxed-ion elastic tensor
+divides by small eigenvalues, and finite-difference errors grow there: on an
+unrelaxed acetic acid cell they reached 0.2–0.6 GPa, and moved with the step.
+TF32 is refused unless `allow_reduced_precision=True`.
+
+The exact Hessian is symmetric, and the response to a translation is zero, to
+rounding. It also carries the solver adaptive cutoff's full second derivative.
+The forward treats that cutoff's root and slope as constants, as metatrain
+does, which is right for forces; a double backward through that graph, as torch
+would do it, leaves out terms that are 4% of the virial's response to a strain.
+
+With pet-mad-s on an RTX 4080 SUPER:
+
+| | exact | fd, 2-point | fd, 4-point |
+|---|---|---|---|
+| benzene crystal, 48 atoms: Hessian | 0.35 s | 0.51 s | 1.03 s |
+| anthracene, 48 atoms: Hessian | 0.39 s | 0.57 s | 1.19 s |
+| anthracene: elastic tensor | 0.42 s | 0.55 s | 1.11 s |
+| anthracene 2×2×2: phonons (36 displacements of 384 atoms) | 1.11 s | 1.19 s | |
+
+The same anthracene elastic tensor computed one structure per call takes
+1.96 s.
 
 PET is not exactly rotationally equivariant, and that shows up in second
 derivatives at a level well above the finite-difference error:

@@ -136,6 +136,34 @@ class Calculator:
             items.append((z, x, c, p, q, m))
         return self._calc.compute_batch(items, forces)
 
+    def response(self, numbers, positions, cell=None, pbc=None, *, displacements=None, strains=None, charge=0,
+                 spin_multiplicity=1) -> dict:
+        """The derivatives of the forces and virial along K directions, exactly:
+        a Hessian-vector product, with no finite step. Direction k moves the
+        atoms by ``displacements[k]`` ([N, 3], A per unit t) and strains the
+        structure by ``strains[k]`` ([3, 3]: positions and cell go to
+        x (I + t e)^T); either may be None. Returns ``forces`` [K, N, 3]
+        (d forces / dt), ``virial`` [K, 6] (d virial / dt, the virial's order)
+        and ``base_forces`` [N, 3].
+
+        So far the feedforward featurizer (pet-mad, pet-omol...) with the
+        solver adaptive cutoff or none; other models raise. See
+        ``pet_kokkos.properties`` for Hessians, vibrations and elastic tensors
+        built on it.
+        """
+        z, x, c, p = _arrays(numbers, positions, cell, pbc)
+        n = len(z)
+        u = np.zeros((0, n, 3)) if displacements is None else np.ascontiguousarray(displacements, dtype=np.float64)
+        e = np.zeros((0, 3, 3)) if strains is None else np.ascontiguousarray(strains, dtype=np.float64)
+        u = u.reshape(-1, n, 3)
+        e = e.reshape(-1, 3, 3)
+        K = max(len(u), len(e))
+        if len(u) == 0:
+            u = np.zeros((K, n, 3))
+        if len(e) == 0:
+            e = np.zeros((K, 3, 3))
+        return self._calc.response(z, x, c, p, u, e, charge, spin_multiplicity)
+
     @property
     def cutoff(self) -> float:
         return self._calc.cutoff

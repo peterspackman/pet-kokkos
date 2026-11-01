@@ -205,6 +205,23 @@ struct ReadoutSaves {
   std::vector<View2D> nh0, nh1, eh0, eh1, epred;
 };
 
+// The tangents of those saves for the Hessian-vector product (hvp.cpp), K
+// directions stacked in rows: an [R, C] save's tangents are [K * R, C].
+struct LayerTangents {
+  View2D cpre, concat, cph;
+  std::vector<View2D> tokens, qkv, node_new, tmp_center, eps, tmp_edge;
+};
+struct ReadoutTangents {
+  View2D nh0, nh1, eh0, eh1, epred;
+};
+
+// The Hessian-vector product's results, on the device (PetModel::hvp).
+struct HvpOut {
+  RView2D forces;   // [N, 3] the forces, from the same pass
+  RView2D dforces;  // [K * N, 3] d(forces)/dt along each direction
+  RView2D dvir9;    // [K, 9] d(virial)/dt, row-major, as DeviceOut::vir9
+};
+
 class PetModel {
  public:
   explicit PetModel(const Checkpoint& ckpt);
@@ -307,6 +324,27 @@ class PetModel {
   void residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D input_edge,
                       View2D tokens, ResidualSaves* sav, bool save_wide);
   PackedEdges pack_edges(const DeviceEdgeData& dev);
+  // The derivatives of forces and virial along K directions, exactly: a
+  // Hessian-vector product by forward-over-reverse differentiation (hvp.cpp).
+  // vdot_raw [K * n_raw, 3] is each raw edge vector's tangent along each
+  // direction; dev needs raw_slot. One structure, the feedforward featurizer,
+  // the solver adaptive cutoff or none.
+  HvpOut hvp(const DeviceEdgeData& dev, int K, RView2D vdot_raw);
+  void ff_layer_tan(const PackedEdges& pk, int L, const LayerSaves& sav, LayerTangents& ts, int K, View2D node_t,
+                    View2D ie_t, View2D x4_t, View2D cf, View2D cf_t);
+  void ff_layer_bwd2(const PackedEdges& pk, int L, const LayerSaves& sav, const LayerTangents& ts, int K,
+                     View2D cf, View2D cf_t, View2D node_adj, View2D node_adj_t, View2D ie_adj, View2D ie_adj_t,
+                     View2D x4_adj, View2D x4_adj_t, View2D cf_adj, View2D cf_adj_t);
+  void readout_tan(const ReadoutSaves& sav, ReadoutTangents& ts, int K, View2D node_t, View2D edge_t);
+  void readout_bwd2(const ReadoutSaves& sav, const ReadoutTangents& ts, const PackedEdges& pk, int K, View1D cut_t,
+                    View2D node_adj, View2D node_adj_t, View2D edge_adj, View2D edge_adj_t, View1D cutoff_adj,
+                    View1D cutoff_adj_t);
+  // A feedforward block's tangent (out_t onto beta * out_t, pre_t its
+  // pre-activation's), and its backward with tangents: in_adj and in_adj_t
+  // onto beta times themselves.
+  void feedforward_tan(View2D out_t, View2D in_t, const std::string& key, View2D pre, View2D pre_t, Net beta);
+  void feedforward_bwd2(View2D in_adj, View2D in_adj_t, View2D out_adj, View2D out_adj_t, const std::string& key,
+                        View2D pre, View2D pre_t, Net beta);
   View2D conditioning(const DeviceEdgeData& dev);
   void readout_bwd(const ReadoutSaves& sav, int i, const PackedEdges& pk, int N, View2D node_adj,
                    View2D edge_adj, View1D cutoff_adj, bool acc_cutoff);

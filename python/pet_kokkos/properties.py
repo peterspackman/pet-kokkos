@@ -8,19 +8,33 @@
 
 Everything is built on one primitive, :func:`response`: the derivatives of the
 forces and virial along a set of directions, each an atomic displacement or a
-homogeneous strain. It runs as central finite differences, every displaced
-structure of a property in one batched evaluation.
+homogeneous strain. Two ways to get them:
+
+- ``method="exact"``: a Hessian-vector product, differentiating the network's
+  forward and backward along each direction (:meth:`Calculator.response`). No
+  step, no truncation, and the translations' zero response is exact. So far
+  for the feedforward models (pet-mad, pet-omol) with the solver adaptive
+  cutoff or none.
+- ``method="fd"``: central finite differences of the forces, every displaced
+  structure of a property in one batched evaluation. Any model.
+
+``method="auto"`` (the default) takes the exact product where the model has
+it.
 
 A structure is an ASE ``Atoms`` or a tuple ``(numbers, positions, cell, pbc)``
 as :meth:`Calculator.compute` takes it.
 
-Accuracy. Measured against an fp64 build on molecules and molecular and
-covalent crystals, the fp32 network's own noise is not what limits these: the
-stencil's truncation error is. ``points=2, step=0.0025`` (the default) gives
-frequencies to ~0.1 cm^-1 and elastic constants to ~0.02 GPa; ``points=4,
-step=0.005`` to ~0.03 cm^-1 and ~0.01 GPa, for twice the evaluations. TF32 (or
-any lower-precision GEMM or attention) puts its noise through the 1/step of a
-difference -- 1-20 cm^-1, several GPa -- so it is refused unless asked for.
+Accuracy, measured against the exact product in an fp64 build (benzene, the CO2
+crystal, silicon; pet-mad-s). The exact product in fp32 gives Hessians to
+~3e-5 eV/A^2 and frequencies to ~0.0005 cm^-1, and is faster than either
+stencil. Finite differences are limited by the stencil's truncation, not by
+fp32 noise: ``points=2, step=0.0025`` (the default) gives frequencies to ~0.1
+cm^-1 and elastic constants to ~0.02 GPa, ``points=4, step=0.005`` ~0.02 cm^-1
+and ~0.01 GPa for twice the evaluations. Near soft or unstable modes the
+relaxed-ion elastic tensor divides by small eigenvalues and those errors grow
+(0.2-0.6 GPa on an unrelaxed cell). TF32 (or any lower-precision GEMM or
+attention) puts its noise through the 1/step of a difference -- 1-20 cm^-1,
+several GPa -- so it is refused unless asked for.
 
 Units are the model's: Angstrom, eV; frequencies in cm^-1 (imaginary modes as
 negative numbers), elastic constants in GPa, in the standard Voigt order xx yy
@@ -30,6 +44,7 @@ xx yy zz xy xz yz, as :meth:`Calculator.compute` returns it.)
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Iterator, Sequence
 
@@ -99,19 +114,25 @@ class Response:
     virial: np.ndarray
 
 
-def response(calc, structure, displacements=None, strains=None, *, points: int = 2, step: float = 0.0025,
-             strain_step: float = 5e-4, batch_atoms: int = 4096, allow_reduced_precision: bool = False) -> Response:
+def response(calc, structure, displacements=None, strains=None, *, method: str = "auto", points: int = 2,
+             step: float = 0.0025, strain_step: float = 5e-4, batch_atoms: int = 4096,
+             allow_reduced_precision: bool = False) -> Response:
     """d(forces)/dt and d(virial)/dt along each direction x(t) = x + t d.
 
     displacements: [K, N, 3] atomic displacement directions (A per unit t).
     strains: [K', 3, 3] strain directions: positions and cell go to
         x (I + t e)^T. Their derivatives follow the displacements'.
+    method: "exact" (the Hessian-vector product), "fd" or "auto" (exact where
+        the model has it, else fd).
     points, step, strain_step: the central-difference stencil (2, 4 or 6
-        points) and its steps for displacements (A) and strains.
-    batch_atoms: atoms per batched evaluation (the GPU is saturated well
-        before the default).
+        points) and its steps for displacements (A) and strains; fd only.
+    batch_atoms: atoms per batched evaluation for fd, and atoms times
+        directions per product for exact (each direction keeps a copy of the
+        network's activations).
     """
     _check(calc, allow_reduced_precision)
+    if method not in ("auto", "exact", "fd"):
+        raise ValueError("method must be auto, exact or fd")
     if points not in STENCILS:
         raise ValueError(f"points must be one of {sorted(STENCILS)}")
     numbers, x, cell, pbc = _structure(structure)
@@ -121,6 +142,12 @@ def response(calc, structure, displacements=None, strains=None, *, points: int =
     eps = np.zeros((0, 3, 3)) if strains is None else np.asarray(strains, dtype=np.float64).reshape(-1, 3, 3)
     if len(eps) and not periodic:
         raise ValueError("strain directions need a periodic structure")
+    if method != "fd":
+        try:
+            return _exact(calc, (numbers, x, cell, pbc), disp, eps, batch_atoms)
+        except RuntimeError as e:
+            if method == "exact" or "Hessian-vector product" not in str(e):
+                raise
     stencil = STENCILS[points]
 
     def structures() -> Iterator[tuple]:
@@ -151,6 +178,22 @@ def response(calc, structure, displacements=None, strains=None, *, points: int =
     return Response(forces, virial)
 
 
+def _exact(calc, structure, disp, eps, batch_atoms):
+    numbers, x, cell, pbc = structure
+    n = len(numbers)
+    u = np.concatenate([disp, np.zeros((len(eps), n, 3))])
+    e = np.concatenate([np.zeros((len(disp), 3, 3)), eps])
+    K = len(u)
+    forces = np.zeros((K, n, 3))
+    virial = np.zeros((K, 6))
+    chunk = max(1, batch_atoms // max(n, 1))
+    for k in range(0, K, chunk):
+        r = calc.response(numbers, x, cell, pbc, displacements=u[k : k + chunk], strains=e[k : k + chunk])
+        forces[k : k + chunk] = r["forces"]
+        virial[k : k + chunk] = r["virial"]
+    return Response(forces, virial)
+
+
 def _unit_displacements(n, atoms=None):
     atoms = range(n) if atoms is None else atoms
     out = []
@@ -173,7 +216,7 @@ def _voigt_strains():
 
 def hessian(calc, structure, *, symmetrize: bool = True, **fd) -> np.ndarray:
     """The Hessian d2E/dx dx [3N, 3N] (eV/A^2), one displacement per
-    coordinate. ``fd`` takes :func:`response`'s stencil options."""
+    coordinate. ``fd`` takes :func:`response`'s options (method, stencil)."""
     n = len(_structure(structure)[0])
     H = -response(calc, structure, _unit_displacements(n), **fd).forces.reshape(3 * n, 3 * n)
     return 0.5 * (H + H.T) if symmetrize else H
@@ -320,6 +363,11 @@ def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float =
         w, v = np.linalg.eigh(P @ H @ P)
         order = np.argsort(np.abs(w))
         keep = order[3:]
+        if w[keep].min() < -1e-4 * np.abs(w).max():
+            warnings.warn(
+                f"pet_kokkos.properties.elastic_tensor: the Hessian has negative eigenvalues (down to "
+                f"{w[keep].min():.3g} eV/A^2): the atoms are not at a minimum, and the relaxed-ion tensor "
+                "divides by those modes. Relax the structure first.", stacklevel=2)
         keep = keep[np.abs(w[keep]) > rcond * np.abs(w).max()]
         Hinv = (v[:, keep] / w[keep]) @ v[:, keep].T
         C = C0 - L.T @ Hinv @ L / V

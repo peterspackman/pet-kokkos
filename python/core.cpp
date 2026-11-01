@@ -159,6 +159,32 @@ class Calculator {
     return out;
   }
 
+  // d(forces)/dt [K, N, 3] and d(virial)/dt [K, 6] along K directions, exactly
+  // (pet::Calculator::response): displacements [K, N, 3], strains [K, 3, 3].
+  nb::dict response(Numbers numbers, Positions positions, std::optional<Cell> cell, std::array<bool, 3> pbc,
+                    nb::ndarray<const double, nb::ndim<3>, nb::c_contig, nb::device::cpu> displacements,
+                    nb::ndarray<const double, nb::ndim<3>, nb::c_contig, nb::device::cpu> strains, int charge,
+                    int spin_multiplicity) const {
+    const pet::System s = make_system(numbers, positions, cell, pbc, charge, spin_multiplicity);
+    const std::size_t n = s.n_atoms, K = std::max(displacements.shape(0), strains.shape(0));
+    if ((displacements.size() && (displacements.shape(0) != K || displacements.shape(1) != n ||
+                                  displacements.shape(2) != 3)) ||
+        (strains.size() && (strains.shape(0) != K || strains.shape(1) != 3 || strains.shape(2) != 3)))
+      throw std::invalid_argument("pet_kokkos: displacements must be [K, N, 3] and strains [K, 3, 3]");
+    std::vector<double> u(displacements.data(), displacements.data() + displacements.size());
+    std::vector<double> e(strains.data(), strains.data() + strains.size());
+    pet::Calculator::Response r;
+    {
+      nb::gil_scoped_release release;
+      r = get().response(s, int(K), u, e);
+    }
+    nb::dict d;
+    d["forces"] = owned(std::move(r.forces), {K, n, 3});
+    d["virial"] = owned(std::move(r.virial), {K, 6});
+    d["base_forces"] = owned(std::move(r.base), {n, 3});
+    return d;
+  }
+
   void close() { calc_.reset(); }
   bool closed() const { return !calc_; }
   double cutoff() const { return get().cutoff(); }
@@ -220,6 +246,8 @@ NB_MODULE(_core, m) {
            "pbc"_a = std::array<bool, 3>{false, false, false}, "forces"_a = true, "charge"_a = 0,
            "spin_multiplicity"_a = 1)
       .def("compute_batch", &Calculator::compute_batch, "items"_a, "forces"_a = true)
+      .def("response", &Calculator::response, "numbers"_a, "positions"_a, "cell"_a.none(), "pbc"_a,
+           "displacements"_a, "strains"_a, "charge"_a = 0, "spin_multiplicity"_a = 1)
       .def("close", &Calculator::close)
       .def_prop_ro("closed", &Calculator::closed)
       .def_prop_ro("cutoff", &Calculator::cutoff)

@@ -52,6 +52,7 @@ struct EdgeData {
   std::vector<int> raw_center, raw_neigh;  // [E]
   std::vector<double> raw_dist;            // [E]
   std::vector<double> raw_vec;             // [E*3]
+  std::vector<int> raw_slot;               // [E] the kept edge's slot n*M + m, -1 if dropped
 };
 
 // An edge supplied to build_edge_data_from_raw. center and neigh_owner are local

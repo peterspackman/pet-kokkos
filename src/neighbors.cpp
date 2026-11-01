@@ -214,6 +214,7 @@ EdgeData build_edge_data_from_raw(int N, const std::vector<int>& species, const 
   ed.pair_cutoff.assign(NM, h.cutoff);
   ed.mask.assign(NM, 0);
   ed.reverse_index.assign(NM, -1);
+  ed.raw_slot.assign(edges.size(), -1);
 
   // Slots in edge order per atom; the reverse of (i, j, s) is (j, i, -s), found
   // by its tags.
@@ -232,6 +233,7 @@ EdgeData build_edge_data_from_raw(int N, const std::vector<int>& species, const 
                               : detail::cosine_cutoff(e.dist, kept[k].rc, h.cutoff_width);
     ed.pair_cutoff[f] = kept[k].rc;
     ed.mask[f] = 1;
+    ed.raw_slot[kept[k].e - edges.data()] = (int) f;
     slot_of[{e.tag_center, e.tag_neigh, e.sa, e.sb, e.sc}] = f;
   }
   for (std::size_t k = 0; k < kept.size(); ++k) {

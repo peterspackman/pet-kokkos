@@ -17,20 +17,20 @@ namespace pet {
 namespace {
 
 
-// The smooth cutoff factors' derivatives in the distance, in float like the
+// The smooth cutoff factors' derivatives in the distance, in CutT like the
 // factors themselves (pet/cutoff.hpp).
 KOKKOS_INLINE_FUNCTION double bump_ddist(double d, double rc, double w) {
-  const float x = (float) ((d - (rc - w)) / w);
-  if (x <= 0.0f || x >= 1.0f) return 0.0;
-  const float si = Kokkos::sin((float) detail::PET_PI * x);
-  const float t = Kokkos::tanh(Kokkos::cos((float) detail::PET_PI * x) / si);
-  const float du = (-(float) detail::PET_PI / (si * si)) / (float) w;
+  const detail::CutT x = (detail::CutT) ((d - (rc - w)) / w);
+  if (x <= detail::CutT(0) || x >= detail::CutT(1)) return 0.0;
+  const detail::CutT si = Kokkos::sin((detail::CutT) detail::PET_PI * x);
+  const detail::CutT t = Kokkos::tanh(Kokkos::cos((detail::CutT) detail::PET_PI * x) / si);
+  const detail::CutT du = (-(detail::CutT) detail::PET_PI / (si * si)) / (detail::CutT) w;
   return 0.5 * (1.0 - (double) (t * t)) * (double) du;
 }
 KOKKOS_INLINE_FUNCTION double cosine_ddist(double d, double rc, double w) {
-  const float x = (float) ((d - (rc - w)) / w);
-  if (x <= 0.0f || x >= 1.0f) return 0.0;
-  return 0.5 * (double) (-(float) detail::PET_PI * Kokkos::sin((float) detail::PET_PI * x)) / w;
+  const detail::CutT x = (detail::CutT) ((d - (rc - w)) / w);
+  if (x <= detail::CutT(0) || x >= detail::CutT(1)) return 0.0;
+  return 0.5 * (double) (-(detail::CutT) detail::PET_PI * Kokkos::sin((detail::CutT) detail::PET_PI * x)) / w;
 }
 KOKKOS_INLINE_FUNCTION double cutoff_ddist(double d, double rc, double w, bool bump) {
   return bump ? bump_ddist(d, rc, w) : cosine_ddist(d, rc, w);
@@ -114,11 +114,22 @@ void adaptive_backward(Workspace& ws, const DeviceEdgeData& dev, const Hypers& h
     const bool have_eff = (int) eff.extent(0) == N && (int) eff.extent(1) == P;
     if (!have_eff) {
       eff = ws.r2("ad:eff", N, P);
-      Kokkos::deep_copy(ExecSpace(), eff, 0.0);
-      Kokkos::parallel_for(
-          "ad_eff", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
-            for (int p = 0; p < P; ++p) Kokkos::atomic_add(&eff(center(e), p), detail::dev_bump_cutoff(dist(e), probes(p), width));
-          });
+      if (roff.extent(0) == (size_t) (N + 1)) {  // each atom's own edges, in order: the same bits every run
+        Kokkos::parallel_for(
+            "ad_eff", RangePolicy(0, N * P), KOKKOS_LAMBDA(int i) {
+              const int a = i / P, p = i % P;
+              double s = 0.0;
+              for (int e = roff(a); e < roff(a + 1); ++e) s += detail::dev_bump_cutoff(dist(e), probes(p), width);
+              eff(a, p) = s;
+            });
+      } else {
+        Kokkos::deep_copy(ExecSpace(), eff, 0.0);
+        Kokkos::parallel_for(
+            "ad_eff", RangePolicy(0, E), KOKKOS_LAMBDA(int e) {
+              for (int p = 0; p < P; ++p)
+                Kokkos::atomic_add(&eff(center(e), p), detail::dev_bump_cutoff(dist(e), probes(p), width));
+            });
+      }
     }
     RView2D diff = ws.r2("ad:diff", N, P), grad = ws.r2("ad:grad", N, P), gsign = ws.r2("ad:gsign", N, P),
             w = ws.r2("ad:w", N, P), Cq = ws.r2("ad:Cq", N, P), diff_adj = ws.r2("ad:diffadj", N, P);

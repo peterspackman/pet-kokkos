@@ -24,6 +24,7 @@ add_executable(pet_tests
     test_gemm_modes.cpp
     test_cell_list.cpp
     test_edges.cpp
+    test_hvp.cpp
 )
 
 target_link_libraries(pet_tests PRIVATE
@@ -50,6 +51,7 @@ add_test(NAME ozaki        COMMAND pet_tests "[ozaki]")
 add_test(NAME gemm_modes   COMMAND pet_tests "[gemm]")
 add_test(NAME cell_list    COMMAND pet_tests "[cells]")
 add_test(NAME edges        COMMAND pet_tests "[edges]")
+add_test(NAME hvp          COMMAND pet_tests "[hvp]")
 
 # The finite-difference test evaluates the model a few hundred times.
 set_tests_properties(finite_diff PROPERTIES TIMEOUT 900)

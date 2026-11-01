@@ -165,6 +165,23 @@ class Calculator {
   // for device memory (or for max_batch_atoms) runs as several, in order; one
   // structure goes to the overload above.
   Results compute(const std::vector<System>& systems, bool compute_forces = true) const;
+
+  // The derivatives of the forces and the virial along K directions, exactly: a
+  // Hessian-vector product, by differentiating the forward and backward along
+  // each direction, with no finite step. Direction k displaces the atoms by
+  // displacements[k] ([N * 3], A per unit t) and strains the structure by
+  // strains[k] ([9], row-major e: positions and cell go to x (I + t e)^T); either
+  // may be empty, as zeros. One structure; so far the feedforward featurizer,
+  // with the solver adaptive cutoff or none.
+  struct Response {
+    int K = 0;
+    std::vector<double> forces;   // [K][N * 3] d(forces)/dt, eV/A per unit t
+    std::vector<double> virial;   // [K][6] d(virial)/dt, as Results::virial
+    std::vector<double> base;     // [N * 3] the forces themselves
+  };
+  Response response(const System& system, int K, const std::vector<double>& displacements,
+                    const std::vector<double>& strains) const;
+
   // Structures staged on the device, from this Calculator's pool, for a caller
   // that steps them there (a relaxation, MD): move geom.pos and geom.scell in
   // place, then compute_device. Staging resets the neighbour cache.

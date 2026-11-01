@@ -332,6 +332,57 @@ Results Calculator::compute(const System& system, bool compute_forces) const {
   return out;
 }
 
+Calculator::Response Calculator::response(const System& system, int K, const std::vector<double>& displacements,
+                                          const std::vector<double>& strains) const {
+  const int N = system.n_atoms;
+  if (K < 0 || (!displacements.empty() && (int) displacements.size() != K * N * 3) ||
+      (!strains.empty() && (int) strains.size() != K * 9))
+    throw std::invalid_argument("pet::Calculator::response: displacements must be [K][N*3] and strains [K][9]");
+  // The host list, which keeps each raw edge's slot: the tangents are the raw
+  // edges', v' = u_j - u_i + e v.
+  const EdgeData ed = build_edge_data(system, impl_->ckpt.hypers, impl_->ckpt.species_to_index);
+  DeviceEdgeData dev = impl_->model.upload_edge_data(ed, true);
+  const int R = ed.n_raw;
+  IView1D raw_slot("pet:raw_slot", R);
+  RView2D vdot("pet:vdot", std::size_t(K) * R, 3);
+  {
+    auto hs = Kokkos::create_mirror_view(raw_slot);
+    for (int e = 0; e < R; ++e) hs(e) = ed.raw_slot[e];
+    Kokkos::deep_copy(raw_slot, hs);
+    auto hv = Kokkos::create_mirror_view(vdot);
+    for (int k = 0; k < K; ++k)
+      for (int e = 0; e < R; ++e) {
+        const int i = ed.raw_center[e], j = ed.raw_neigh[e];
+        const double* v = &ed.raw_vec[std::size_t(e) * 3];
+        for (int c = 0; c < 3; ++c) {
+          double t = 0.0;
+          if (!displacements.empty())
+            t += displacements[(std::size_t(k) * N + j) * 3 + c] - displacements[(std::size_t(k) * N + i) * 3 + c];
+          if (!strains.empty())
+            for (int b = 0; b < 3; ++b) t += strains[std::size_t(k) * 9 + c * 3 + b] * v[b];
+          hv(std::size_t(k) * R + e, c) = t;
+        }
+      }
+    Kokkos::deep_copy(vdot, hv);
+  }
+  dev.raw_slot = raw_slot;
+  const HvpOut o = impl_->model.hvp(dev, K, vdot);
+  Response r;
+  r.K = K;
+  auto f = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.forces);
+  auto df = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.dforces);
+  auto w = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.dvir9);
+  r.base.assign(f.data(), f.data() + std::size_t(N) * 3);
+  r.forces.assign(df.data(), df.data() + std::size_t(K) * N * 3);
+  r.virial.resize(std::size_t(K) * 6);
+  for (int k = 0; k < K; ++k) {
+    const double v[6] = {w(k, 0), w(k, 4), w(k, 8), 0.5 * (w(k, 1) + w(k, 3)), 0.5 * (w(k, 2) + w(k, 6)),
+                         0.5 * (w(k, 5) + w(k, 7))};
+    std::copy(v, v + 6, r.virial.begin() + std::size_t(k) * 6);
+  }
+  return r;
+}
+
 Results Calculator::compute(const std::vector<System>& systems, bool compute_forces) const {
   if (systems.empty()) return {};
   if (systems.size() == 1) return compute(systems[0], compute_forces);
