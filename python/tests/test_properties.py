@@ -132,6 +132,19 @@ def test_elastic_cg_matches_direct():
     assert direct.n_products == 3 * len(si) + 6
 
 
+def test_crystal_symmetry():
+    pytest.importorskip("spglib")
+    calc = calculator("pet-mad-s")
+    si = silicon()
+    C = properties.elastic_tensor(calc, si, symmetry=True).C
+    assert np.allclose(np.diag(C)[:3], C[0, 0], atol=1e-6) and np.allclose(np.diag(C)[3:], C[3, 3], atol=1e-6)
+    assert np.abs(C[:3, 3:]).max() < 1e-6 and abs(C[0, 1] - C[1, 2]) < 1e-6
+    v = properties.vibrations(calc, si, symmetry=True)
+    assert np.ptp(np.sort(v.frequencies)[-3:]) < 1e-6  # the optical triplet, degenerate again
+    H = properties.hessian(calc, si, symmetry=True)
+    assert np.abs(properties.symmetrize_hessian(H, si) - H).max() < 1e-10
+
+
 def test_exact_residual_featurizer():
     calc = calculator("pet-mols-s")  # residual featurizer, LayerNorm, SiLU, cosine cutoff
     a = relaxed_benzene(calc)

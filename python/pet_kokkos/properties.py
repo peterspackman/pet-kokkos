@@ -56,7 +56,8 @@ import numpy as np
 from . import precision_modes
 
 __all__ = ["Response", "response", "hessian", "HessianOperator", "exp_preconditioner", "Vibrations", "vibrations",
-           "Elastic", "elastic_tensor", "phonons", "phonopy_forces"]
+           "Elastic", "elastic_tensor", "phonons", "phonopy_forces", "symmetry_operations", "symmetrize_hessian",
+           "symmetrize_elastic"]
 
 #: sqrt(eV / A^2 / amu) in cm^-1
 EV_A2_AMU_TO_CM = 521.47091
@@ -210,12 +211,91 @@ def _voigt_strains():
     return out
 
 
-def hessian(calc, structure, *, symmetrize: bool = True, **fd) -> np.ndarray:
+# ---- crystal symmetry --------------------------------------------------------------
+#
+# PET is not exactly equivariant, so a crystal's second derivatives break its
+# symmetry slightly (silicon's cubic constants spread by ~0.5 GPa, its optical
+# triplet by ~1.5 cm^-1). Averaging over the space group restores it, as
+# phonopy does for its force constants. Opt-in: it changes the numbers. The
+# same breaking moves atoms during an unconstrained relaxation: X23 crystals
+# relaxed from their symmetric cells left their space groups by 0.01-0.05 A, so
+# relax with ase.constraints.FixSymmetry when the symmetry is to be kept.
+
+
+def _symprec(symmetry):
+    return 1e-3 if symmetry is True else float(symmetry)
+
+
+def symmetry_operations(structure, symprec: float = 1e-3):
+    """The structure's space-group operations as (R, perm): R the Cartesian
+    rotation [3, 3] and perm[i] the atom that atom i goes to. Needs spglib."""
+    import spglib
+
+    numbers, x, cell, pbc = _structure(structure)
+    if cell is None or not all(pbc):
+        raise ValueError("crystal symmetry needs a structure periodic in all three directions")
+    frac = np.linalg.solve(cell.T, x.T).T
+    ops = spglib.get_symmetry((cell, frac, numbers), symprec=symprec)
+    if ops is None:
+        raise RuntimeError("spglib found no symmetry")
+    out = []
+    Lt = cell.T  # x = Lt f
+    for W, w in zip(ops["rotations"], ops["translations"]):
+        R = Lt @ W @ np.linalg.inv(Lt)
+        img = frac @ W.T + w
+        d = img[:, None, :] - frac[None, :, :]
+        d -= np.round(d)
+        dist = np.linalg.norm(d @ cell, axis=2)
+        perm = np.argmin(dist, axis=1)
+        if dist[np.arange(len(perm)), perm].max() > 10 * symprec or len(set(perm)) != len(perm):
+            raise RuntimeError("a symmetry operation did not map the atoms onto each other")
+        out.append((R, perm))
+    return out
+
+
+def symmetrize_hessian(H, structure, symprec: float = 1e-3):
+    """The Gamma-point Hessian averaged over the space group:
+    H_ij -> mean over g of R^T H_{g(i) g(j)} R."""
+    n = len(_structure(structure)[0])
+    Hb = np.asarray(H).reshape(n, 3, n, 3)
+    acc = np.zeros_like(Hb)
+    ops = symmetry_operations(structure, symprec)
+    for R, perm in ops:
+        acc += np.einsum("ka,ikjl,lb->iajb", R, Hb[perm][:, :, perm], R)
+    return (acc / len(ops)).reshape(3 * n, 3 * n)
+
+
+def _voigt_to_tensor(C):
+    T = np.zeros((3, 3, 3, 3))
+    for I, (i, j) in enumerate(_VOIGT):
+        for J, (k, l) in enumerate(_VOIGT):
+            for a, b in ((i, j), (j, i)):
+                for c, d in ((k, l), (l, k)):
+                    T[a, b, c, d] = C[I, J]
+    return T
+
+
+def symmetrize_elastic(C, structure, symprec: float = 1e-3):
+    """A Voigt elastic tensor averaged over the crystal's point group."""
+    T = _voigt_to_tensor(np.asarray(C))
+    ops = symmetry_operations(structure, symprec)
+    acc = np.zeros_like(T)
+    for R, _ in ops:
+        acc += np.einsum("ia,jb,kc,ld,abcd->ijkl", R, R, R, R, T)
+    acc /= len(ops)
+    return np.array([[acc[i, j, k, l] for (k, l) in _VOIGT] for (i, j) in _VOIGT])
+
+
+def hessian(calc, structure, *, symmetrize: bool = True, symmetry=False, **fd) -> np.ndarray:
     """The Hessian d2E/dx dx [3N, 3N] (eV/A^2), one displacement per
-    coordinate. ``fd`` takes :func:`response`'s options (method, stencil)."""
+    coordinate. ``fd`` takes :func:`response`'s options (method, stencil).
+    symmetrize: (H + H^T)/2. symmetry: True (or a spglib tolerance, default
+    1e-3 A) to average over the crystal's space group."""
     n = len(_structure(structure)[0])
     H = -response(calc, structure, _unit_displacements(n), **fd).forces.reshape(3 * n, 3 * n)
-    return 0.5 * (H + H.T) if symmetrize else H
+    if symmetrize:
+        H = 0.5 * (H + H.T)
+    return symmetrize_hessian(H, structure, _symprec(symmetry)) if symmetry else H
 
 
 def _masses(numbers, masses):
@@ -268,7 +348,8 @@ class Vibrations:
         return self.frequencies * 1.239841984e-4
 
 
-def vibrations(calc, structure, *, masses=None, project: str = "auto", hessian_matrix=None, **fd) -> Vibrations:
+def vibrations(calc, structure, *, masses=None, project: str = "auto", hessian_matrix=None, symmetry=False,
+               **fd) -> Vibrations:
     """Harmonic frequencies and modes.
 
     project: "auto" (rotations and translations for a molecule, translations
@@ -277,11 +358,15 @@ def vibrations(calc, structure, *, masses=None, project: str = "auto", hessian_m
         rotations come out at a few to ~20 cm^-1 even in fp64 -- so leave the
         rotations projected for molecules. Projected modes are dropped.
     hessian_matrix: a Hessian already computed, to skip the evaluations.
+    symmetry: average the Hessian over the crystal's space group (see
+        :func:`hessian`).
     """
     numbers, x, cell, pbc = _structure(structure)
     n = len(numbers)
     m = _masses(numbers, masses)
     H = hessian(calc, structure, **fd) if hessian_matrix is None else np.asarray(hessian_matrix)
+    if symmetry:
+        H = symmetrize_hessian(H, structure, _symprec(symmetry))
     if project == "auto":
         project = "translations" if any(pbc) else "rotations"
     if project not in ("rotations", "translations", "none"):
@@ -472,7 +557,7 @@ class Elastic:
 
 
 def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float = 1e-8, solver: str = "auto",
-                   rtol: float = 1e-6, maxiter: int = 300, **fd) -> Elastic:
+                   rtol: float = 1e-6, maxiter: int = 300, symmetry=False, **fd) -> Elastic:
     """The elastic tensor of a periodic structure at its geometry, from one
     batch: C = C0 - L^T Phi^+ L / V, C0 the clamped-ion tensor (virial response
     to strain), Phi the Gamma-point Hessian and L the internal-strain tensor
@@ -491,6 +576,8 @@ def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float =
         not at a minimum) or CG does not converge. ``n_products`` and
         ``iterations`` on the result say what it took.
     rtol, maxiter: CG's convergence (relative residual per column) and limit.
+    symmetry: True (or a spglib tolerance) to average C and C0 over the
+        crystal's point group; ``asymmetry`` stays the raw tensor's.
     """
     numbers, x, cell, pbc = _structure(structure)
     if cell is None or not all(pbc):
@@ -517,8 +604,8 @@ def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float =
         else:
             C = C0 - L.T @ X / V
             asym = float(np.abs(C - C.T).max()) * EV_A3_TO_GPA
-            sym = lambda a: 0.5 * (a + a.T) * EV_A3_TO_GPA  # noqa: E731
-            return Elastic(sym(C), sym(C0), L, None, asym, V, n_products=op.n_products + 6, iterations=its)
+            return Elastic(_finish(C, structure, symmetry), _finish(C0, structure, symmetry), L, None, asym, V,
+                           n_products=op.n_products + 6, iterations=its)
     disp = _unit_displacements(n) if relaxed_ions else None
     r = response(calc, structure, disp, _voigt_strains(), **fd)
     K = 0 if disp is None else len(disp)
@@ -547,8 +634,14 @@ def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float =
         Hinv = (v[:, keep] / w[keep]) @ v[:, keep].T
         C = C0 - L.T @ Hinv @ L / V
     asym = float(np.abs(C - C.T).max()) * EV_A3_TO_GPA
-    sym = lambda a: 0.5 * (a + a.T) * EV_A3_TO_GPA  # noqa: E731
-    return Elastic(sym(C), sym(C0), L, H, asym, V, n_products=K + 6)
+    return Elastic(_finish(C, structure, symmetry), _finish(C0, structure, symmetry), L, H, asym, V,
+                   n_products=K + 6)
+
+
+def _finish(C, structure, symmetry):
+    "eV/A^3 to GPa, symmetric, and averaged over the point group if asked."
+    C = 0.5 * (C + C.T) * EV_A3_TO_GPA
+    return symmetrize_elastic(C, structure, _symprec(symmetry)) if symmetry else C
 
 
 def phonopy_forces(calc, phonon, *, step: float | None = None, **fd) -> np.ndarray:

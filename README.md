@@ -271,6 +271,14 @@ derivatives at a level well above the finite-difference error:
 
 Translations are exact: the model sees only edge vectors.
 
+`symmetry=True` (in `hessian`, `vibrations` and `elastic_tensor`; needs
+spglib) averages the result over the crystal's space group, as phonopy does for
+its force constants. It is opt-in, because it changes the numbers. Silicon then
+comes out exactly cubic, with a degenerate optical mode. The same symmetry
+breaking moves atoms during an unconstrained relaxation: X23 crystals relaxed
+from their symmetric cells drifted 0.01–0.05 Å off their space groups. So relax
+with `ase.constraints.FixSymmetry` first if you want to symmetrise.
+
 ## metatomic plugin
 
 `-DPET_BUILD_METATOMIC=ON` builds `metatomic/pet-kokkos-metatomic.so`, a
