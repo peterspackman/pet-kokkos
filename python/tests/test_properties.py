@@ -8,11 +8,8 @@ stencils' agreement with each other.
 import numpy as np
 import pytest
 
-ase = pytest.importorskip("ase")
-from ase.build import bulk, molecule  # noqa: E402
-
-import pet_kokkos  # noqa: E402
-from pet_kokkos import _core, properties  # noqa: E402
+import pet_kokkos
+from pet_kokkos import _core, properties
 
 _calcs = {}
 
@@ -25,26 +22,50 @@ def calculator(model):
     return _calcs[model]
 
 
+# Structures as (numbers, positions, cell, pbc) tuples: nothing here needs ASE.
+
+
+def silicon(a=5.43):
+    "Diamond silicon, the 8-atom conventional cell."
+    f = np.array([[0, 0, 0], [0, 0.5, 0.5], [0.5, 0, 0.5], [0.5, 0.5, 0]])
+    cell = a * np.eye(3)
+    return np.full(8, 14), np.vstack([f, f + 0.25]) @ cell, cell, True
+
+
+def silicon_primitive(a=5.43):
+    cell = 0.5 * a * np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
+    return np.full(2, 14), np.array([[0, 0, 0], [0.25 * a] * 3]), cell, True
+
+
+def rattled(structure, sigma, seed):
+    z, x, cell, pbc = structure
+    return z, x + np.random.default_rng(seed).normal(0.0, sigma, x.shape), cell, pbc
+
+
+def n_atoms(structure):
+    return len(structure[0])
+
+
 def relaxed_benzene(calc):
-    from ase.optimize import BFGS
+    from scipy.optimize import minimize
 
-    from pet_kokkos.ase import PETCalculator
+    t = np.arange(6) * np.pi / 3
+    ring = np.stack([np.cos(t), np.sin(t), 0 * t], axis=1)
+    z = np.array([6] * 6 + [1] * 6)
+    x = np.vstack([1.395 * ring, 2.482 * ring])
 
-    a = molecule("C6H6")
-    a.calc = PETCalculator(calc.model)
-    BFGS(a, logfile=None).run(fmax=1e-4, steps=1000)
-    a.calc = None
-    return a
+    def energy(v):
+        r = calc.compute(z, v.reshape(-1, 3))
+        return r["energy"], -np.asarray(r["forces"]).ravel()
 
-
-def silicon():
-    return bulk("Si", "diamond", a=5.43, cubic=True)
+    out = minimize(energy, x.ravel(), jac=True, method="L-BFGS-B", options={"gtol": 1e-5, "maxiter": 2000})
+    return z, out.x.reshape(-1, 3), None, False
 
 
 def test_translation_has_no_response():
     calc = calculator("pet-mad-s")
     si = silicon()
-    d = np.zeros((1, len(si), 3))
+    d = np.zeros((1, n_atoms(si), 3))
     d[0, :, 0] = 1.0
     r = properties.response(calc, si, d)
     assert np.abs(r.forces).max() < 1e-3
@@ -56,7 +77,7 @@ def test_hessian_symmetric_and_acoustic_sum():
     si = silicon()
     H = properties.hessian(calc, si, symmetrize=False)
     assert np.abs(H - H.T).max() < 2e-3 * np.abs(H).max()
-    rows = H.reshape(3 * len(si), len(si), 3).sum(axis=1)  # sum over displaced atoms
+    rows = H.reshape(3 * n_atoms(si), n_atoms(si), 3).sum(axis=1)  # sum over displaced atoms
     assert np.abs(rows).max() < 2e-3 * np.abs(H).max()
 
 
@@ -66,10 +87,10 @@ def test_vibrations_benzene_stencils_agree():
     v2 = properties.vibrations(calc, a, method="fd")
     v4 = properties.vibrations(calc, a, method="fd", points=4, step=0.005)
     assert v2.projected == "rotations"
-    assert len(v2.frequencies) == 3 * len(a) - 6
+    assert len(v2.frequencies) == 3 * n_atoms(a) - 6
     assert v2.frequencies.min() > 300  # benzene's lowest mode is ~400 cm^-1; no soft rigid modes
     assert np.abs(v2.frequencies - v4.frequencies).max() < 0.5
-    assert v2.modes.shape == (3 * len(a) - 6, len(a), 3)
+    assert v2.modes.shape == (3 * n_atoms(a) - 6, n_atoms(a), 3)
 
 
 def test_elastic_silicon_cubic():
@@ -91,34 +112,32 @@ def test_elastic_silicon_cubic():
 
 def test_exact_matches_finite_differences():
     calc = calculator("pet-mad-s")
-    si = silicon()
-    si.rattle(0.05, seed=3)
+    si = rattled(silicon(), 0.05, seed=3)
     H = properties.hessian(calc, si, method="exact", symmetrize=False)
     H4 = properties.hessian(calc, si, method="fd", points=4, step=0.005, symmetrize=False)
     # the exact Hessian is symmetric, and a translation's response is zero, to rounding
     assert np.abs(H - H.T).max() < 1e-4
-    assert np.abs(H.reshape(3 * len(si), len(si), 3).sum(axis=1)).max() < 1e-4
+    assert np.abs(H.reshape(3 * n_atoms(si), n_atoms(si), 3).sum(axis=1)).max() < 1e-4
     assert np.abs(H - H4).max() < 5e-3 * np.abs(H).max()
-    e = properties.elastic_tensor(calc, bulk("Si", "diamond", a=5.43, cubic=True), method="exact")
-    e4 = properties.elastic_tensor(calc, bulk("Si", "diamond", a=5.43, cubic=True), method="fd", points=4,
+    e = properties.elastic_tensor(calc, silicon(), method="exact")
+    e4 = properties.elastic_tensor(calc, silicon(), method="fd", points=4,
                                    step=0.005, strain_step=1e-3)
     assert np.abs(e.C - e4.C).max() < 0.05
 
 
 def test_hessian_operator():
     calc = calculator("pet-mad-s")
-    si = silicon()
-    si.rattle(0.03, seed=5)
+    si = rattled(silicon(), 0.03, seed=5)
     H = properties.hessian(calc, si, method="exact", symmetrize=False)
     op = properties.HessianOperator(calc, si)
-    V = np.random.default_rng(0).normal(size=(3 * len(si), 4))
+    V = np.random.default_rng(0).normal(size=(3 * n_atoms(si), 4))
     assert np.abs(op @ V - H @ V).max() < 1e-4 * np.abs(H).max()
     assert op.n_products == 4
     # projected: a translation goes to zero, and so does anything's translation part
     pr = properties.HessianOperator(calc, si, project="translations")
-    t = np.tile([1.0, 0.0, 0.0], len(si))
+    t = np.tile([1.0, 0.0, 0.0], n_atoms(si))
     assert np.abs(pr @ t).max() < 1e-10
-    assert np.abs((pr @ V).reshape(len(si), 3, -1).sum(axis=0)).max() < 1e-8
+    assert np.abs((pr @ V).reshape(n_atoms(si), 3, -1).sum(axis=0)).max() < 1e-8
 
 
 def test_elastic_cg_matches_direct():
@@ -129,7 +148,7 @@ def test_elastic_cg_matches_direct():
     cg = properties.elastic_tensor(calc, si, solver="cg")
     assert np.abs(cg.C - direct.C).max() < 1e-3
     assert cg.hessian is None and 0 < cg.iterations < 100
-    assert direct.n_products == 3 * len(si) + 6
+    assert direct.n_products == 3 * n_atoms(si) + 6
 
 
 def test_crystal_symmetry():
@@ -157,7 +176,7 @@ def test_phonons_match_gamma_vibrations():
     pytest.importorskip("phonopy")
     calc = calculator("pet-mad-s")
     si = silicon()
-    prim = bulk("Si", "diamond", a=5.43)
+    prim = silicon_primitive()
     ph = properties.phonons(calc, prim, [2, 2, 2])
     ph.run_qpoints([[0, 0, 0]])
     gamma = np.sort(ph.qpoints.frequencies[0]) * 33.35641  # THz -> cm^-1
@@ -168,6 +187,19 @@ def test_phonons_match_gamma_vibrations():
     # by ~1.5 cm^-1, PET not being exactly equivariant: compare the means
     assert abs(gamma[3:].mean() - optical.mean()) < 0.5
     assert np.ptp(optical) < 3.0
+
+
+def test_chmpy_structures():
+    chmpy = pytest.importorskip("chmpy")  # noqa: F841
+    from chmpy.calc.system import System
+
+    calc = calculator("pet-mad-s")
+    z, x, cell, _ = silicon()
+    H = properties.hessian(calc, System(z, x, cell))
+    assert np.allclose(H, properties.hessian(calc, silicon()))
+    zb, xb, _, _ = relaxed_benzene(calculator("pet-mols-s"))
+    v = properties.vibrations(calculator("pet-mols-s"), System(zb, xb))  # isolated: zero cell, no pbc
+    assert v.projected == "rotations" and len(v.frequencies) == 3 * len(zb) - 6
 
 
 def test_refuses_non_conservative():

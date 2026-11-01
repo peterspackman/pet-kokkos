@@ -24,8 +24,10 @@ finite differences for a model it cannot differentiate.
 Krylov methods (scipy's ``cg``, ``eigsh``, Newton-CG); ``elastic_tensor`` uses
 it, by block CG, for cells of 100 atoms and more.
 
-A structure is an ASE ``Atoms`` or a tuple ``(numbers, positions, cell, pbc)``
-as :meth:`Calculator.compute` takes it.
+A structure is a tuple ``(numbers, positions, cell, pbc)`` as
+:meth:`Calculator.compute` takes it, a chmpy ``System``, ``Crystal`` or
+``Molecule``, or anything else with ``numbers``, ``positions``, ``cell`` and
+``pbc`` attributes. Nothing here needs ASE.
 
 Accuracy, measured against the exact product in an fp64 build (benzene, the CO2
 crystal, silicon; pet-mad-s). The exact product in fp32 gives Hessians to
@@ -79,20 +81,31 @@ _PET_FROM_VOIGT = [0, 1, 2, 5, 4, 3]
 
 
 def _structure(s):
-    "(numbers, positions, cell or None, pbc) from an ASE Atoms or a tuple."
-    if hasattr(s, "get_positions"):
-        pbc = tuple(bool(p) for p in s.pbc)
-        cell = np.array(s.cell.array, dtype=np.float64) if any(pbc) else None
-        return np.asarray(s.numbers), np.array(s.positions, dtype=np.float64), cell, pbc
+    """(numbers, positions, cell or None, pbc) from a tuple, a chmpy System,
+    Crystal or Molecule, or any object with numbers/positions/cell/pbc."""
+    if not isinstance(s, (tuple, list)):
+        if type(s).__module__.startswith("chmpy") and not hasattr(s, "numbers"):
+            from chmpy.calc.system import System  # a Crystal or a Molecule
+
+            s = System.from_crystal(s) if hasattr(s, "space_group") else System.from_molecule(s)
+        cell = getattr(s, "cell", None)
+        cell = None if cell is None else np.asarray(getattr(cell, "array", cell), dtype=np.float64)
+        pbc = getattr(s, "pbc", None)
+        if cell is not None and not cell.any():  # chmpy's isolated systems carry a zero cell
+            cell = None
+        s = (s.numbers, s.positions, cell, None if pbc is None else tuple(bool(p) for p in np.atleast_1d(pbc)))
     numbers, positions, cell, pbc = (list(s) + [None, None])[:4]
     positions = np.array(positions, dtype=np.float64).reshape(-1, 3)
     if cell is not None:
         cell = np.array(cell, dtype=np.float64).reshape(3, 3)
     if pbc is None:
         pbc = (cell is not None,) * 3
-    elif isinstance(pbc, (bool, np.bool_)):
-        pbc = (bool(pbc),) * 3
-    return np.asarray(numbers), positions, cell, tuple(bool(p) for p in pbc)
+    elif isinstance(pbc, (bool, np.bool_)) or len(pbc) == 1:
+        pbc = (bool(np.atleast_1d(pbc)[0]),) * 3
+    pbc = tuple(bool(p) for p in pbc)
+    if not any(pbc):
+        cell = None
+    return np.asarray(numbers), positions, cell, pbc
 
 
 def _check(calc, allow_reduced_precision):
@@ -219,7 +232,8 @@ def _voigt_strains():
 # phonopy does for its force constants. Opt-in: it changes the numbers. The
 # same breaking moves atoms during an unconstrained relaxation: X23 crystals
 # relaxed from their symmetric cells left their space groups by 0.01-0.05 A, so
-# relax with ase.constraints.FixSymmetry when the symmetry is to be kept.
+# relax keeping the space group (chmpy's relax(crystal, calc, symmetry=True)
+# varies the asymmetric unit, so it cannot break it) when it is to be kept.
 
 
 def _symprec(symmetry):
@@ -301,11 +315,9 @@ def hessian(calc, structure, *, symmetrize: bool = True, symmetry=False, **fd) -
 def _masses(numbers, masses):
     if masses is not None:
         return np.asarray(masses, dtype=np.float64)
-    try:
-        from ase.data import atomic_masses
-    except ImportError as e:
-        raise ImportError("pet_kokkos.properties needs masses=... or ASE installed for the standard ones") from e
-    return atomic_masses[np.asarray(numbers)]
+    from ._elements import MASSES
+
+    return np.array(MASSES, dtype=np.float64)[np.asarray(numbers)]
 
 
 def _rigid_modes(positions, masses, rotations):
@@ -452,6 +464,24 @@ class HessianOperator:
                               rmatmat=self.matmat, dtype=self.dtype)
 
 
+def _pairs(numbers, x, cell, pbc, r_cut):
+    """Every pair (i, j, d) closer than r_cut, periodic images included (each
+    pair both ways), by a sweep over the lattice shifts that can reach."""
+    shifts = [np.zeros(3)]
+    if cell is not None:
+        heights = abs(np.linalg.det(cell)) / np.linalg.norm(np.cross(cell[[1, 2, 0]], cell[[2, 0, 1]]), axis=1)
+        reach = [int(np.ceil(r_cut / h)) if p else 0 for h, p in zip(heights, pbc)]
+        g = np.mgrid[-reach[0] : reach[0] + 1, -reach[1] : reach[1] + 1, -reach[2] : reach[2] + 1].reshape(3, -1).T
+        shifts = g @ cell
+    I, J, Dd = [], [], []
+    for t in shifts:
+        for i0 in range(0, len(x), 512):  # rows in blocks: N x N distances at once would not fit
+            d = np.linalg.norm(x[None, :, :] + t - x[i0 : i0 + 512, None, :], axis=2)
+            i, j = np.nonzero((d < r_cut) & (d > 1e-8))
+            I.append(i + i0), J.append(j), Dd.append(d[i, j])
+    return np.concatenate(I), np.concatenate(J), np.concatenate(Dd)
+
+
 def exp_preconditioner(structure, *, mu: float = 1.0, A: float = 3.0, r_cut: float | None = None,
                        c_stab: float = 0.1):
     """The "Exp" preconditioner (Packwood et al., J. Chem. Phys. 144, 164109
@@ -459,19 +489,15 @@ def exp_preconditioner(structure, *, mu: float = 1.0, A: float = 3.0, r_cut: flo
     r_nn - 1)) (e_i - e_j)(e_i - e_j)^T (x) I_3 over pairs within r_cut (2 r_nn,
     r_nn the nearest-neighbour distance), plus c_stab mu I. A cheap
     approximation of the Hessian's shape, for preconditioning Krylov solves on
-    it. Needs ASE (its neighbour list) and scipy."""
+    it. Needs scipy."""
     import scipy.sparse as sp
-    from ase import Atoms
-    from ase.neighborlist import neighbor_list
 
     numbers, x, cell, pbc = _structure(structure)
-    atoms = Atoms(numbers=numbers, positions=x, cell=cell if cell is not None else np.zeros((3, 3)), pbc=pbc)
     n = len(numbers)
-    i0, j0, d0 = neighbor_list("ijd", atoms, 6.0)
+    _, _, d0 = _pairs(numbers, x, cell, pbc, 4.0)
     r_nn = float(d0.min()) if len(d0) else 1.0
     r_cut = 2.0 * r_nn if r_cut is None else r_cut
-    keep = d0 < r_cut
-    i, j, d = i0[keep], j0[keep], d0[keep]
+    i, j, d = _pairs(numbers, x, cell, pbc, r_cut)
     c = -mu * np.exp(-A * (d / r_nn - 1.0))
     diag = np.zeros(n)
     np.add.at(diag, i, -c)
@@ -568,8 +594,8 @@ def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float =
     rcond: Phi's eigenvalues below rcond * its largest are treated as zero
         modes, beyond the three translations always removed.
     solver: "direct" builds Phi (3N products) and inverts it; "cg" solves Phi X
-        = L by block preconditioned CG (the Exp preconditioner; needs scipy and
-        ASE), 6 products per iteration and never forming Phi. CG took 25-40
+        = L by block preconditioned CG (the Exp preconditioner; needs scipy),
+        6 products per iteration and never forming Phi. CG took 25-40
         iterations on molecular crystals of 12-384 atoms, so it wins from ~100
         atoms; "auto" (the default) takes it from there, falling back to
         direct, with a warning, if Phi turns out not positive definite (atoms

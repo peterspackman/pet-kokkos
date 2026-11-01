@@ -175,7 +175,10 @@ it installed).
 ### Second derivatives
 
 `pet_kokkos.properties` computes Hessians, vibrational modes, phonons (via
-phonopy, `pip install pet-kokkos[phonons]`) and elastic tensors:
+phonopy, `pip install pet-kokkos[phonons]`) and elastic tensors. A structure is
+a `(numbers, positions, cell, pbc)` tuple, a chmpy `System`, `Crystal` or
+`Molecule`, or anything else with those four attributes. None of it needs
+ASE.
 
 ```python
 from pet_kokkos import properties
@@ -277,7 +280,8 @@ its force constants. It is opt-in, because it changes the numbers. Silicon then
 comes out exactly cubic, with a degenerate optical mode. The same symmetry
 breaking moves atoms during an unconstrained relaxation: X23 crystals relaxed
 from their symmetric cells drifted 0.01–0.05 Å off their space groups. So relax
-with `ase.constraints.FixSymmetry` first if you want to symmetrise.
+with the space group held first if you want to symmetrise: chmpy's
+`relax(crystal, calc, symmetry=True)` varies only the asymmetric unit.
 
 ## metatomic plugin
 
