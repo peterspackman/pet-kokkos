@@ -241,6 +241,26 @@ With pet-mad-s on an RTX 4080 SUPER:
 The same anthracene elastic tensor computed one structure per call takes
 1.96 s.
 
+`properties.HessianOperator(calc, structure)` wraps the exact product as a
+matrix-free operator (a scipy `LinearOperator` via `as_linear_operator()`;
+mass-weighted and with rigid modes projected out if asked). One block of k
+vectors is one call with k directions, so Krylov methods such as `cg`,
+`eigsh` and Newton-CG pay only for the products they take.
+
+`elastic_tensor` uses it from 100 atoms up (`solver="auto"`). It solves for
+the internal relaxation by block CG, six products per iteration, preconditioned
+with a pair Hessian (Packwood et al.'s "Exp"). That took 25–40 iterations on
+molecular crystals from 12 to 384 atoms. For anthracene 2×2×2 (384 atoms) it
+is 6.6 s and 247 products, against 1,158 products to build the Hessian, and it
+reproduces the unit cell's tensor to <1e-4 GPa. If the atoms are not at a
+minimum, it falls back to building the Hessian.
+
+Finding the lowest few modes iteratively does not pay off for molecular
+crystals. LOBPCG needed 400–7,500 products for the six lowest modes, against
+3N for the whole Hessian: the spectrum spans a stiffness ratio of ~10⁴, and a
+pair preconditioner does not capture the soft intermolecular modes those six
+are made of. For those, take the full exact Hessian.
+
 PET is not exactly rotationally equivariant, and that shows up in second
 derivatives at a level well above the finite-difference error:
 

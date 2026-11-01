@@ -105,6 +105,33 @@ def test_exact_matches_finite_differences():
     assert np.abs(e.C - e4.C).max() < 0.05
 
 
+def test_hessian_operator():
+    calc = calculator("pet-mad-s")
+    si = silicon()
+    si.rattle(0.03, seed=5)
+    H = properties.hessian(calc, si, method="exact", symmetrize=False)
+    op = properties.HessianOperator(calc, si)
+    V = np.random.default_rng(0).normal(size=(3 * len(si), 4))
+    assert np.abs(op @ V - H @ V).max() < 1e-4 * np.abs(H).max()
+    assert op.n_products == 4
+    # projected: a translation goes to zero, and so does anything's translation part
+    pr = properties.HessianOperator(calc, si, project="translations")
+    t = np.tile([1.0, 0.0, 0.0], len(si))
+    assert np.abs(pr @ t).max() < 1e-10
+    assert np.abs((pr @ V).reshape(len(si), 3, -1).sum(axis=0)).max() < 1e-8
+
+
+def test_elastic_cg_matches_direct():
+    pytest.importorskip("scipy")
+    calc = calculator("pet-mad-s")
+    si = silicon()
+    direct = properties.elastic_tensor(calc, si, solver="direct")
+    cg = properties.elastic_tensor(calc, si, solver="cg")
+    assert np.abs(cg.C - direct.C).max() < 1e-3
+    assert cg.hessian is None and 0 < cg.iterations < 100
+    assert direct.n_products == 3 * len(si) + 6
+
+
 def test_exact_residual_featurizer():
     calc = calculator("pet-mols-s")  # residual featurizer, LayerNorm, SiLU, cosine cutoff
     a = relaxed_benzene(calc)

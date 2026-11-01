@@ -20,6 +20,10 @@ homogeneous strain. Two ways to get them:
 ``method="auto"`` (the default) takes the exact product, and falls back to
 finite differences for a model it cannot differentiate.
 
+:class:`HessianOperator` wraps the product as a matrix-free operator for
+Krylov methods (scipy's ``cg``, ``eigsh``, Newton-CG); ``elastic_tensor`` uses
+it, by block CG, for cells of 100 atoms and more.
+
 A structure is an ASE ``Atoms`` or a tuple ``(numbers, positions, cell, pbc)``
 as :meth:`Calculator.compute` takes it.
 
@@ -51,8 +55,8 @@ import numpy as np
 
 from . import precision_modes
 
-__all__ = ["Response", "response", "hessian", "Vibrations", "vibrations", "Elastic", "elastic_tensor",
-           "phonons", "phonopy_forces"]
+__all__ = ["Response", "response", "hessian", "HessianOperator", "exp_preconditioner", "Vibrations", "vibrations",
+           "Elastic", "elastic_tensor", "phonons", "phonopy_forces"]
 
 #: sqrt(eV / A^2 / amu) in cm^-1
 EV_A2_AMU_TO_CM = 521.47091
@@ -125,9 +129,9 @@ def response(calc, structure, displacements=None, strains=None, *, method: str =
         the model has it, else fd).
     points, step, strain_step: the central-difference stencil (2, 4 or 6
         points) and its steps for displacements (A) and strains; fd only.
-    batch_atoms: atoms per batched evaluation for fd, and atoms times
-        directions per product for exact (each direction keeps a copy of the
-        network's activations).
+    batch_atoms: atoms per batched evaluation for fd. The exact product sizes
+        its own passes by memory (each direction keeps a copy of the network's
+        activations).
     """
     _check(calc, allow_reduced_precision)
     if method not in ("auto", "exact", "fd"):
@@ -143,7 +147,7 @@ def response(calc, structure, displacements=None, strains=None, *, method: str =
         raise ValueError("strain directions need a periodic structure")
     if method != "fd":
         try:
-            return _exact(calc, (numbers, x, cell, pbc), disp, eps, batch_atoms)
+            return _exact(calc, (numbers, x, cell, pbc), disp, eps)
         except RuntimeError as e:
             if method == "exact" or "Hessian-vector product" not in str(e):
                 raise
@@ -177,20 +181,13 @@ def response(calc, structure, displacements=None, strains=None, *, method: str =
     return Response(forces, virial)
 
 
-def _exact(calc, structure, disp, eps, batch_atoms):
+def _exact(calc, structure, disp, eps):
     numbers, x, cell, pbc = structure
     n = len(numbers)
     u = np.concatenate([disp, np.zeros((len(eps), n, 3))])
     e = np.concatenate([np.zeros((len(disp), 3, 3)), eps])
-    K = len(u)
-    forces = np.zeros((K, n, 3))
-    virial = np.zeros((K, 6))
-    chunk = max(1, batch_atoms // max(n, 1))
-    for k in range(0, K, chunk):
-        r = calc.response(numbers, x, cell, pbc, displacements=u[k : k + chunk], strains=e[k : k + chunk])
-        forces[k : k + chunk] = r["forces"]
-        virial[k : k + chunk] = r["virial"]
-    return Response(forces, virial)
+    r = calc.response(numbers, x, cell, pbc, displacements=u, strains=e)
+    return Response(np.asarray(r["forces"]), np.asarray(r["virial"]))
 
 
 def _unit_displacements(n, atoms=None):
@@ -305,6 +302,151 @@ def vibrations(calc, structure, *, masses=None, project: str = "auto", hessian_m
     return Vibrations(freqs, v.T.reshape(-1, n, 3), H, m, project)
 
 
+# ---- matrix-free: the Hessian as an operator --------------------------------------
+
+
+class HessianOperator:
+    """The Hessian H as a linear operator on [3N] vectors (atom-major, as
+    positions.ravel()), each product an exact Hessian-vector product: a block of
+    k vectors is one call with k directions. No [3N, 3N] matrix is formed, so
+    Krylov methods -- scipy's ``eigsh``, ``lobpcg``, ``cg``, Newton-CG -- need
+    only as many products as they take iterations.
+
+    mass_weighted: D = M^-1/2 H M^-1/2 instead (vibrational frequencies are
+        sqrt of its eigenvalues).
+    project: "none", "translations" or "rotations" (both rigid motions): the
+        operator P H P on the space orthogonal to them (mass-weighted when D).
+    method: as :func:`response` ("auto", "exact", "fd").
+
+    ``n_products`` counts the products taken; ``as_linear_operator()`` gives a
+    scipy LinearOperator.
+    """
+
+    def __init__(self, calc, structure, *, mass_weighted: bool = False, masses=None, project: str = "none",
+                 method: str = "auto", **fd):
+        numbers, x, cell, pbc = _structure(structure)
+        self.structure = (numbers, x, cell, pbc)
+        self.calc, self.method, self.fd = calc, method, fd
+        self.n = len(numbers)
+        self.shape = (3 * self.n, 3 * self.n)
+        self.dtype = np.dtype(np.float64)
+        self.n_products = 0
+        m = _masses(numbers, masses) if (mass_weighted or project == "rotations") else np.ones(self.n)
+        self.sm = np.repeat(np.sqrt(m), 3) if mass_weighted else None
+        if project not in ("none", "translations", "rotations"):
+            raise ValueError("project must be none, translations or rotations")
+        # the rigid motions span the same space whatever point the rotations are
+        # about, so in plain coordinates unit masses give an orthonormal basis of it
+        self.rigid = None
+        if project != "none":
+            self.rigid = _rigid_modes(x, m if mass_weighted else np.ones(self.n), project == "rotations")
+
+    def _project(self, V):
+        return V if self.rigid is None else V - self.rigid @ (self.rigid.T @ V)
+
+    def matmat(self, V):
+        V = self._project(np.asarray(V, dtype=np.float64).reshape(self.shape[0], -1))
+        k = V.shape[1]
+        U = V / self.sm[:, None] if self.sm is not None else V
+        r = response(self.calc, self.structure, U.T.reshape(k, self.n, 3), method=self.method, **self.fd)
+        HU = -r.forces.reshape(k, 3 * self.n).T
+        self.n_products += k
+        return self._project(HU / self.sm[:, None] if self.sm is not None else HU)
+
+    def matvec(self, v):
+        return self.matmat(np.asarray(v).reshape(-1, 1))[:, 0]
+
+    def __matmul__(self, V):
+        V = np.asarray(V)
+        return self.matvec(V) if V.ndim == 1 else self.matmat(V)
+
+    def as_linear_operator(self):
+        from scipy.sparse.linalg import LinearOperator
+
+        return LinearOperator(self.shape, matvec=self.matvec, matmat=self.matmat, rmatvec=self.matvec,
+                              rmatmat=self.matmat, dtype=self.dtype)
+
+
+def exp_preconditioner(structure, *, mu: float = 1.0, A: float = 3.0, r_cut: float | None = None,
+                       c_stab: float = 0.1):
+    """The "Exp" preconditioner (Packwood et al., J. Chem. Phys. 144, 164109
+    (2016)) as a sparse [3N, 3N] matrix: a pair Hessian mu sum_ij exp(-A (r_ij /
+    r_nn - 1)) (e_i - e_j)(e_i - e_j)^T (x) I_3 over pairs within r_cut (2 r_nn,
+    r_nn the nearest-neighbour distance), plus c_stab mu I. A cheap
+    approximation of the Hessian's shape, for preconditioning Krylov solves on
+    it. Needs ASE (its neighbour list) and scipy."""
+    import scipy.sparse as sp
+    from ase import Atoms
+    from ase.neighborlist import neighbor_list
+
+    numbers, x, cell, pbc = _structure(structure)
+    atoms = Atoms(numbers=numbers, positions=x, cell=cell if cell is not None else np.zeros((3, 3)), pbc=pbc)
+    n = len(numbers)
+    i0, j0, d0 = neighbor_list("ijd", atoms, 6.0)
+    r_nn = float(d0.min()) if len(d0) else 1.0
+    r_cut = 2.0 * r_nn if r_cut is None else r_cut
+    keep = d0 < r_cut
+    i, j, d = i0[keep], j0[keep], d0[keep]
+    c = -mu * np.exp(-A * (d / r_nn - 1.0))
+    diag = np.zeros(n)
+    np.add.at(diag, i, -c)
+    rows = np.concatenate([i, np.arange(n)])
+    cols = np.concatenate([j, np.arange(n)])
+    vals = np.concatenate([c, diag + c_stab * mu])
+    P1 = sp.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsc()
+    return sp.kron(P1, sp.identity(3), format="csc")
+
+
+def _scaled_preconditioner(op, structure, P):
+    """P scaled to op's size (mu from one Rayleigh quotient of a smooth vector),
+    and its factorisation's solve, in op's coordinates."""
+    from scipy.sparse.linalg import splu
+    import scipy.sparse as sp
+
+    n = op.n
+    rng = np.random.default_rng(1)
+    _, x, _, _ = _structure(structure)
+    v = np.sin(x @ rng.normal(size=3) * 0.7).repeat(3) * rng.normal(size=3 * n)  # smooth-ish
+    if op.sm is not None:
+        S = sp.diags(1.0 / op.sm)
+        P = S @ P @ S
+    v = op._project(v.reshape(-1, 1))[:, 0]
+    mu = float(v @ op.matvec(v)) / float(v @ (P @ v))
+    lu = splu((abs(mu) * P).tocsc())
+    return lambda R: op._project(lu.solve(np.asarray(R).reshape(op.shape[0], -1)))
+
+
+class _NotConverged(RuntimeError):
+    pass
+
+
+def _block_pcg(op, B, solve, rtol, maxiter):
+    """Block preconditioned CG for op X = B (op symmetric positive definite on
+    its range), one product of B's width per iteration; the search block is
+    re-orthonormalised each step so a converged column cannot break it. Raises
+    _NotConverged on negative curvature or at maxiter."""
+    X = np.zeros_like(B)
+    R = B.copy()
+    Z = solve(R)
+    Pk = Z
+    bnorm = np.linalg.norm(B, axis=0)
+    for it in range(1, maxiter + 1):
+        Pk, _ = np.linalg.qr(Pk)
+        Q = op.matmat(Pk)
+        PQ = 0.5 * (Pk.T @ Q + Q.T @ Pk)
+        if np.linalg.eigvalsh(PQ).min() <= 0.0:
+            raise _NotConverged(f"negative curvature at iteration {it}: the Hessian is not positive definite")
+        alpha = np.linalg.solve(PQ, Pk.T @ R)
+        X += Pk @ alpha
+        R -= Q @ alpha
+        if (np.linalg.norm(R, axis=0) <= rtol * np.maximum(bnorm, 1e-300)).all():
+            return X, it
+        Z = solve(R)
+        beta = -np.linalg.solve(PQ, Q.T @ Z)
+        Pk = Z + Pk @ beta
+    raise _NotConverged(f"block CG did not reach rtol={rtol} in {maxiter} iterations")
+
+
 @dataclass
 class Elastic:
     """``C`` the relaxed-ion (or, with relaxed_ions=False, clamped-ion) elastic
@@ -319,6 +461,8 @@ class Elastic:
     hessian: np.ndarray | None
     asymmetry: float
     volume: float
+    n_products: int = 0  # Hessian-vector products (or difference directions) taken
+    iterations: int = 0
 
     @property
     def bulk_modulus(self) -> float:
@@ -327,7 +471,8 @@ class Elastic:
         return float((c[0, 0] + c[1, 1] + c[2, 2] + 2 * (c[0, 1] + c[0, 2] + c[1, 2])) / 9)
 
 
-def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float = 1e-8, **fd) -> Elastic:
+def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float = 1e-8, solver: str = "auto",
+                   rtol: float = 1e-6, maxiter: int = 300, **fd) -> Elastic:
     """The elastic tensor of a periodic structure at its geometry, from one
     batch: C = C0 - L^T Phi^+ L / V, C0 the clamped-ion tensor (virial response
     to strain), Phi the Gamma-point Hessian and L the internal-strain tensor
@@ -337,12 +482,43 @@ def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float =
 
     rcond: Phi's eigenvalues below rcond * its largest are treated as zero
         modes, beyond the three translations always removed.
+    solver: "direct" builds Phi (3N products) and inverts it; "cg" solves Phi X
+        = L by block preconditioned CG (the Exp preconditioner; needs scipy and
+        ASE), 6 products per iteration and never forming Phi. CG took 25-40
+        iterations on molecular crystals of 12-384 atoms, so it wins from ~100
+        atoms; "auto" (the default) takes it from there, falling back to
+        direct, with a warning, if Phi turns out not positive definite (atoms
+        not at a minimum) or CG does not converge. ``n_products`` and
+        ``iterations`` on the result say what it took.
+    rtol, maxiter: CG's convergence (relative residual per column) and limit.
     """
     numbers, x, cell, pbc = _structure(structure)
     if cell is None or not all(pbc):
         raise ValueError("elastic_tensor needs a structure periodic in all three directions")
     n = len(numbers)
     V = abs(np.linalg.det(cell))
+    if solver not in ("auto", "direct", "cg"):
+        raise ValueError("solver must be auto, direct or cg")
+    if solver == "auto":
+        solver = "cg" if n >= 100 else "direct"
+    if solver == "cg" and relaxed_ions:
+        r = response(calc, structure, None, _voigt_strains(), **fd)
+        C0 = r.virial[:, _PET_FROM_VOIGT].T / V
+        L = -r.forces.reshape(6, 3 * n).T
+        op = HessianOperator(calc, structure, project="translations", **fd)
+        try:
+            solve = _scaled_preconditioner(op, structure, exp_preconditioner(structure))
+        except ImportError:
+            solve = op._project
+        try:
+            X, its = _block_pcg(op, op._project(L), solve, rtol, maxiter)
+        except _NotConverged as e:
+            warnings.warn(f"pet_kokkos.properties.elastic_tensor: {e}; building the Hessian instead", stacklevel=2)
+        else:
+            C = C0 - L.T @ X / V
+            asym = float(np.abs(C - C.T).max()) * EV_A3_TO_GPA
+            sym = lambda a: 0.5 * (a + a.T) * EV_A3_TO_GPA  # noqa: E731
+            return Elastic(sym(C), sym(C0), L, None, asym, V, n_products=op.n_products + 6, iterations=its)
     disp = _unit_displacements(n) if relaxed_ions else None
     r = response(calc, structure, disp, _voigt_strains(), **fd)
     K = 0 if disp is None else len(disp)
@@ -372,7 +548,7 @@ def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float =
         C = C0 - L.T @ Hinv @ L / V
     asym = float(np.abs(C - C.T).max()) * EV_A3_TO_GPA
     sym = lambda a: 0.5 * (a + a.T) * EV_A3_TO_GPA  # noqa: E731
-    return Elastic(sym(C), sym(C0), L, H, asym, V)
+    return Elastic(sym(C), sym(C0), L, H, asym, V, n_products=K + 6)
 
 
 def phonopy_forces(calc, phonon, *, step: float | None = None, **fd) -> np.ndarray:

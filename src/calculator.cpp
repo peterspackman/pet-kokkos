@@ -195,6 +195,12 @@ struct Calculator::Impl {
     void edges(View2D out, View2D in) override { rec->cut([r = real, out, in] { r->edges(out, in); }); }
   } cut;
   EdgeSession md;  // an engine's list (compute_edges, set_neighbors)
+  // response()'s last structure and its host list: a Krylov solver asks for
+  // product after product at one geometry, and the list is most of a small
+  // call's cost.
+  System resp_system;
+  EdgeData resp_edges;
+  bool resp_cached = false;
 
   std::vector<int> atomic_types;
 
@@ -339,46 +345,69 @@ Calculator::Response Calculator::response(const System& system, int K, const std
       (!strains.empty() && (int) strains.size() != K * 9))
     throw std::invalid_argument("pet::Calculator::response: displacements must be [K][N*3] and strains [K][9]");
   // The host list, which keeps each raw edge's slot: the tangents are the raw
-  // edges', v' = u_j - u_i + e v.
-  const EdgeData ed = build_edge_data(system, impl_->ckpt.hypers, impl_->ckpt.species_to_index);
-  DeviceEdgeData dev = impl_->model.upload_edge_data(ed, true);
+  // edges', v' = u_j - u_i + e v. Kept for the next call at the same structure.
+  Impl& I = *impl_;
+  const System& c = I.resp_system;
+  const bool same = I.resp_cached && c.n_atoms == N && c.atomic_numbers == system.atomic_numbers &&
+                    c.positions == system.positions && c.cell == system.cell && c.pbc == system.pbc &&
+                    c.charge == system.charge && c.spin_multiplicity == system.spin_multiplicity;
+  if (!same) {
+    I.resp_edges = build_edge_data(system, I.ckpt.hypers, I.ckpt.species_to_index);
+    I.resp_system = system;
+    I.resp_cached = true;
+  }
+  const EdgeData& ed = I.resp_edges;
   const int R = ed.n_raw;
-  IView1D raw_slot("pet:raw_slot", R);
-  RView2D vdot("pet:vdot", std::size_t(K) * R, 3);
-  {
+  // Each direction keeps a copy of the network's activations: as many directions
+  // per pass as half the card holds, at about 1.5x the saves' estimate apiece.
+  std::size_t free_b = 0, total_b = 0;
+  device_memory(I.opts, free_b, total_b);
+  const double per_dir = 1.5 * double(I.model.bytes_per_slot()) * double(N) * double(std::max(1, ed.max_neighbors));
+  const int chunk = std::max(1, std::min(std::max(K, 1), int(0.5 * double(total_b) / per_dir)));
+
+  Response r;
+  r.K = K;
+  r.forces.assign(std::size_t(K) * N * 3, 0.0);
+  r.virial.assign(std::size_t(K) * 6, 0.0);
+  for (int k0 = 0; k0 < std::max(K, 1); k0 += chunk) {
+    const int kc = std::min(chunk, K - k0);
+    DeviceEdgeData dev = I.model.upload_edge_data(ed, true);
+    IView1D raw_slot("pet:raw_slot", R);
+    RView2D vdot("pet:vdot", std::size_t(std::max(kc, 0)) * R, 3);
     auto hs = Kokkos::create_mirror_view(raw_slot);
     for (int e = 0; e < R; ++e) hs(e) = ed.raw_slot[e];
     Kokkos::deep_copy(raw_slot, hs);
     auto hv = Kokkos::create_mirror_view(vdot);
-    for (int k = 0; k < K; ++k)
+    for (int k = 0; k < kc; ++k)
       for (int e = 0; e < R; ++e) {
         const int i = ed.raw_center[e], j = ed.raw_neigh[e];
         const double* v = &ed.raw_vec[std::size_t(e) * 3];
-        for (int c = 0; c < 3; ++c) {
+        const std::size_t kk = std::size_t(k0 + k);
+        for (int x = 0; x < 3; ++x) {
           double t = 0.0;
           if (!displacements.empty())
-            t += displacements[(std::size_t(k) * N + j) * 3 + c] - displacements[(std::size_t(k) * N + i) * 3 + c];
+            t += displacements[(kk * N + j) * 3 + x] - displacements[(kk * N + i) * 3 + x];
           if (!strains.empty())
-            for (int b = 0; b < 3; ++b) t += strains[std::size_t(k) * 9 + c * 3 + b] * v[b];
-          hv(std::size_t(k) * R + e, c) = t;
+            for (int y = 0; y < 3; ++y) t += strains[kk * 9 + x * 3 + y] * v[y];
+          hv(std::size_t(k) * R + e, x) = t;
         }
       }
     Kokkos::deep_copy(vdot, hv);
-  }
-  dev.raw_slot = raw_slot;
-  const HvpOut o = impl_->model.hvp(dev, K, vdot);
-  Response r;
-  r.K = K;
-  auto f = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.forces);
-  auto df = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.dforces);
-  auto w = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.dvir9);
-  r.base.assign(f.data(), f.data() + std::size_t(N) * 3);
-  r.forces.assign(df.data(), df.data() + std::size_t(K) * N * 3);
-  r.virial.resize(std::size_t(K) * 6);
-  for (int k = 0; k < K; ++k) {
-    const double v[6] = {w(k, 0), w(k, 4), w(k, 8), 0.5 * (w(k, 1) + w(k, 3)), 0.5 * (w(k, 2) + w(k, 6)),
-                         0.5 * (w(k, 5) + w(k, 7))};
-    std::copy(v, v + 6, r.virial.begin() + std::size_t(k) * 6);
+    dev.raw_slot = raw_slot;
+    const HvpOut o = I.model.hvp(dev, std::max(kc, 0), vdot);
+    if (k0 == 0) {
+      auto f = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.forces);
+      r.base.assign(f.data(), f.data() + std::size_t(N) * 3);
+    }
+    if (kc <= 0) break;
+    auto df = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.dforces);
+    auto w = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.dvir9);
+    std::copy(df.data(), df.data() + std::size_t(kc) * N * 3, r.forces.begin() + std::size_t(k0) * N * 3);
+    for (int k = 0; k < kc; ++k) {
+      const double v[6] = {w(k, 0), w(k, 4), w(k, 8), 0.5 * (w(k, 1) + w(k, 3)), 0.5 * (w(k, 2) + w(k, 6)),
+                           0.5 * (w(k, 5) + w(k, 7))};
+      std::copy(v, v + 6, r.virial.begin() + std::size_t(k0 + k) * 6);
+    }
   }
   return r;
 }
