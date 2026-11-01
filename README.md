@@ -172,6 +172,47 @@ say what each needs); `python/wheels/` has CI's toolchains. `python/tests`
 checks the package (`uv run --with pytest --with ase pytest python/tests` with
 it installed).
 
+### Second derivatives
+
+`pet_kokkos.properties` computes Hessians, vibrational modes, phonons (via
+phonopy, `pip install pet-kokkos[phonons]`) and elastic tensors from central
+differences of the forces and virial. All the displaced structures for a
+property go through one batched evaluation:
+
+```python
+from pet_kokkos import properties
+vib = properties.vibrations(calc, molecule)              # cm^-1, rigid modes projected out
+el = properties.elastic_tensor(calc, crystal)            # relaxed-ion C, GPa, no relaxations
+ph = properties.phonons(calc, crystal, [2, 2, 2])        # a phonopy.Phonopy with force constants
+H = properties.hessian(calc, atoms, points=4, step=0.005)
+```
+
+The stencil can be set: `points` (2, 4 or 6), `step` (Å), `strain_step`.
+Measured against an fp64 build, fp32's own noise is not what limits the
+accuracy; the stencil's truncation error is:
+
+| | frequencies | elastic constants |
+|---|---|---|
+| `points=2, step=0.0025` (default) | ~0.1 cm⁻¹ | ~0.02 GPa |
+| `points=4, step=0.005` | ~0.03 cm⁻¹ | ~0.01 GPa |
+| any stencil, TF32 GEMMs or attention | 1–20 cm⁻¹ | 1.5–8 GPa |
+
+These were measured on benzene, the CO2 crystal and silicon, with pet-mad-s
+and pet-mols-s. TF32 is refused unless `allow_reduced_precision=True`. With
+pet-mad-s on an RTX 4080 SUPER, a 48-atom anthracene cell's elastic tensor
+takes 0.8 s, and its 2×2×2 phonons (36 symmetry-reduced displacements of 384
+atoms) take 1.1 s.
+
+PET is not exactly rotationally equivariant, and that shows up in second
+derivatives at a level well above the finite-difference error:
+
+- A molecule's rotations come out at 6–18 cm⁻¹ rather than zero, even in fp64,
+  so `vibrations` projects them out.
+- Silicon's cubic elastic constants differ from one another by ~0.5 GPa.
+- Silicon's triply degenerate optical mode is split by ~1.5 cm⁻¹.
+
+Translations are exact: the model sees only edge vectors.
+
 ## metatomic plugin
 
 `-DPET_BUILD_METATOMIC=ON` builds `metatomic/pet-kokkos-metatomic.so`, a

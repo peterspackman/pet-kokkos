@@ -25,7 +25,7 @@ import numpy as np
 from ._backend import core as _core
 from .models import data_dir, download, resolve
 
-__all__ = ["Calculator", "backend", "download", "data_dir", "metatomic_plugin"]
+__all__ = ["Calculator", "backend", "precision_modes", "download", "data_dir", "metatomic_plugin"]
 
 _live: "weakref.WeakSet[Calculator]" = weakref.WeakSet()
 
@@ -34,6 +34,12 @@ def backend() -> str:
     """The Kokkos execution space this process computes on (Serial, OpenMP,
     Threads, Cuda, HIP): this build's."""
     return _core.backend()
+
+
+def precision_modes() -> tuple[str, str]:
+    """The process-wide (gemm, attention) modes: ("native", "native") unless a
+    Calculator or PET_GEMM / PET_ATTN asked for faster ones."""
+    return tuple(_core.precision_modes())
 
 
 def metatomic_plugin() -> str | None:
@@ -93,6 +99,7 @@ class Calculator:
         uncertainty: bool = False,
     ):
         self.model = resolve(model)
+        self.non_conservative = non_conservative
         self._calc = _core.Calculator(
             self.model,
             gemm=gemm,

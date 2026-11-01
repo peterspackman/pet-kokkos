@@ -189,6 +189,14 @@ NB_MODULE(_core, m) {
         "The Kokkos execution space this build computes on (Serial, OpenMP, Threads, Cuda, HIP).");
   m.def("model_search_dirs", &pet::model_search_dirs, "Where named models are looked for, in order.");
   m.def(
+      "precision_modes",
+      [] {
+        const char* gemm[] = {"native", "tf32", "bf16", "fp16", "fp8", "ozaki"};
+        return std::make_pair(std::string(gemm[int(pet::gemm_mode())]),
+                              std::string(pet::attention_mode() == pet::AttentionMode::TF32 ? "tf32" : "native"));
+      },
+      "The process-wide (gemm, attention) modes: native unless set by a Calculator or PET_GEMM / PET_ATTN.");
+  m.def(
       "find_model",
       [](const std::string& spec) -> std::optional<std::pair<std::string, std::string>> {
         try {
