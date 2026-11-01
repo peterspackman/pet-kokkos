@@ -1113,6 +1113,256 @@ __global__ void backward(const float* qkv, int ldq, const int* off, int N, const
   }
 }
 
+// ---- tangents, for the Hessian-vector product (hvp.cpp) ---------------------------
+//
+// The same products as the matrix-core tangents above (see there), in TF32 with
+// this file's tensor-core layout: a block per (tangent, atom, head), a warp per
+// 16 queries (or keys). Tangent t's rows of a [K T, ld] buffer are t T + the
+// primal's.
+
+// Shared floats for S slots: four head slices and per-token values.
+template <int HD>
+std::size_t tan_floats(int S) { return std::size_t((S + 15) / 16 * 16) * (4 * pitch<HD> + 8); }
+
+template <int HD>
+__global__ void tan_forward(const float* qkv, const float* qkv_t, int ldq, const int* off, int N, int T,
+                            const float* merged, int ldm, const float* ml, int ldml, const float* cf_seq,
+                            const float* cf_t, int ldc, float* merged_t, int ldmt, float* pbar, int S, int H,
+                            float sc) {
+  constexpr int P = pitch<HD>, DK = HD / 8;
+  extern __shared__ float smem[];
+  const int b = blockIdx.x, h = b % H, n = (b / H) % N, tg = b / (H * N), D = H * HD;
+  const Atom at(off, N, n);
+  const int R = (at.cnt + 15) / 16 * 16;
+  const float* qt_rows = qkv_t + (size_t) tg * T * ldq;
+  float *sk = smem, *sv = sk + R * P, *skt = sv + R * P, *svt = skt + R * P, *slc = svt + R * P, *sbt = slc + R;
+  const float* cf = cf_seq + (size_t) n * ldc;
+  const float* cft = cf_t + ((size_t) tg * N + n) * ldc;
+  stage<HD>(sk, qkv, ldq, D + h * HD, at, R);
+  stage<HD>(sv, qkv, ldq, 2 * D + h * HD, at, R);
+  stage<HD>(skt, qt_rows, ldq, D + h * HD, at, R);
+  stage<HD>(svt, qt_rows, ldq, 2 * D + h * HD, at, R);
+  for (int r = threadIdx.x; r < R; r += blockDim.x) {
+    slc[r] = log_cf(cf, r, at.cnt);
+    sbt[r] = slc[r] > -1e29f ? cft[r] / cf[r] : 0.0f;
+  }
+  const int w = threadIdx.x / 32, l = threadIdx.x % 32, g = l / 4, t = l % 4;
+  const int qr[2] = {16 * w + g, 16 * w + g + 8};
+  float qa[DK][4], qta[DK][4];
+  for (int c = 0; c < DK; ++c)
+    for (int j = 0; j < 4; ++j) {
+      const int q = qr[j % 2], d = 8 * c + t + 4 * (j / 2);
+      qa[c][j] = q < at.cnt ? tf32(qkv[at.row(q) * ldq + h * HD + d]) : 0.0f;
+      qta[c][j] = q < at.cnt ? tf32(qt_rows[at.row(q) * ldq + h * HD + d]) : 0.0f;
+    }
+  __syncthreads();
+  if (16 * w >= at.cnt) return;
+  float mi[2], li[2];
+  for (int i = 0; i < 2; ++i) {
+    const bool in = qr[i] < at.cnt;
+    const float* m = ml + (size_t) ((n * H + h) * S + (in ? qr[i] : 0)) * ldml;
+    mi[i] = in ? m[0] : -1e30f, li[i] = in ? m[1] : 0.0f;
+  }
+  float a1[DK][4], a2[DK][4], ps[2] = {0.0f, 0.0f};
+  for (int c = 0; c < DK; ++c)
+    for (int j = 0; j < 4; ++j) a1[c][j] = a2[c][j] = 0.0f;
+  for (int J = 0; J < R / 8; ++J) {
+    const int k0 = 8 * J + 2 * t, kb = 8 * J + g;
+    float s[4] = {0, 0, 0, 0}, st[4] = {0, 0, 0, 0};
+    for (int c = 0; c < DK; ++c) {
+      const float b0 = sk[kb * P + 8 * c + t], b1 = sk[kb * P + 8 * c + t + 4];
+      mma(s, qa[c][0], qa[c][1], qa[c][2], qa[c][3], b0, b1);
+      mma(st, qta[c][0], qta[c][1], qta[c][2], qta[c][3], b0, b1);
+      mma(st, qa[c][0], qa[c][1], qa[c][2], qa[c][3], skt[kb * P + 8 * c + t], skt[kb * P + 8 * c + t + 4]);
+    }
+    float p[4], pst[4];
+    for (int e = 0; e < 4; ++e) {  // query qr[e / 2], key k0 + e % 2
+      const int i = e / 2, k = k0 + e % 2;
+      p[e] = li[i] > 0.0f && slc[k] > -1e29f ? __expf(s[e] * sc + slc[k] - mi[i]) * li[i] : 0.0f;
+      pst[e] = p[e] * (st[e] * sc + sbt[k]);
+      ps[i] += pst[e];
+    }
+    const float x0 = tf32(pst[0]), x1 = tf32(pst[2]), x2 = tf32(pst[1]), x3 = tf32(pst[3]);
+    const float y0 = tf32(p[0]), y1 = tf32(p[2]), y2 = tf32(p[1]), y3 = tf32(p[3]);
+    for (int c = 0; c < DK; ++c) {
+      mma(a1[c], x0, x1, x2, x3, sv[k0 * P + 8 * c + g], sv[(k0 + 1) * P + 8 * c + g]);
+      mma(a2[c], y0, y1, y2, y3, svt[k0 * P + 8 * c + g], svt[(k0 + 1) * P + 8 * c + g]);
+    }
+  }
+  for (int i = 0; i < 2; ++i) {
+    const int q = qr[i];
+    const float pb = quad_sum(ps[i]);
+    if (q >= at.cnt) continue;
+    const float* o = merged + at.row(q) * ldm + h * HD;
+    float* ot = merged_t + ((size_t) tg * T + at.row(q)) * ldmt + h * HD;
+    for (int c = 0; c < DK; ++c) {  // [c][2i + j]: query q, dim 8c + 2t + j
+      const int d = 8 * c + 2 * t;
+      *reinterpret_cast<float2*>(ot + d) = make_float2(a1[c][2 * i] - pb * o[d] + a2[c][2 * i],
+                                                       a1[c][2 * i + 1] - pb * o[d + 1] + a2[c][2 * i + 1]);
+    }
+    if (t == 0) pbar[((size_t) (tg * N + n) * H + h) * S + q] = pb;
+  }
+}
+
+template <int HD>
+__global__ void tan_backward(const float* qkv, const float* qkv_t, int ldq, const int* off, int N, int T,
+                             const float* dm, const float* dm_t, const float* merged, const float* merged_t, int ldm,
+                             const float* ml, int ldml, const float* pbar, const float* cf_seq, const float* cf_t,
+                             int ldc, float* qkv_adj_t, int lda, float* cfh, int S, int H, float sc) {
+  constexpr int P = pitch<HD>, DK = HD / 8;
+  extern __shared__ float smem[];
+  const int b = blockIdx.x, h = b % H, n = (b / H) % N, tg = b / (H * N), D = H * HD;
+  const Atom at(off, N, n);
+  const int R = (at.cnt + 15) / 16 * 16;
+  const size_t to = (size_t) tg * T;
+  const float *qt_rows = qkv_t + to * ldq, *gt_rows = dm_t + to * ldm, *ot_rows = merged_t + to * ldm;
+  // K, V, K', V', then Q, dO, Q', dO'; per token: m, 1/sum, pbar, Dq, Dq', log cf, cf'/cf
+  float *s0 = smem, *s1 = s0 + R * P, *s2 = s1 + R * P, *s3 = s2 + R * P;
+  float *sm = s3 + R * P, *sl = sm + R, *spb = sl + R, *sd = spb + R, *sdt = sd + R, *slc = sdt + R, *sbt = slc + R;
+  const float* cf = cf_seq + (size_t) n * ldc;
+  const float* cft = cf_t + ((size_t) tg * N + n) * ldc;
+  const size_t si0 = ((size_t) (tg * N + n) * H + h) * S;
+  stage<HD>(s0, qkv, ldq, D + h * HD, at, R);
+  stage<HD>(s1, qkv, ldq, 2 * D + h * HD, at, R);
+  stage<HD>(s2, qt_rows, ldq, D + h * HD, at, R);
+  stage<HD>(s3, qt_rows, ldq, 2 * D + h * HD, at, R);
+  for (int q = at.cnt + threadIdx.x; q < S; q += blockDim.x) {
+    float* ch = cfh + ((size_t) (tg * N + n) * S + q) * 2 * H;
+    ch[h] = ch[H + h] = 0.0f;
+  }
+  for (int r = threadIdx.x; r < R; r += blockDim.x) {
+    float dq = 0.0f, dqt = 0.0f, m = -1e30f, li = 0.0f, pb = 0.0f;
+    if (r < at.cnt) {  // Dq and Dq' in fp32, from the unrounded rows
+      const size_t ro = at.row(r) * ldm + h * HD;
+      for (int d = 0; d < HD; ++d) {
+        dq += dm[ro + d] * merged[ro + d];
+        dqt += gt_rows[ro + d] * merged[ro + d] + dm[ro + d] * ot_rows[ro + d];
+      }
+      const float* mm = ml + (size_t) ((n * H + h) * S + r) * ldml;
+      m = mm[0], li = mm[1], pb = pbar[si0 + r];
+    }
+    sd[r] = dq, sdt[r] = dqt, sm[r] = m, sl[r] = li, spb[r] = pb;
+    slc[r] = log_cf(cf, r, at.cnt);
+    sbt[r] = slc[r] > -1e29f ? cft[r] / cf[r] : 0.0f;
+  }
+  __syncthreads();
+  const int w = threadIdx.x / 32, l = threadIdx.x % 32, g = l / 4, t = l % 4;
+  const int r0 = 16 * w + g, rr[2] = {r0, r0 + 8};
+  const bool busy = 16 * w < at.cnt;
+  auto frags = [&](const float* x, float (&f)[DK][4]) {
+    for (int c = 0; c < DK; ++c)
+      for (int j = 0; j < 4; ++j) f[c][j] = x[rr[j % 2] * P + 8 * c + t + 4 * (j / 2)];
+  };
+  auto global_frags = [&](const float* x, int ld, float (&f)[DK][4]) {
+    for (int c = 0; c < DK; ++c)
+      for (int j = 0; j < 4; ++j) {
+        const int r = rr[j % 2];
+        f[c][j] = r < at.cnt ? tf32(x[at.row(r) * ld + 8 * c + t + 4 * (j / 2)]) : 0.0f;
+      }
+  };
+  float ka[DK][4], va[DK][4], kta[DK][4], vta[DK][4];  // the keys pass's rows, before Q and dO replace them
+
+  if (busy) {  // Queries: dQ' = sc (dS' K + dS K').
+    float qa[DK][4], qta[DK][4], ga[DK][4], gta[DK][4], acc[DK][4];
+    global_frags(qkv + h * HD, ldq, qa), global_frags(qt_rows + h * HD, ldq, qta);
+    global_frags(dm + h * HD, ldm, ga), global_frags(gt_rows + h * HD, ldm, gta);
+    for (int c = 0; c < DK; ++c)
+      for (int j = 0; j < 4; ++j) acc[c][j] = 0.0f;
+    for (int J = 0; J < R / 8; ++J) {
+      const int k0 = 8 * J + 2 * t, kb = 8 * J + g;
+      float s[4] = {0, 0, 0, 0}, st[4] = {0, 0, 0, 0}, dp[4] = {0, 0, 0, 0}, dpt[4] = {0, 0, 0, 0};
+      for (int c = 0; c < DK; ++c) {
+        const float k0b = s0[kb * P + 8 * c + t], k1b = s0[kb * P + 8 * c + t + 4];
+        const float v0b = s1[kb * P + 8 * c + t], v1b = s1[kb * P + 8 * c + t + 4];
+        mma(s, qa[c][0], qa[c][1], qa[c][2], qa[c][3], k0b, k1b);
+        mma(st, qta[c][0], qta[c][1], qta[c][2], qta[c][3], k0b, k1b);
+        mma(st, qa[c][0], qa[c][1], qa[c][2], qa[c][3], s2[kb * P + 8 * c + t], s2[kb * P + 8 * c + t + 4]);
+        mma(dp, ga[c][0], ga[c][1], ga[c][2], ga[c][3], v0b, v1b);
+        mma(dpt, gta[c][0], gta[c][1], gta[c][2], gta[c][3], v0b, v1b);
+        mma(dpt, ga[c][0], ga[c][1], ga[c][2], ga[c][3], s3[kb * P + 8 * c + t], s3[kb * P + 8 * c + t + 4]);
+      }
+      float ds[4], dst[4];
+      for (int e = 0; e < 4; ++e) {  // query rr[e / 2], key k0 + e % 2
+        const int q = rr[e / 2], k = k0 + e % 2;
+        const float p = sl[q] > 0.0f && slc[k] > -1e29f ? __expf(s[e] * sc + slc[k] - sm[q]) * sl[q] : 0.0f;
+        const float pt = p * (st[e] * sc + sbt[k] - spb[q]);
+        ds[e] = tf32(p * (dp[e] - sd[q]));
+        dst[e] = tf32(pt * (dp[e] - sd[q]) + p * (dpt[e] - sdt[q]));
+      }
+      for (int c = 0; c < DK; ++c) {
+        mma(acc[c], dst[0], dst[2], dst[1], dst[3], s0[k0 * P + 8 * c + g], s0[(k0 + 1) * P + 8 * c + g]);
+        mma(acc[c], ds[0], ds[2], ds[1], ds[3], s2[k0 * P + 8 * c + g], s2[(k0 + 1) * P + 8 * c + g]);
+      }
+    }
+    for (int i = 0; i < 2; ++i) {
+      if (rr[i] >= at.cnt) continue;
+      float* o = qkv_adj_t + (to + at.row(rr[i])) * lda + h * HD;
+      for (int c = 0; c < DK; ++c)
+        *reinterpret_cast<float2*>(o + 8 * c + 2 * t) = make_float2(acc[c][2 * i] * sc, acc[c][2 * i + 1] * sc);
+    }
+  }
+  if (busy) frags(s0, ka), frags(s1, va), frags(s2, kta), frags(s3, vta);
+  __syncthreads();
+  stage<HD>(s0, qkv, ldq, h * HD, at, R);
+  stage<HD>(s1, dm, ldm, h * HD, at, R);
+  stage<HD>(s2, qt_rows, ldq, h * HD, at, R);
+  stage<HD>(s3, gt_rows, ldm, h * HD, at, R);
+  __syncthreads();
+
+  if (busy) {  // Keys: dK' = sc (dS'^T Q + dS^T Q'), dV' = p'^T dO + p^T dO'.
+    float dk[DK][4], dv[DK][4];
+    for (int c = 0; c < DK; ++c)
+      for (int j = 0; j < 4; ++j) dk[c][j] = dv[c][j] = 0.0f;
+    const float lc[2] = {slc[rr[0]], slc[rr[1]]}, bt[2] = {sbt[rr[0]], sbt[rr[1]]};
+    float bb[2] = {0.0f, 0.0f}, bbt[2] = {0.0f, 0.0f};
+    for (int I = 0; I < R / 8; ++I) {
+      const int q0 = 8 * I + 2 * t, qb = 8 * I + g;
+      float s[4] = {0, 0, 0, 0}, st[4] = {0, 0, 0, 0}, dp[4] = {0, 0, 0, 0}, dpt[4] = {0, 0, 0, 0};
+      for (int c = 0; c < DK; ++c) {
+        const float q0b = s0[qb * P + 8 * c + t], q1b = s0[qb * P + 8 * c + t + 4];
+        const float g0b = s1[qb * P + 8 * c + t], g1b = s1[qb * P + 8 * c + t + 4];
+        mma(s, ka[c][0], ka[c][1], ka[c][2], ka[c][3], q0b, q1b);
+        mma(st, kta[c][0], kta[c][1], kta[c][2], kta[c][3], q0b, q1b);
+        mma(st, ka[c][0], ka[c][1], ka[c][2], ka[c][3], s2[qb * P + 8 * c + t], s2[qb * P + 8 * c + t + 4]);
+        mma(dp, va[c][0], va[c][1], va[c][2], va[c][3], g0b, g1b);
+        mma(dpt, vta[c][0], vta[c][1], vta[c][2], vta[c][3], g0b, g1b);
+        mma(dpt, va[c][0], va[c][1], va[c][2], va[c][3], s3[qb * P + 8 * c + t], s3[qb * P + 8 * c + t + 4]);
+      }
+      float p[4], pt[4], ds[4], dst[4];
+      for (int e = 0; e < 4; ++e) {  // key rr[e / 2], query q0 + e % 2
+        const int i = e / 2, q = q0 + e % 2;
+        p[e] = sl[q] > 0.0f && lc[i] > -1e29f ? __expf(s[e] * sc + lc[i] - sm[q]) * sl[q] : 0.0f;
+        pt[e] = p[e] * (st[e] * sc + bt[i] - spb[q]);
+        ds[e] = p[e] * (dp[e] - sd[q]);
+        dst[e] = pt[e] * (dp[e] - sd[q]) + p[e] * (dpt[e] - sdt[q]);
+        bb[i] += ds[e], bbt[i] += dst[e];
+        p[e] = tf32(p[e]), pt[e] = tf32(pt[e]), ds[e] = tf32(ds[e]), dst[e] = tf32(dst[e]);
+      }
+      for (int c = 0; c < DK; ++c) {
+        const float qr0 = s0[q0 * P + 8 * c + g], qr1 = s0[(q0 + 1) * P + 8 * c + g];
+        const float gr0 = s1[q0 * P + 8 * c + g], gr1 = s1[(q0 + 1) * P + 8 * c + g];
+        mma(dk[c], dst[0], dst[2], dst[1], dst[3], qr0, qr1);
+        mma(dk[c], ds[0], ds[2], ds[1], ds[3], s2[q0 * P + 8 * c + g], s2[(q0 + 1) * P + 8 * c + g]);
+        mma(dv[c], pt[0], pt[2], pt[1], pt[3], gr0, gr1);
+        mma(dv[c], p[0], p[2], p[1], p[3], s3[q0 * P + 8 * c + g], s3[(q0 + 1) * P + 8 * c + g]);
+      }
+    }
+    for (int i = 0; i < 2; ++i) {
+      const float bs = quad_sum(bb[i]), bst = quad_sum(bbt[i]);
+      if (rr[i] >= at.cnt) continue;
+      float* o = qkv_adj_t + (to + at.row(rr[i])) * lda + D + h * HD;
+      for (int c = 0; c < DK; ++c) {
+        *reinterpret_cast<float2*>(o + 8 * c + 2 * t) = make_float2(dk[c][2 * i] * sc, dk[c][2 * i + 1] * sc);
+        *reinterpret_cast<float2*>(o + D + 8 * c + 2 * t) = make_float2(dv[c][2 * i], dv[c][2 * i + 1]);
+      }
+      if (t == 0) {
+        float* ch = cfh + ((size_t) (tg * N + n) * S + rr[i]) * 2 * H;
+        ch[h] = bs, ch[H + h] = bst;
+      }
+    }
+  }
+}
+
 // Whether the tensor-core kernels run here: the mode, the device, and shared
 // memory for `floats`.
 inline bool usable(std::size_t floats) {
@@ -1543,10 +1793,27 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
 
 }  // namespace
 
-bool attention_tan_mfma(View2D merged_t, View2D pbar, View2D qkv, View2D qkv_t, View2D merged, View2D ml,
+bool attention_tan_fast(View2D merged_t, View2D pbar, View2D qkv, View2D qkv_t, View2D merged, View2D ml,
                         View2D cf_seq, View2D cf_t, const Tokens& tk, int S, int H, int hd, double temperature,
                         int K) {
-#if defined(PET_MFMA)
+#if defined(PET_TC)
+  const int N = tk.N, T = qkv.extent(0);
+  const float sc = float(1.0 / (std::sqrt((double) hd) * temperature));
+  bool ran = false;
+  with_head_dim(hd, [&](auto hdc) {
+    constexpr int HD = decltype(hdc)::value;
+    if constexpr (HD > 0 && HD % 8 == 0)
+      if (tc::usable(tc::tan_floats<HD>(S))) {
+        tc::run("hv_attn_tc", tc::tan_forward<HD>, K * N * H, (S + 15) / 16 * 32, sizeof(float) * tc::tan_floats<HD>(S),
+                (const float*) qkv.data(), (const float*) qkv_t.data(), int(qkv.stride(0)), (const int*) tk.off.data(),
+                N, T, (const float*) merged.data(), int(merged.stride(0)), (const float*) ml.data(), int(ml.stride(0)),
+                (const float*) cf_seq.data(), (const float*) cf_t.data(), int(cf_seq.stride(0)), merged_t.data(),
+                int(merged_t.stride(0)), pbar.data(), S, H, sc);
+        ran = true;
+      }
+  });
+  return ran;
+#elif defined(PET_MFMA)
   const int N = tk.N, T = qkv.extent(0);
   const float sc = float(1.0 / (std::sqrt((double) hd) * temperature));
   bool ran = false;
@@ -1570,15 +1837,32 @@ bool attention_tan_mfma(View2D merged_t, View2D pbar, View2D qkv, View2D qkv_t, 
 #endif
 }
 
-bool attention_bwd_tan_mfma(Workspace& ws, View2D qkv_adj_t, View2D cf_adj_t, View2D dm, View2D dm_t, View2D qkv,
+bool attention_bwd_tan_fast(Workspace& ws, View2D qkv_adj_t, View2D cf_adj_t, View2D dm, View2D dm_t, View2D qkv,
                             View2D qkv_t, View2D merged, View2D merged_t, View2D ml, View2D pbar, View2D cf_seq,
                             View2D cf_t, const Tokens& tk, int S, int H, int hd, double temperature, int K) {
-#if defined(PET_MFMA)
+#if defined(PET_MFMA) || defined(PET_TC)
   const int N = tk.N, T = qkv.extent(0);
   const float sc = float(1.0 / (std::sqrt((double) hd) * temperature));
   Workspace::Scope scope(ws);
   View2D dq = ws.tmp(K * N * H * S, 2), cfh = ws.tmp(K * N * S, 2 * H);
   bool ran = false;
+#if defined(PET_TC)
+  (void) dq, (void) T;
+  with_head_dim(hd, [&](auto hdc) {
+    constexpr int HD = decltype(hdc)::value;
+    if constexpr (HD > 0 && HD % 8 == 0)
+      if (tc::usable(tc::tan_floats<HD>(S))) {
+        tc::run("hv_attn_bwd_tc", tc::tan_backward<HD>, K * N * H, (S + 15) / 16 * 32,
+                sizeof(float) * tc::tan_floats<HD>(S), (const float*) qkv.data(), (const float*) qkv_t.data(),
+                int(qkv.stride(0)), (const int*) tk.off.data(), N, T, (const float*) dm.data(),
+                (const float*) dm_t.data(), (const float*) merged.data(), (const float*) merged_t.data(),
+                int(dm.stride(0)), (const float*) ml.data(), int(ml.stride(0)), (const float*) pbar.data(),
+                (const float*) cf_seq.data(), (const float*) cf_t.data(), int(cf_seq.stride(0)), qkv_adj_t.data(),
+                int(qkv_adj_t.stride(0)), cfh.data(), S, H, sc);
+        ran = true;
+      }
+  });
+#else
   with_head_dim(hd, [&](auto hdc) {
     constexpr int HD = decltype(hdc)::value;
     if constexpr (HD > 0 && HD % 16 == 0)
@@ -1598,6 +1882,7 @@ bool attention_bwd_tan_mfma(Workspace& ws, View2D qkv_adj_t, View2D cf_adj_t, Vi
         });
       });
   });
+#endif
   if (!ran) return false;
   // The cf adjoint's tangent per key, the heads' shares summed:
   // d/dt (sum dS / cf) = (sum dS' - sum dS cf'/cf) / cf.

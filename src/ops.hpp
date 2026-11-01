@@ -110,15 +110,16 @@ void attention_bwd(Workspace& ws, const std::string& key, View2D in_adj, View2D 
                    double temperature, Net beta);
 
 // The tangents of the heads' attention for the Hessian-vector product (hvp.cpp)
-// on AMD's matrix cores, K tangents stacked in rows; false when they cannot run
-// here (no matrix cores, or a head or token count the kernels do not hold), and
-// then the generic kernels must. merged and ml are the forward's saves; the
+// on AMD's matrix cores (fp32), or on NVIDIA's tensor cores in the TF32
+// attention mode, K tangents stacked in rows; false when they cannot run here
+// (neither, or a head or token count the kernels do not hold), and then the
+// generic kernels must. merged and ml are the forward's saves; the
 // forward's tangent leaves merged_t and each query's pbar ([K N H S]) for the
 // backward's, which writes qkv_adj_t and adds onto cf_adj_t.
-bool attention_tan_mfma(View2D merged_t, View2D pbar, View2D qkv, View2D qkv_t, View2D merged, View2D ml,
+bool attention_tan_fast(View2D merged_t, View2D pbar, View2D qkv, View2D qkv_t, View2D merged, View2D ml,
                         View2D cf_seq, View2D cf_t, const Tokens& tk, int S, int heads, int head_dim,
                         double temperature, int K);
-bool attention_bwd_tan_mfma(Workspace& ws, View2D qkv_adj_t, View2D cf_adj_t, View2D dm, View2D dm_t, View2D qkv,
+bool attention_bwd_tan_fast(Workspace& ws, View2D qkv_adj_t, View2D cf_adj_t, View2D dm, View2D dm_t, View2D qkv,
                             View2D qkv_t, View2D merged, View2D merged_t, View2D ml, View2D pbar, View2D cf_seq,
                             View2D cf_t, const Tokens& tk, int S, int heads, int head_dim, double temperature, int K);
 

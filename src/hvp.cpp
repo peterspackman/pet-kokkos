@@ -458,11 +458,11 @@ void attn_bwd2(View2D qkv_adj_t, View2D cf_adj_t, View2D dm, View2D dm_t, View2D
 }
 
 // The attention's forward tangent: merged_t (before the output linear), and the
-// queries' pbar for the backward -- on AMD's matrix cores where it can, from the
-// forward's saves under `key`.
+// queries' pbar for the backward -- on AMD's matrix cores, or on NVIDIA's tensor
+// cores in TF32, where it can, from the forward's saves under `key`.
 void attention_tangent(Workspace& ws, const std::string& key, View2D merged_t, View2D pbar, View2D qkv, View2D qkv_t,
                        View2D cf, View2D cf_t, const AttnShape& as, int K) {
-  if (attention_tan_mfma(merged_t, pbar, qkv, qkv_t, ws.peek2(key + ":merged"), ws.peek2(key + ":ml"), cf, cf_t,
+  if (attention_tan_fast(merged_t, pbar, qkv, qkv_t, ws.peek2(key + ":merged"), ws.peek2(key + ":ml"), cf, cf_t,
                          as.tk, as.S, as.H, as.hd, as.temperature, K))
     return;
   attn_tan(merged_t, qkv, qkv_t, cf, cf_t, as, K);
@@ -483,7 +483,7 @@ void attention_backward2(Workspace& ws, const std::string& key, View2D in_adj, V
   linear_bwd(dm_t, ao_t, wo, 0);
   attention_bwd(ws, key, in_adj, cf_adj, ao, qkv, cf, wi, wo, as.tk, as.S, as.H, as.hd, as.temperature, beta);
   View2D qa_t = ws.tmp(K * T, 3 * D);
-  if (!attention_bwd_tan_mfma(ws, qa_t, cf_adj_t, dm, dm_t, qkv, qkv_t, ws.peek2(key + ":merged"), merged_t,
+  if (!attention_bwd_tan_fast(ws, qa_t, cf_adj_t, dm, dm_t, qkv, qkv_t, ws.peek2(key + ":merged"), merged_t,
                               ws.peek2(key + ":ml"), pbar, cf, cf_t, as.tk, as.S, as.H, as.hd, as.temperature, K)) {
     View2D stats = ws.tmp(K * as.N * as.H * as.S, 5);
     attn_bwd2(qa_t, cf_adj_t, dm, dm_t, qkv, qkv_t, cf, cf_t, stats, as, K);
