@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -47,6 +48,8 @@ void usage() {
       "      --host-neighbors build the neighbour list on the host\n"
       "      --builtin-neighbors  use the built-in O(N^2) search, not vesin\n"
       "      --repeat N       evaluate N times and report the best wall time\n"
+      "      --hvp K          time K exact Hessian-vector products (random\n"
+      "                       directions) on the first frame, instead\n"
       "      --memory         report the device scratch pool and its largest buffers\n"
       "      --info           print the model's properties and exit\n"
       "      --models         list the model search path and exit\n"
@@ -80,6 +83,7 @@ struct Args {
   bool host_neighbors = false, builtin_neighbors = false, info_only = false, json = false;
   bool report_memory = false, non_conservative = false, uncertainty = false;
   int repeat = 1;
+  int hvp = 0;  // directions for --hvp
   int charge = 0;
   int spin = 1;
 };
@@ -134,6 +138,8 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.spin = std::atoi(next("--spin").c_str());
     } else if (s == "--memory") {
       a.report_memory = true;
+    } else if (s == "--hvp") {
+      a.hvp = std::max(1, std::atoi(next("--hvp").c_str()));
     } else if (s == "--repeat") {
       a.repeat = std::max(1, std::atoi(next("--repeat").c_str()));
     } else if (s.rfind("--kokkos-", 0) == 0) {
@@ -350,6 +356,27 @@ int run(const Args& a) {
                      f, pet::element_symbol(z), z);
         return 1;
       }
+
+  if (a.hvp > 0) {  // K exact Hessian-vector products on the first frame
+    const pet::System& s = frames[0];
+    std::vector<double> u(std::size_t(a.hvp) * s.n_atoms * 3);
+    std::uint64_t x = 88172645463325252ull;  // a fixed xorshift: the same directions every run
+    for (auto& v : u) {
+      x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+      v = double(x % 2000001) / 1e6 - 1.0;
+    }
+    double best = 1e300, dmax = 0.0;
+    for (int k = 0; k < std::max(a.repeat, 1); ++k) {
+      const auto t0 = std::chrono::steady_clock::now();
+      const pet::Calculator::Response hv = calc.response(s, a.hvp, u, {});
+      const std::chrono::duration<double> dt = std::chrono::steady_clock::now() - t0;
+      best = std::min(best, dt.count());
+      for (double f : hv.forces) dmax = std::max(dmax, std::fabs(f));
+    }
+    std::printf("hvp: N=%d K=%d  max|dF/dt| = %.6e  best of %d: %.4f s (%.3f ms per direction)\n", s.n_atoms,
+                a.hvp, dmax, std::max(a.repeat, 1), best, 1e3 * best / a.hvp);
+    return 0;
+  }
 
   pet::Results r;
   double best_seconds = 1e300;
