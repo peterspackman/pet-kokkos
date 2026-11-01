@@ -39,7 +39,10 @@ and ~0.01 GPa for twice the evaluations. Near soft or unstable modes the
 relaxed-ion elastic tensor divides by small eigenvalues and those errors grow
 (0.2-0.6 GPa on an unrelaxed cell). TF32 (or any lower-precision GEMM or
 attention) puts its noise through the 1/step of a difference -- 1-20 cm^-1,
-several GPa -- so it is refused unless asked for.
+several GPa -- so finite differences refuse it unless asked. The exact product
+has no step to amplify it: in TF32 it gives frequencies to ~0.1-0.4 cm^-1 and
+elastic constants to ~0.02 GPa, about fp32 2-point differences' accuracy, so
+it is allowed.
 
 Units are the model's: Angstrom, eV; frequencies in cm^-1 (imaginary modes as
 negative numbers), elastic constants in GPa, in the standard Voigt order xx yy
@@ -108,17 +111,20 @@ def _structure(s):
     return np.asarray(numbers), positions, cell, pbc
 
 
-def _check(calc, allow_reduced_precision):
+def _check(calc):
     if getattr(calc, "non_conservative", False):
         raise ValueError(
             "pet_kokkos.properties: this Calculator has non_conservative=True; those forces are not the "
             "energy's gradient, so their derivatives are not a Hessian")
+
+
+def _check_fd_precision(allow_reduced_precision):
     gemm, attention = precision_modes()
     if not allow_reduced_precision and (gemm not in ("native", "ozaki") or attention != "native"):
         raise ValueError(
             f"pet_kokkos.properties: gemm={gemm}, attention={attention}: a finite difference turns their noise "
-            "into errors of several cm^-1 and GPa. Use fp32 (native) for second derivatives, or pass "
-            "allow_reduced_precision=True")
+            "into errors of several cm^-1 and GPa (the exact product does not: use method='exact', or fp32 "
+            "(native), or pass allow_reduced_precision=True)")
 
 
 @dataclass
@@ -147,7 +153,7 @@ def response(calc, structure, displacements=None, strains=None, *, method: str =
         its own passes by memory (each direction keeps a copy of the network's
         activations).
     """
-    _check(calc, allow_reduced_precision)
+    _check(calc)
     if method not in ("auto", "exact", "fd"):
         raise ValueError("method must be auto, exact or fd")
     if points not in STENCILS:
@@ -165,6 +171,7 @@ def response(calc, structure, displacements=None, strains=None, *, method: str =
         except RuntimeError as e:
             if method == "exact" or "Hessian-vector product" not in str(e):
                 raise
+    _check_fd_precision(allow_reduced_precision)
     stencil = STENCILS[points]
 
     def structures() -> Iterator[tuple]:

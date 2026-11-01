@@ -210,6 +210,7 @@ Measured against the exact product in an fp64 build:
 | exact, fp32 | ~3e-5 eV/Å² | ~0.0005 cm⁻¹ | <0.0001 GPa |
 | `fd`, `points=2, step=0.0025` | ~5e-3 eV/Å² | ~0.1 cm⁻¹ | ~0.02 GPa |
 | `fd`, `points=4, step=0.005` | ~1e-3 eV/Å² | ~0.02 cm⁻¹ | ~0.01 GPa |
+| exact, TF32 GEMMs and attention | ~3e-2 eV/Å² | ~0.1–0.4 cm⁻¹ | ~0.02 GPa |
 | `fd`, TF32 GEMMs or attention | | 1–20 cm⁻¹ | 1.5–8 GPa |
 
 These were measured on benzene, the CO2 crystal and silicon with pet-mad-s.
@@ -217,7 +218,10 @@ fp32's own noise is not what limits the finite differences; the stencil's
 truncation is. Near soft or unstable modes the relaxed-ion elastic tensor
 divides by small eigenvalues, and finite-difference errors grow there: on an
 unrelaxed acetic acid cell they reached 0.2–0.6 GPa, and moved with the step.
-TF32 is refused unless `allow_reduced_precision=True`.
+With finite differences, TF32 is refused unless `allow_reduced_precision=True`.
+The exact product has no step to amplify TF32's noise, so it is allowed there.
+(For forces, TF32 is 1.6–2× faster on an H200; it hasn't been timed for the
+product.)
 
 The cosine cutoff (pet-mols-s) is smooth only to first order: its second
 derivative jumps at both ends of the taper (4.3 and 4.5 Å), so the Hessian
