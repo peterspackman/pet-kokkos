@@ -116,3 +116,38 @@ TEST_CASE("Hessian-vector products match differences of the forces", "[model][hv
     }
   }
 }
+
+// A Krylov solver asks for product after product at one geometry: from the
+// second call the product is recorded and then replayed (graph.hpp). Every
+// call, with new directions each time, must match the same directions asked
+// for alone.
+TEST_CASE("repeated Hessian-vector products at one geometry match", "[model][hvp]") {
+  pet::Calculator* calcp = shared_calculator("pet-mad-xs-v1.6");
+  if (!calcp) {
+    WARN("pet-mad-xs-v1.6 is not installed; skipping");
+    return;
+  }
+  const Golden g = load_golden(golden_paths("pet-mad-xs-v1.6").front());
+  const int N = g.system.n_atoms, K = 4;
+  std::mt19937 rng(11);
+  std::normal_distribution<double> nd(0.0, 1.0);
+  std::vector<std::vector<double>> dirs(5, std::vector<double>(std::size_t(K) * N * 3));
+  for (auto& d : dirs)
+    for (auto& x : d) x = nd(rng);
+  std::vector<pet::Calculator::Response> seq;
+  for (const auto& d : dirs) seq.push_back(calcp->response(g.system, K, d, {}));
+  for (std::size_t i = 0; i < dirs.size(); ++i) {
+    // alone: a fresh structure in between, so this one is not a replay of the sequence's
+    pet::System other = g.system;
+    other.positions[0] += 0.01;
+    (void) calcp->response(other, 1, std::vector<double>(std::size_t(N) * 3, 1.0), {});
+    const pet::Calculator::Response one = calcp->response(g.system, K, dirs[i], {});
+    double err = 0.0, scale = 0.0;
+    for (std::size_t j = 0; j < one.forces.size(); ++j) {
+      err = worst(err, std::fabs(seq[i].forces[j] - one.forces[j]));
+      scale = worst(scale, std::fabs(one.forces[j]));
+    }
+    INFO("call " << i << ": max difference " << err << " of " << scale);
+    CHECK(err <= 1e-6 * std::max(1.0, scale));
+  }
+}

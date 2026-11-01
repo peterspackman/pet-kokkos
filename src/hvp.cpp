@@ -540,8 +540,8 @@ void PetModel::ff_layer_tan(const PackedEdges& pk, int L, const LayerSaves& sav,
     View2D node_norm = ws_.tmp(K * N, Dn), edge_norm = ws_.tmp(K * E, D);
     norm_tan(node_norm, sav.node_new[a], node_res, vec(tl + ".norm_center_features.weight"), ln);
     norm_tan(edge_norm, sav.eps[a], eps, vec(tl + ".norm_mlp.weight"), ln);
-    Kokkos::deep_copy(ExecSpace(), node_next, node_res);
-    Kokkos::deep_copy(ExecSpace(), edge_next, eps);
+    copy(node_next, node_res);
+    copy(edge_next, eps);
     ts.tmp_center[a] = keep("tc", a, N, sav.tmp_center[a].extent(1));
     ts.tmp_edge[a] = keep("te", a, E, sav.tmp_edge[a].extent(1));
     feedforward_tan(node_next, node_norm, tl + ".center_mlp", sav.tmp_center[a], ts.tmp_center[a], 1);
@@ -549,7 +549,7 @@ void PetModel::ff_layer_tan(const PackedEdges& pk, int L, const LayerSaves& sav,
     node_cur = node_next;
     edge_cur = edge_next;
   }
-  Kokkos::deep_copy(ExecSpace(), node_t, node_cur);
+  copy(node_t, node_cur);
 
   // input_edge' += out_edge' + comb_mlp'(layernorm'([out_edge' | its reverse's]))
   const View2D out_edge = edge_cur;
@@ -831,11 +831,11 @@ void PetModel::residual_layer_tan(const PackedEdges& pk, int L, const ResidualSa
     linear(qkv, tokens_t, mat(tl + ".attention.input_linear.weight"), View1D(), 0);
     View2D merged = ws_.tmp(K * T, D);
     attn_tan(merged, sav.qkv[a], qkv, cf, cf_t, as, K);
-    Kokkos::deep_copy(ExecSpace(), s1, tokens_t);
+    copy(s1, tokens_t);
     linear(s1, merged, mat(tl + ".attention.output_linear.weight"), View1D(), 1);
     View2D tok_a = ws_.tmp(K * T, D);
     norm_tan(tok_a, sav.s1[a], s1, vec(tl + ".norm_attention.weight"), ln);
-    Kokkos::deep_copy(ExecSpace(), s2, tok_a);
+    copy(s2, tok_a);
     feedforward_tan(s2, tok_a, tl + ".mlp", sav.pre[a], pre, 1);
     norm_tan(tokens_t, sav.s2[a], s2, vec(tl + ".norm_mlp.weight"), ln);
   }
@@ -860,8 +860,8 @@ void PetModel::residual_layer_bwd2(const PackedEdges& pk, int L, const ResidualS
     // tokens = norm(s2), s2 = tok_a + mlp(tok_a)
     View2D s2a = ws_.tmp(T, D), s2a_t = ws_.tmp(K * T, D), ta = ws_.tmp(T, D), ta_t = ws_.tmp(K * T, D);
     norm_bwd2(s2a, s2a_t, tokens_adj, tokens_adj_t, sav.s2[a], ts.s2[a], vec(tl + ".norm_mlp.weight"), ln, false);
-    Kokkos::deep_copy(ExecSpace(), ta, s2a);
-    Kokkos::deep_copy(ExecSpace(), ta_t, s2a_t);
+    copy(ta, s2a);
+    copy(ta_t, s2a_t);
     feedforward_bwd2(ta, ta_t, s2a, s2a_t, tl + ".mlp", sav.pre[a], ts.pre[a], 1);
     // tok_a = norm(s1), s1 = tokens_in + attention(tokens_in)
     norm_bwd2(tokens_adj, tokens_adj_t, ta, ta_t, sav.s1[a], ts.s1[a], vec(tl + ".norm_attention.weight"), ln,
@@ -887,7 +887,17 @@ void PetModel::residual_layer_bwd2(const PackedEdges& pk, int L, const ResidualS
 
 // ---- the whole product --------------------------------------------------------------
 
+// Recorded as a CUDA graph like the forward (graph.hpp): a Krylov solver asks
+// for product after product at one geometry, and at a few dozen atoms the
+// launches are most of a call.
 HvpOut PetModel::hvp(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
+  auto key = graph_key(dev, true);
+  key.insert(key.end(), {0x4876ull, (std::uintptr_t) K, (std::uintptr_t) vdot_raw.data(), vdot_raw.size()});
+  auto pass = [&] { return hvp_pass(dev, K, vdot_raw); };
+  return graphs_ && !ozaki_active() ? hv_graph_.run(key, pass) : pass();
+}
+
+HvpOut PetModel::hvp_pass(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
   if ((h_.featurizer_type == FeaturizerType::FeedForward && h_.num_readout_layers != 1) || dev.exchange ||
       dev.n_struct != 1 || dev.edge_capacity || dev.padded || (dev.n_local >= 0 && dev.n_local != dev.n_atoms) ||
       dev.centres() != dev.n_atoms)
@@ -937,18 +947,25 @@ HvpOut PetModel::hvp(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
   auto probes = probes_;
   RView2D geff, gdiff, ggrad, gsgn, gw, gdt, gwt;
   RView1D gc;
+  // The solver's count derivatives at the root, per raw edge, the same for every
+  // direction: f1, f2 of bump(d_e; r of its centre).
+  RView2D sf = ws_.r2("hv:sf", adaptive && solver ? R : 0, 2);
   if (adaptive && solver) {
     Kokkos::parallel_for(
-        "hv_rcdot", RangePolicy(0, K * N), KOKKOS_LAMBDA(int q) {
-          const int t = q / N, a = q % N;
+        "hv_sf", RangePolicy(0, R), KOKKOS_LAMBDA(int e) {
+          double f1, f2;
+          cut_derivs(rdist(e), ar(rcen(e)), wad, true, f1, f2);
+          sf(e, 0) = f1, sf(e, 1) = f2;
+        });
+    Kokkos::parallel_for(
+        "hv_rcdot", TeamPolicy(K * N, 1, kLanes), KOKKOS_LAMBDA(const Team& m) {
+          const int q = m.league_rank(), t = q / N, a = q % N;
           double s = 0.0;
           if (adn(a) > 0.0)
-            for (int e = roff(a); e < roff(a + 1); ++e) {
-              double f1, f2;
-              cut_derivs(rdist(e), ar(a), wad, true, f1, f2);
-              s += -f1 / adn(a) * ddot(t * R + e);
-            }
-          rcdot(q) = s;
+            Kokkos::parallel_reduce(
+                Kokkos::ThreadVectorRange(m, roff(a), roff(a + 1)),
+                [&](int e, double& acc) { acc += -sf(e, 0) / adn(a) * ddot(t * R + e); }, s);
+          Kokkos::single(Kokkos::PerThread(m), [&] { rcdot(q) = s; });
         });
   } else if (adaptive) {
     // The grid's: eff_p = sum_e bump(d_e, probe p), diff = eff - target + target
@@ -1209,25 +1226,24 @@ HvpOut PetModel::hvp(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
         });
     if (solver) {
       Kokkos::parallel_for(
-          "hv_nr_t", RangePolicy(0, K * N), KOKKOS_LAMBDA(int q) {
-            const int t = q / N, a = q % N;
-            if (adn(a) <= 0.0) return (void) (nr_t(q) = 0.0);
-            const double r = ar(a), rt = rcdot(q);
-            double s = 6.0 * target * r / (rmax * rmax * rmax) * rt;
-            for (int e = roff(a); e < roff(a + 1); ++e) {
-              double f1, f2;
-              cut_derivs(rdist(e), r, wad, true, f1, f2);
-              s += f2 * (rt - ddot(t * R + e));
-            }
-            nr_t(q) = s;
+          "hv_nr_t", TeamPolicy(K * N, 1, kLanes), KOKKOS_LAMBDA(const Team& m) {
+            const int q = m.league_rank(), t = q / N, a = q % N;
+            const double rt = rcdot(q);
+            double s = 0.0;
+            if (adn(a) > 0.0)
+              Kokkos::parallel_reduce(
+                  Kokkos::ThreadVectorRange(m, roff(a), roff(a + 1)),
+                  [&](int e, double& acc) { acc += sf(e, 1) * (rt - ddot(t * R + e)); }, s);
+            Kokkos::single(Kokkos::PerThread(m), [&] {
+              nr_t(q) = adn(a) > 0.0 ? s + 6.0 * target * ar(a) / (rmax * rmax * rmax) * rt : 0.0;
+            });
           });
       Kokkos::parallel_for(
           "hv_adaptive_g", RangePolicy(0, (K + 1) * R), KOKKOS_LAMBDA(int q) {
             const int t = q / R - 1, e = q % R, c = rcen(e);
             const double nr = adn(c), d = rdist(e);
             if (nr <= 0.0 || d <= 0.0) return;
-            double f1, f2;
-            cut_derivs(d, ar(c), wad, true, f1, f2);
+            const double f1 = sf(e, 0), f2 = sf(e, 1);
             const double qe = -f1 / nr, invd = 1.0 / d;
             if (t < 0) {
               for (int x = 0; x < 3; ++x) g(e, x) += scale * A(c) * qe * rvec(e, x) * invd;
@@ -1329,11 +1345,13 @@ HvpOut PetModel::hvp(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
         }
       });
   Kokkos::parallel_for(
-      "hv_virial", RangePolicy(0, K * 9), KOKKOS_LAMBDA(int q) {
-        const int t = q / 9, x = (q % 9) / 3, y = q % 3;
+      "hv_virial", TeamPolicy(K * 9, Kokkos::AUTO), KOKKOS_LAMBDA(const Team& m) {
+        const int q = m.league_rank(), t = q / 9, x = (q % 9) / 3, y = q % 3;
         double s = 0.0;
-        for (int e = 0; e < R; ++e) s += vdot_raw(t * R + e, x) * g(e, y) + rvec(e, x) * g_t(t * R + e, y);
-        dW(t, x * 3 + y) = s;
+        Kokkos::parallel_reduce(
+            Kokkos::TeamThreadRange(m, R),
+            [&](int e, double& acc) { acc += vdot_raw(t * R + e, x) * g(e, y) + rvec(e, x) * g_t(t * R + e, y); }, s);
+        Kokkos::single(Kokkos::PerTeam(m), [&] { dW(t, x * 3 + y) = s; });
       });
   return out;
 }

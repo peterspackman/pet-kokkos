@@ -201,6 +201,10 @@ struct Calculator::Impl {
   System resp_system;
   EdgeData resp_edges;
   bool resp_cached = false;
+  // Its tangents and slots on the device, kept so a recorded product's inputs
+  // stay where it recorded them.
+  RView1D resp_vdot;
+  IView1D resp_slot;
 
   std::vector<int> atomic_types;
 
@@ -372,8 +376,11 @@ Calculator::Response Calculator::response(const System& system, int K, const std
   for (int k0 = 0; k0 < std::max(K, 1); k0 += chunk) {
     const int kc = std::min(chunk, K - k0);
     DeviceEdgeData dev = I.model.upload_edge_data(ed, true);
-    IView1D raw_slot("pet:raw_slot", R);
-    RView2D vdot("pet:vdot", std::size_t(std::max(kc, 0)) * R, 3);
+    const std::size_t nv = std::size_t(std::max(chunk, 1)) * R * 3;
+    if (I.resp_vdot.extent(0) < nv) I.resp_vdot = RView1D("pet:vdot", nv);
+    if ((int) I.resp_slot.extent(0) < R) I.resp_slot = IView1D("pet:raw_slot", R);
+    IView1D raw_slot(I.resp_slot.data(), R);
+    RView2D vdot(I.resp_vdot.data(), std::size_t(std::max(kc, 0)) * R, 3);
     auto hs = Kokkos::create_mirror_view(raw_slot);
     for (int e = 0; e < R; ++e) hs(e) = ed.raw_slot[e];
     Kokkos::deep_copy(raw_slot, hs);

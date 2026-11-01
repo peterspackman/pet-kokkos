@@ -334,6 +334,7 @@ class PetModel {
   // direction; dev needs raw_slot. One structure; the solver adaptive cutoff or
   // none.
   HvpOut hvp(const DeviceEdgeData& dev, int K, RView2D vdot_raw);
+  HvpOut hvp_pass(const DeviceEdgeData& dev, int K, RView2D vdot_raw);  // the work hvp records
   void ff_layer_tan(const PackedEdges& pk, int L, const LayerSaves& sav, LayerTangents& ts, int K, View2D node_t,
                     View2D ie_t, View2D x4_t, View2D cf, View2D cf_t);
   void ff_layer_bwd2(const PackedEdges& pk, int L, const LayerSaves& sav, const LayerTangents& ts, int K,
@@ -427,6 +428,7 @@ class PetModel {
   Recompute recompute_ = Recompute::Auto;
   bool graphs_ = true;
   GraphCache<DeviceOut> graph_;
+  GraphCache<HvpOut> hv_graph_;
 
   long peak_edge_slots_ = 0;
   int peak_max_neighbors_ = 0;
