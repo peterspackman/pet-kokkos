@@ -257,6 +257,16 @@ void with_head_dim(int hd, F&& f) {
   }
 }
 
+// The attention passes hold several head-sized arrays a thread. Under HIP's
+// default launch bound of 1024 an MI250X caps a thread at 128 registers and they
+// spill (as attention.cpp found for the forward's passes); 256 lets them fit.
+#if defined(KOKKOS_ENABLE_HIP)
+using AttnRange = Kokkos::RangePolicy<ExecSpace, Kokkos::LaunchBounds<256, 1>,
+                                      Kokkos::Experimental::WorkItemProperty::HintLightWeight_t>;
+#else
+using AttnRange = RangePolicy;
+#endif
+
 struct AttnShape {
   Tokens tk;
   int N, S, H, hd, T;
@@ -317,7 +327,7 @@ template <int HD>
 void attn_tan_impl(View2D merged_t, View2D qkv, View2D qkv_t, View2D cf, View2D cf_t, const AttnShape& a, int K) {
   const int N = a.N, S = a.S, H = a.H;
   Kokkos::parallel_for(
-      "hv_attn", RangePolicy(0, K * N * H * S), KOKKOS_LAMBDA(int idx) {
+      "hv_attn", AttnRange(0, K * N * H * S), KOKKOS_LAMBDA(int idx) {
         constexpr int CAP = HD > 0 ? HD : kMaxHeadDim;
         const int i = idx % S, h = (idx / S) % H, n = (idx / (S * H)) % N, t = idx / (S * H * N);
         const int nd = HD > 0 ? HD : a.hd, qo = h * a.hd;
@@ -346,7 +356,7 @@ void attn_bwd2_impl(View2D qkv_adj, View2D qkv_adj_t, View2D cf_adj, View2D cf_a
   const int N = a.N, S = a.S, H = a.H;
   // Queries: dq, and per query its softmax, delta = go.o and their tangents.
   Kokkos::parallel_for(
-      "hv_attn_q", RangePolicy(0, K * N * H * S), KOKKOS_LAMBDA(int idx) {
+      "hv_attn_q", AttnRange(0, K * N * H * S), KOKKOS_LAMBDA(int idx) {
         constexpr int CAP = HD > 0 ? HD : kMaxHeadDim;
         const int i = idx % S, h = (idx / S) % H, n = (idx / (S * H)) % N, t = idx / (S * H * N);
         const int nd = HD > 0 ? HD : a.hd, D = H * a.hd, T = a.T, qo = h * a.hd, ko = D + qo, vo = 2 * D + qo;
@@ -395,7 +405,7 @@ void attn_bwd2_impl(View2D qkv_adj, View2D qkv_adj_t, View2D cf_adj, View2D cf_a
       });
   // Keys: dk, dv and the log cf adjoint's share from this head.
   Kokkos::parallel_for(
-      "hv_attn_k", RangePolicy(0, K * N * H * S), KOKKOS_LAMBDA(int idx) {
+      "hv_attn_k", AttnRange(0, K * N * H * S), KOKKOS_LAMBDA(int idx) {
         constexpr int CAP = HD > 0 ? HD : kMaxHeadDim;
         const int j = idx % S, h = (idx / S) % H, n = (idx / (S * H)) % N, t = idx / (S * H * N);
         const int nd = HD > 0 ? HD : a.hd, D = H * a.hd, T = a.T, qo = h * a.hd, ko = D + qo, vo = 2 * D + qo;
@@ -707,17 +717,10 @@ void PetModel::compress_bwd2(int L, View2D et_adj, View2D et_adj_t, View2D z, Vi
   linear_bwd(ca, et_adj, w2, 0);
   linear_bwd(ca_t, et_adj_t, w2, 0);
   act_bwd2(gz, gz_t, ca, ca_t, z, z_t);
-  auto wx = f.wx;
-  Kokkos::parallel_for(
-      "hv_bw_x4", RangePolicy(0, (K + 1) * E), KOKKOS_LAMBDA(int q) {
-        const int t = q / E - 1, k = q % E;
-        for (int c = 0; c < 4; ++c) {
-          Net v = Net(0);
-          for (int d = 0; d < D; ++d) v += (t < 0 ? gz(k, d) : gz_t(t * E + k, d)) * wx(d, c);
-          if (t < 0) x4_adj(k, c) += v;
-          else x4_adj_t(t * E + k, c) += v;
-        }
-      });
+  // x4_adj += gz wx, wx [D, 4]: a narrow GEMM, as the other weights' products are
+  const WeightRef wx(f.wx);
+  linear_bwd(x4_adj, gz, wx, 1);
+  linear_bwd(x4_adj_t, gz_t, wx, 1);
   if (f.wi.extent(0) > 0) {
     linear_bwd(ie_adj, gz, f.wi, 1);
     linear_bwd(ie_adj_t, gz_t, f.wi, 1);

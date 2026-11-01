@@ -248,6 +248,18 @@ With pet-mad-s on an RTX 4080 SUPER:
 The same anthracene elastic tensor computed one structure per call takes
 1.96 s.
 
+How a direction of the exact product compares with a force evaluation, with
+pet-mad-s (`pet-eval STRUCTURE --hvp K` times it):
+
+| | RTX 4080 SUPER | MI250X (one GCD) |
+|---|---|---|
+| diamond, 64 atoms | 2.9 ms per direction (forces 4.9 ms) | 3.2 ms (forces 4.9 ms) |
+| water, 648 atoms | 41 ms (forces 21.7 ms) | 34 ms (forces 21 ms) |
+
+So a direction costs about one evaluation in small cells and nearly two at
+several hundred atoms. That is what a 2-point difference costs per direction,
+with none of its error.
+
 `properties.HessianOperator(calc, structure)` wraps the exact product as a
 matrix-free operator (a scipy `LinearOperator` via `as_linear_operator()`;
 mass-weighted and with rigid modes projected out if asked). One block of k
