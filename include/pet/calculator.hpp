@@ -87,6 +87,15 @@ struct Options {
   // construction for a model without one. Results-returning calls only.
   bool uncertainty = false;
 
+  // A model whose edges taper with the cosine (pet-mols-s) has a second
+  // derivative that jumps at both ends of the taper, so its Hessian jumps
+  // wherever a pair distance crosses one -- which a strain derivative of the
+  // force constants (quasi-harmonic free energies) trips over. This swaps in a
+  // taper with the same ends and its first three derivatives zero there. It
+  // changes the model (slightly: the factors differ by at most a few hundredths
+  // within the taper); off by default, and nothing for a bump-tapered model.
+  bool smooth_cutoff = false;
+
   // compute_step: give every step between neighbour-list rebuilds the same
   // shapes -- capacities for the kept edges and the neighbour count, sized with
   // room to move and grown (the step redone) when outgrown -- so each replays

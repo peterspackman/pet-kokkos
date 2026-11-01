@@ -10,7 +10,9 @@ enum class Normalization { RMSNorm, LayerNorm };
 enum class Activation { SwiGLU, SiLU };
 enum class TransformerType { PreLN, PostLN };
 enum class FeaturizerType { FeedForward, Residual };
-enum class CutoffFunction { Bump, Cosine };
+// Smooth: not a checkpoint's own, but what Options::smooth_cutoff puts in place
+// of Cosine (pet/cutoff.hpp).
+enum class CutoffFunction { Bump, Cosine, Smooth };
 // How the adaptive cutoff is chosen: a Gaussian-weighted average over a probe
 // grid, or a Newton-bisection root of n_total(r) = num_neighbors_adaptive. They
 // give different answers; a checkpoint that does not say is Grid.

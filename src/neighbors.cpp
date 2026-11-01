@@ -40,6 +40,8 @@ double cosine_cutoff(double d, double rc, double width) {
   return 0.5 * (1.0 + std::cos(M_PI * x));
 }
 
+double smooth_cutoff(double d, double rc, double width) { return dev_smooth_cutoff(d, rc, width); }
+
 // The derivative runs off to infinity at both ends of the taper, where the
 // function itself is flat; the clamp keeps it finite there.
 double bump_dcutoff_dr(double d, double rc, double width) {
@@ -228,9 +230,9 @@ EdgeData build_edge_data_from_raw(int N, const std::vector<int>& species, const 
     ed.edge_vec[f * 3 + 0] = e.vx, ed.edge_vec[f * 3 + 1] = e.vy, ed.edge_vec[f * 3 + 2] = e.vz;
     ed.edge_dist[f] = e.dist;
     ed.neigh_species[f] = ed.species[e.neigh_owner];
-    ed.cutoff_factor[f] = h.cutoff_function == CutoffFunction::Bump
-                              ? detail::bump_cutoff(e.dist, kept[k].rc, h.cutoff_width)
-                              : detail::cosine_cutoff(e.dist, kept[k].rc, h.cutoff_width);
+    ed.cutoff_factor[f] = h.cutoff_function == CutoffFunction::Bump     ? detail::bump_cutoff(e.dist, kept[k].rc, h.cutoff_width)
+                          : h.cutoff_function == CutoffFunction::Cosine ? detail::cosine_cutoff(e.dist, kept[k].rc, h.cutoff_width)
+                                                                        : detail::smooth_cutoff(e.dist, kept[k].rc, h.cutoff_width);
     ed.pair_cutoff[f] = kept[k].rc;
     ed.mask[f] = 1;
     ed.raw_slot[kept[k].e - edges.data()] = (int) f;

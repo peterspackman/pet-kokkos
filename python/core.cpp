@@ -104,11 +104,13 @@ class Calculator {
  public:
   Calculator(const std::string& model, std::optional<std::string> gemm, std::optional<std::string> attention,
              bool device_neighbors, bool cache_neighbors, std::optional<std::string> recompute,
-             double memory_budget_gib, int max_batch_atoms, bool non_conservative, bool uncertainty) {
+             double memory_budget_gib, int max_batch_atoms, bool non_conservative, bool uncertainty,
+             bool smooth_cutoff) {
     start_kokkos();
     pet::Options o;
     o.non_conservative = non_conservative;
     o.uncertainty = uncertainty;
+    o.smooth_cutoff = smooth_cutoff;
     o.device_neighbors = device_neighbors;
     o.cache_neighbors = cache_neighbors;
     o.memory_budget_bytes = std::size_t(memory_budget_gib * double(1ull << 30));
@@ -238,10 +240,11 @@ NB_MODULE(_core, m) {
 
   nb::class_<Calculator>(m, "Calculator")
       .def(nb::init<const std::string&, std::optional<std::string>, std::optional<std::string>, bool, bool,
-                    std::optional<std::string>, double, int, bool, bool>(),
+                    std::optional<std::string>, double, int, bool, bool, bool>(),
            "model"_a, "gemm"_a = nb::none(), "attention"_a = nb::none(), "device_neighbors"_a = true,
            "cache_neighbors"_a = false, "recompute"_a = nb::none(), "memory_budget_gib"_a = 0.0,
-           "max_batch_atoms"_a = 0, "non_conservative"_a = false, "uncertainty"_a = false)
+           "max_batch_atoms"_a = 0, "non_conservative"_a = false, "uncertainty"_a = false,
+           "smooth_cutoff"_a = false)
       .def("compute", &Calculator::compute, "numbers"_a, "positions"_a, "cell"_a = nb::none(),
            "pbc"_a = std::array<bool, 3>{false, false, false}, "forces"_a = true, "charge"_a = 0,
            "spin_multiplicity"_a = 1)

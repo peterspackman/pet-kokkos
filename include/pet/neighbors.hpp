@@ -95,6 +95,7 @@ namespace detail {
 // The smooth cutoff functions, and the bump's derivative in the cutoff radius.
 double bump_cutoff(double d, double rc, double width);
 double cosine_cutoff(double d, double rc, double width);
+double smooth_cutoff(double d, double rc, double width);
 double bump_dcutoff_dr(double d, double rc, double width);
 
 // A directed edge from the search.

@@ -210,8 +210,14 @@ struct Calculator::Impl {
 
   std::vector<int> atomic_types;
 
+  static Checkpoint adjusted(Checkpoint c, const Options& o) {
+    if (o.smooth_cutoff && c.hypers.cutoff_function == CutoffFunction::Cosine)
+      c.hypers.cutoff_function = CutoffFunction::Smooth;
+    return c;
+  }
+
   Impl(const std::string& json_path, const std::string& weights_path, Options o)
-      : ckpt(json_path, weights_path), model(ckpt), opts(o) {
+      : ckpt(adjusted(Checkpoint(json_path, weights_path), o)), model(ckpt), opts(o) {
     for (int z = 0; z < (int) ckpt.species_to_index.size(); ++z)
       if (ckpt.species_to_index[z] >= 0) atomic_types.push_back(z);
     if (o.gemm != GemmMode::Native) gemm_mode() = o.gemm;

@@ -48,12 +48,16 @@ KOKKOS_INLINE_FUNCTION Net d2silu(Net z) {
 
 // The smooth cutoff's first and second derivatives in d, f(x) with x = (d - rc +
 // w) / w, in double; the factor depends on rc only through d - rc.
-KOKKOS_INLINE_FUNCTION void cut_derivs(double d, double rc, double w, bool bump, double& f1, double& f2) {
+KOKKOS_INLINE_FUNCTION void cut_derivs(double d, double rc, double w, int kind, double& f1, double& f2) {
   f1 = f2 = 0.0;
   const double x = (d - (rc - w)) / w;
   if (x <= 0.0 || x >= 1.0) return;
   const double pi = detail::PET_PI;
-  if (bump) {  // f = (1 + tanh(cot(pi x))) / 2
+  if (kind == 2) {  // f = 1 - (35x^4 - 84x^5 + 70x^6 - 20x^7)
+    const double y = x * (1.0 - x);
+    f1 = -140.0 * y * y * y / w;
+    f2 = -420.0 * y * y * (1.0 - 2.0 * x) / (w * w);
+  } else if (kind == 0) {  // f = (1 + tanh(cot(pi x))) / 2
     const double si = Kokkos::sin(pi * x), co = Kokkos::cos(pi * x);
     const double th = Kokkos::tanh(co / si), se = 1.0 - th * th;
     const double ud = -pi / (si * si) / w, udd = 2.0 * pi * pi * co / (si * si * si) / (w * w);
@@ -953,7 +957,8 @@ HvpOut PetModel::hvp_pass(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
   ws_.set_zero(false);
   const PackedEdges pk = pack_edges(dev);
   const int E = pk.E;
-  const bool adaptive = h_.adaptive(), bump = h_.cutoff_function == CutoffFunction::Bump;
+  const bool adaptive = h_.adaptive();
+  const int kind = int(h_.cutoff_function);
   const double width = h_.cutoff_width, wad = h_.cutoff_width_adaptive, target = h_.num_neighbors_adaptive,
                rmax = h_.cutoff, scale = energy_scale_;
 
@@ -991,7 +996,7 @@ HvpOut PetModel::hvp_pass(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
     Kokkos::parallel_for(
         "hv_sf", RangePolicy(0, R), KOKKOS_LAMBDA(int e) {
           double f1, f2;
-          cut_derivs(rdist(e), ar(rcen(e)), wad, true, f1, f2);
+          cut_derivs(rdist(e), ar(rcen(e)), wad, 0, f1, f2);
           sf(e, 0) = f1, sf(e, 1) = f2;
         });
     Kokkos::parallel_for(
@@ -1052,7 +1057,7 @@ HvpOut PetModel::hvp_pass(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
             const int hi = Kokkos::min((int) Kokkos::ceil((d + wad - p0) / dp) + 1, P);
             for (int p = lo; p < hi; ++p) {
               double f1, f2;
-              cut_derivs(d, probes(p), wad, true, f1, f2);
+              cut_derivs(d, probes(p), wad, 0, f1, f2);
               dt(q, p) += f1 * dd;
             }
           }
@@ -1084,7 +1089,7 @@ HvpOut PetModel::hvp_pass(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
         const double pc_t = adaptive ? 0.5 * (rcdot(t * N + n) + rcdot(t * N + rnb(e))) : 0.0;
         pcdot(q) = pc_t;
         double f1, f2;
-        cut_derivs(pdist(k), pcut(k), width, bump, f1, f2);
+        cut_derivs(pdist(k), pcut(k), width, kind, f1, f2);
         cut_t(q) = (Net) (f1 * (dd - pc_t));
         cf_t(t * N + n, 1 + k - off(n)) = cut_t(q);
       });
@@ -1221,7 +1226,7 @@ HvpOut PetModel::hvp_pass(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
         const int t = q / E - 1, k = q % E, n = center(k), m = k - off(n), e = praw(k);
         const double d = pdist(k), invd = d > 0.0 ? 1.0 / d : 0.0;
         double f1, f2;
-        cut_derivs(d, pcut(k), width, bump, f1, f2);
+        cut_derivs(d, pcut(k), width, kind, f1, f2);
         const double T0 = (double) cutoff_adj(k) + (double) cf_adj(n, 1 + m);
         const double dist_adj = (double) x4_adj(k, 3) + T0 * f1;
         if (t < 0) {
@@ -1345,7 +1350,7 @@ HvpOut PetModel::hvp_pass(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
             const double dd = t < 0 ? 0.0 : ddot(t * R + e);
             for (int p = lo; p < hi; ++p) {
               double f1, f2;
-              cut_derivs(d, probes(p), wad, true, f1, f2);
+              cut_derivs(d, probes(p), wad, 0, f1, f2);
               gm += da(a, p) * f1;
               if (t >= 0) gmt += da((t + 1) * N + a, p) * f1 + da(a, p) * f2 * dd;
             }

@@ -151,3 +151,48 @@ TEST_CASE("repeated Hessian-vector products at one geometry match", "[model][hvp
     CHECK(err <= 1e-6 * std::max(1.0, scale));
   }
 }
+
+// Options::smooth_cutoff: the cosine taper's stand-in is smooth to third order,
+// so a central difference of the forces converges at any step, also across a
+// pair at the taper's start (benzene's meta H-H at 4.2996 A, pet-mols-s's taper
+// 4.3-4.5 A) where the cosine's Hessian jumps. And the forces stay the energy's
+// gradient.
+TEST_CASE("the smooth cutoff's Hessian has no jumps", "[model][hvp]") {
+  const auto found = find_model("pet-mols-s-v1.1");
+  if (!found) {
+    WARN("pet-mols-s-v1.1 is not installed; skipping");
+    return;
+  }
+  pet::Options o;
+  o.smooth_cutoff = true;
+  pet::Calculator calc(found->first, found->second, o);
+  REQUIRE(calc.hypers().cutoff_function == pet::CutoffFunction::Smooth);
+  pet::System s;
+  s.n_atoms = 12;
+  for (int k = 0; k < 6; ++k) {
+    const double t = k * M_PI / 3;
+    s.atomic_numbers.push_back(6);
+    for (double c : {1.395 * std::cos(t), 1.395 * std::sin(t), 0.0}) s.positions.push_back(c);
+  }
+  for (int k = 0; k < 6; ++k) {
+    const double t = k * M_PI / 3;
+    s.atomic_numbers.push_back(1);
+    for (double c : {2.4825 * std::cos(t), 2.4825 * std::sin(t), 0.0}) s.positions.push_back(c);
+  }
+  const int N = s.n_atoms;
+  std::vector<double> u(std::size_t(N) * 3, 0.0);
+  u[6 * 3 + 1] = 1.0;  // atom 6 (an H) along y: towards the taper's start
+  const pet::Calculator::Response hv = calc.response(s, 1, u, {});
+  for (const double h : {1e-3, 2.5e-4}) {
+    std::vector<pet::Results> at;
+    for (double t : {h, -h, 2 * h, -2 * h}) at.push_back(calc.compute(moved(s, u, nullptr, t), true));
+    double err = 0.0, scale = 0.0;
+    for (int i = 0; i < N * 3; ++i) {
+      const double fd = (8.0 * (at[0].forces[i] - at[1].forces[i]) - (at[2].forces[i] - at[3].forces[i])) / (12.0 * h);
+      scale = worst(scale, std::fabs(fd));
+      err = worst(err, std::fabs(fd - hv.forces[i]));
+    }
+    INFO("h = " << h << ": max|dF/dt - FD| = " << err << " of " << scale);
+    CHECK(err <= (kFp64 ? 1e-6 : 2e-3) * std::max(1.0, scale));
+  }
+}

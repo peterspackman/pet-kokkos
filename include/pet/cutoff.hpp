@@ -24,8 +24,19 @@ KOKKOS_INLINE_FUNCTION double dev_cosine_cutoff(double d, double rc, double widt
   const CutT x = Kokkos::fmin(Kokkos::fmax((CutT) ((d - (rc - width)) / width), CutT(0)), CutT(1));
   return 0.5 * (1.0 + (double) Kokkos::cos((CutT) PET_PI * x));
 }
-KOKKOS_INLINE_FUNCTION double dev_cutoff_value(double d, double rc, double width, bool bump) {
-  return bump ? dev_bump_cutoff(d, rc, width) : dev_cosine_cutoff(d, rc, width);
+// The cosine taper's second derivative jumps at both ends, so a Hessian made
+// with it jumps wherever a pair distance crosses one. Its smooth stand-in
+// (Options::smooth_cutoff): 1 - (35x^4 - 84x^5 + 70x^6 - 20x^7), the same ends,
+// with the first three derivatives zero at both.
+KOKKOS_INLINE_FUNCTION double dev_smooth_cutoff(double d, double rc, double width) {
+  const double x = Kokkos::fmin(Kokkos::fmax((d - (rc - width)) / width, 0.0), 1.0);
+  const double x4 = x * x * x * x;
+  return 1.0 - x4 * (35.0 - 84.0 * x + 70.0 * x * x - 20.0 * x * x * x);
+}
+// The edge cutoff function's kind, as the kernels take it: CutoffFunction's value.
+KOKKOS_INLINE_FUNCTION double dev_cutoff_value(double d, double rc, double width, int kind) {
+  return kind == 0 ? dev_bump_cutoff(d, rc, width) : kind == 1 ? dev_cosine_cutoff(d, rc, width)
+                                                               : dev_smooth_cutoff(d, rc, width);
 }
 
 // d/d(rc) of dev_bump_cutoff, the function the solver root-finds on. With

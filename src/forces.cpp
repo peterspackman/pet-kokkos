@@ -32,8 +32,14 @@ KOKKOS_INLINE_FUNCTION double cosine_ddist(double d, double rc, double w) {
   if (x <= detail::CutT(0) || x >= detail::CutT(1)) return 0.0;
   return 0.5 * (double) (-(detail::CutT) detail::PET_PI * Kokkos::sin((detail::CutT) detail::PET_PI * x)) / w;
 }
-KOKKOS_INLINE_FUNCTION double cutoff_ddist(double d, double rc, double w, bool bump) {
-  return bump ? bump_ddist(d, rc, w) : cosine_ddist(d, rc, w);
+KOKKOS_INLINE_FUNCTION double smooth_ddist(double d, double rc, double w) {
+  const double x = (d - (rc - w)) / w;
+  if (x <= 0.0 || x >= 1.0) return 0.0;
+  const double y = x * (1.0 - x);
+  return -140.0 * y * y * y / w;
+}
+KOKKOS_INLINE_FUNCTION double cutoff_ddist(double d, double rc, double w, int kind) {
+  return kind == 0 ? bump_ddist(d, rc, w) : kind == 1 ? cosine_ddist(d, rc, w) : smooth_ddist(d, rc, w);
 }
 
 // Forces and a per-atom virial from per-edge gradients g = dE/dv. The edge list
@@ -341,7 +347,8 @@ void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdg
                        View1D cutoff_adj, View2D cf_seq_adj, RView2D& forces, RView2D& vir9,
                        RView2D& edge_grad) {
   const int N = dev.n_atoms, E = pk.E;
-  const bool adaptive = h.adaptive(), bump = h.cutoff_function == CutoffFunction::Bump;
+  const bool adaptive = h.adaptive();
+  const int kind = int(h.cutoff_function);
   const double width = h.cutoff_width;
 
   // dE/dv per edge: through (v, |v|) directly, and through |v| into the cutoff
@@ -363,7 +370,7 @@ void forces_and_virial(Workspace& ws, const DeviceEdgeData& dev, const PackedEdg
         }
         const int n = center(k), m = k - off(n);
         const double cutoff_total = cutoff_adj(k) + cf_seq_adj(n, 1 + m);
-        const double dcut_dd = cutoff_ddist(dist(k), pcut(k), width, bump);
+        const double dcut_dd = cutoff_ddist(dist(k), pcut(k), width, kind);
         const double dist_adj = x4_adj(k, 3) + cutoff_total * dcut_dd;
         const double invd = (dist(k) > 0.0) ? 1.0 / dist(k) : 0.0;
         for (int c = 0; c < 3; ++c) grad(k, c) = x4_adj(k, c) + dist_adj * vec(k, c) * invd;

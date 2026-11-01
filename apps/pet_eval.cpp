@@ -39,6 +39,8 @@ void usage() {
       "      --non-conservative  forces and virial from the model's direct heads,\n"
       "                       without the backward pass (not the energy's gradient)\n"
       "      --uncertainty    the model's LLPR energy uncertainty (and ensemble)\n"
+      "      --smooth-cutoff  a cosine-tapered model's taper made smooth to third order\n"
+      "                       (changes the model slightly; see Options::smooth_cutoff)\n"
       "  -b, --batch          evaluate all frames in one pass instead of one at a time\n"
       "  -o, --output FILE    write the frames back out as extxyz, with forces\n"
       "      --json           emit results as JSON on stdout (for scripts)\n"
@@ -81,7 +83,7 @@ struct Args {
   std::string model_spec, structure_path, output_path;
   bool want_forces = false, batch = false, per_atom = false;
   bool host_neighbors = false, builtin_neighbors = false, info_only = false, json = false;
-  bool report_memory = false, non_conservative = false, uncertainty = false;
+  bool report_memory = false, non_conservative = false, uncertainty = false, smooth_cutoff = false;
   int repeat = 1;
   int hvp = 0;  // directions for --hvp
   int charge = 0;
@@ -125,6 +127,8 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.want_forces = true;
     } else if (s == "--uncertainty") {
       a.uncertainty = true;
+    } else if (s == "--smooth-cutoff") {
+      a.smooth_cutoff = true;
     } else if (s == "--info") {
       a.info_only = true;
     } else if (s == "--json") {
@@ -185,7 +189,9 @@ std::vector<std::pair<std::string, std::string>> model_fields(const Args& a, con
       {"transformer", str(h.transformer_type == TransformerType::PreLN ? "PreLN" : "PostLN")},
       {"normalization", str(h.normalization == Normalization::RMSNorm ? "RMSNorm" : "LayerNorm")},
       {"activation", str(h.activation == Activation::SwiGLU ? "SwiGLU" : "SiLU")},
-      {"cutoff_function", str(h.cutoff_function == pet::CutoffFunction::Bump ? "Bump" : "Cosine")},
+      {"cutoff_function", str(h.cutoff_function == pet::CutoffFunction::Bump     ? "Bump"
+                              : h.cutoff_function == pet::CutoffFunction::Cosine ? "Cosine"
+                                                                                 : "Smooth")},
       {"cutoff", num(h.cutoff)},
       {"cutoff_width", num(h.cutoff_width)},
       {"cutoff_width_adaptive", num(h.cutoff_width_adaptive)},
@@ -323,6 +329,7 @@ int run(const Args& a) {
                                        : pet::Options::Neighbors::Vesin;
   opts.non_conservative = a.non_conservative;
   opts.uncertainty = a.uncertainty;
+  opts.smooth_cutoff = a.smooth_cutoff;
   pet::Calculator calc(a.model_spec, opts);
 
   if (a.info_only) {

@@ -230,6 +230,18 @@ stencil straddles such a distance is off by up to ~0.04 eV/Å². Benzene's meta
 H–H distance, 4.2996 Å, is one such case. The exact product gives the Hessian
 at the geometry itself.
 
+`smooth_cutoff=True` (`pet::Options::smooth_cutoff`, `pet-eval
+--smooth-cutoff`) swaps the cosine taper for 1 − (35x⁴ − 84x⁵ + 70x⁶ − 20x⁷).
+It has the same ends, with its first three derivatives zero at both, so the
+Hessian and its strain derivative are continuous. That matters for
+quasi-harmonic free energies, which differentiate force constants with respect
+to strain: with the cosine, pet-mols-s's dF_vib/dε for naphthalene moved by up
+to 50% between steps of 3e-4 and 3e-3; with the smooth taper it holds to about
+0.5%. It does change the model, slightly. Over the X23 crystals, energies move
+by at most 0.05 meV/atom and forces by about 6e-4 eV/Å RMS. Stresses move by
+under 0.02 GPa, except oxalic acid α (0.05 GPa) and urea (0.14 GPa). The option
+does nothing for a bump-tapered model (pet-mad, pet-omol).
+
 The exact Hessian is symmetric, and the response to a translation is zero, to
 rounding. It also carries the solver adaptive cutoff's full second derivative.
 The forward treats that cutoff's root and slope as constants, as metatrain

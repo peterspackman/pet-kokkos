@@ -82,6 +82,12 @@ class Calculator:
         ``energy_uncertainty`` and per atom as ``energies_uncertainty``, and,
         for a model with one, the ``energy_ensemble``. A model without one
         raises.
+    smooth_cutoff: for a model whose edges taper with the cosine (pet-mols-s),
+        a taper with the same ends whose first three derivatives vanish there.
+        The cosine's second derivative jumps at both ends of the taper, so its
+        Hessian jumps wherever a pair distance crosses one, which strain
+        derivatives of force constants (quasi-harmonic free energies) trip
+        over. It changes the model slightly; nothing for a bump-tapered model.
     """
 
     def __init__(
@@ -97,6 +103,7 @@ class Calculator:
         max_batch_atoms: int = 0,
         non_conservative: bool = False,
         uncertainty: bool = False,
+        smooth_cutoff: bool = False,
     ):
         self.model = resolve(model)
         self.non_conservative = non_conservative
@@ -111,6 +118,7 @@ class Calculator:
             max_batch_atoms=max_batch_atoms,
             non_conservative=non_conservative,
             uncertainty=uncertainty,
+            smooth_cutoff=smooth_cutoff,
         )
         _live.add(self)
 

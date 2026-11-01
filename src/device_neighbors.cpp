@@ -213,7 +213,8 @@ void edge_topology(Workspace& ws, EdgeMap& edge_map, DeviceEdgeData& dev, int N,
 
 void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D probes, int P, int& m_high,
                    int m_fixed, IView1D overflow, int e_fixed) {
-  const bool adaptive = h.adaptive(), bump = h.cutoff_function == CutoffFunction::Bump;
+  const bool adaptive = h.adaptive();
+  const int kind = int(h.cutoff_function);
   const double width = h.cutoff_width, cutoff = h.cutoff;
   const int N = dev.n_atoms, NC = dev.centres(), E = dev.n_raw;
   auto roff = dev.raw_off, raw_rev = dev.raw_reverse, re_i = dev.raw_center, re_j = dev.raw_neigh;
@@ -244,7 +245,7 @@ void edge_geometry(Workspace& ws, DeviceEdgeData& dev, const Hypers& h, RView1D 
         rcv(e) = rc;
         keep(e) = re_dist(e) <= rc;
         if (keep(e)) {
-          factor(e) = detail::dev_cutoff_value(re_dist(e), rc, width, bump);
+          factor(e) = detail::dev_cutoff_value(re_dist(e), rc, width, kind);
           Kokkos::atomic_inc(&count(re_i(e)));
         }
       });

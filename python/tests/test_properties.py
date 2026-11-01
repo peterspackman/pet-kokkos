@@ -210,3 +210,19 @@ def test_refuses_non_conservative():
     with pytest.raises(ValueError, match="non_conservative"):
         properties.hessian(nc, silicon())
     nc.close()
+
+
+def test_smooth_cutoff():
+    calculator("pet-mols-s")  # skips when not installed
+    plain = pet_kokkos.Calculator("pet-mols-s")
+    smooth = pet_kokkos.Calculator("pet-mols-s", smooth_cutoff=True)
+    z, x, _, _ = relaxed_benzene(plain)
+    a, b = plain.compute(z, x), smooth.compute(z, x)
+    assert abs(a["energy"] - b["energy"]) < 1e-3 * len(z)  # the model barely moves
+    assert np.abs(np.asarray(a["forces"]) - np.asarray(b["forces"])).max() < 0.02
+    # and its Hessian no longer depends on the step across the taper
+    H1 = properties.hessian(smooth, (z, x), method="fd", points=4, step=1e-3)
+    H2 = properties.hessian(smooth, (z, x), method="fd", points=4, step=4e-3)
+    He = properties.hessian(smooth, (z, x), method="exact")
+    assert np.abs(H1 - He).max() < 5e-3 and np.abs(H2 - He).max() < 5e-2
+    plain.close(), smooth.close()
