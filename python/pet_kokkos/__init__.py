@@ -146,8 +146,7 @@ class Calculator:
         (d forces / dt), ``virial`` [K, 6] (d virial / dt, the virial's order)
         and ``base_forces`` [N, 3].
 
-        So far the feedforward featurizer (pet-mad, pet-omol...) with the
-        solver adaptive cutoff or none; other models raise. See
+        One structure at a time; every published model. See
         ``pet_kokkos.properties`` for Hessians, vibrations and elastic tensors
         built on it.
         """

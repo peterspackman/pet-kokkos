@@ -192,13 +192,14 @@ directions (atomic displacements, strains), which come one of two ways:
   hand-written backward are differentiated along every direction at once
   (forward-over-reverse), so there is no step and no truncation error. The
   K directions run as extra rows of the same GEMMs. `Calculator.response`
-  exposes it directly. It is only available for the feedforward featurizer
-  (pet-mad, pet-omol) with the solver adaptive cutoff or none.
+  exposes it directly. It works for every published model: both featurizers
+  (pet-mad, pet-omol; pet-mols-s), and the solver, grid or no adaptive cutoff.
 - `method="fd"`: central differences of the forces, every displaced structure
   of a property in one batched evaluation. The stencil can be set: `points`
   (2, 4 or 6), `step` (Å), `strain_step`. It works with any model.
 
-`method="auto"`, the default, takes the exact product where the model has it.
+`method="auto"`, the default, takes the exact product, and falls back to
+finite differences for a model it cannot differentiate.
 Measured against the exact product in an fp64 build:
 
 | | Hessian | frequencies | elastic constants |
@@ -214,6 +215,13 @@ truncation is. Near soft or unstable modes the relaxed-ion elastic tensor
 divides by small eigenvalues, and finite-difference errors grow there: on an
 unrelaxed acetic acid cell they reached 0.2–0.6 GPa, and moved with the step.
 TF32 is refused unless `allow_reduced_precision=True`.
+
+The cosine cutoff (pet-mols-s) is smooth only to first order: its second
+derivative jumps at both ends of the taper (4.3 and 4.5 Å), so the Hessian
+itself jumps where a pair distance crosses one. A finite difference whose
+stencil straddles such a distance is off by up to ~0.04 eV/Å². Benzene's meta
+H–H distance, 4.2996 Å, is one such case. The exact product gives the Hessian
+at the geometry itself.
 
 The exact Hessian is symmetric, and the response to a translation is zero, to
 rounding. It also carries the solver adaptive cutoff's full second derivative.

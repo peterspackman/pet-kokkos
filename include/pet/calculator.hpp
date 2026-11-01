@@ -171,8 +171,8 @@ class Calculator {
   // each direction, with no finite step. Direction k displaces the atoms by
   // displacements[k] ([N * 3], A per unit t) and strains the structure by
   // strains[k] ([9], row-major e: positions and cell go to x (I + t e)^T); either
-  // may be empty, as zeros. One structure; so far the feedforward featurizer,
-  // with the solver adaptive cutoff or none.
+  // may be empty, as zeros. One structure (not a batch), any of the models'
+  // featurizers and adaptive cutoffs; not long-range or ZBL terms.
   struct Response {
     int K = 0;
     std::vector<double> forces;   // [K][N * 3] d(forces)/dt, eV/A per unit t

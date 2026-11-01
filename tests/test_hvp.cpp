@@ -1,7 +1,9 @@
 // The exact Hessian-vector product (Calculator::response) against central
 // differences of the forces and virial along the same directions: displacements
-// of every atom, of one atom, and a strain with a displacement. In the fp64 build
-// this is tight; in fp32 the differences' own noise sets the tolerance.
+// of every atom, of one atom, and a strain with a displacement, for each kind
+// of model (feedforward and residual featurizers; solver, grid and no adaptive
+// cutoff). In the fp64 build this is tight; in fp32 the differences' own error
+// sets the tolerance.
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
@@ -40,14 +42,18 @@ pet::System moved(const pet::System& s0, const std::vector<double>& u, const dou
 }  // namespace
 
 TEST_CASE("Hessian-vector products match differences of the forces", "[model][hvp]") {
-  for (const std::string model : {"pet-mad-xs-v1.6", "pet-mad-s"}) {
+  // Each model on the goldens' structures of a model that shares its elements.
+  const std::pair<std::string, std::string> cases[] = {
+      {"pet-mad-xs-v1.6", "pet-mad-xs-v1.6"}, {"pet-mad-s", "pet-mad-xs-v1.6"}, {"pet-mols-s-v1.1", "pet-mols-s-v1.1"},
+      {"pet-mad-xs", "pet-mad-xs"}, {"pet-omol-s", "pet-mols-s-v1.1"}};
+  for (const auto& [model, structures] : cases) {
     pet::Calculator* calcp = shared_calculator(model);
     if (!calcp) {
       WARN("model '" << model << "' is not installed; skipping its HVP check");
       continue;
     }
     pet::Calculator& calc = *calcp;
-    for (const auto& path : golden_paths("pet-mad-xs-v1.6")) {
+    for (const auto& path : golden_paths(structures)) {
       const Golden g = load_golden(path);
       DYNAMIC_SECTION(model << " / " << g.name) {
         const pet::System& s0 = g.system;
@@ -73,7 +79,9 @@ TEST_CASE("Hessian-vector products match differences of the forces", "[model][hv
         INFO("forces from the product's pass vs compute: " << ferr << " (max " << fmax << ")");
         CHECK(ferr <= (kFp64 ? 1e-9 : 1e-4) * std::max(1.0, fmax));
 
-        const double h = kFp64 ? 1e-3 : 5e-3;
+        // Small: the cosine cutoff's second derivative jumps at both ends of its
+        // taper, and a difference straddling an edge there is off by O(h).
+        const double h = kFp64 ? 2.5e-4 : 5e-3;
         for (int k = 0; k < K; ++k) {
           const std::vector<double> u(disp.begin() + std::size_t(k) * N * 3, disp.begin() + std::size_t(k + 1) * N * 3);
           const double* e = &strain[std::size_t(k) * 9];
@@ -97,7 +105,10 @@ TEST_CASE("Hessian-vector products match differences of the forces", "[model][hv
             }
           INFO("direction " << k << ": max|dF/dt - FD| = " << err << " of max|FD| " << scale
                             << "; virial " << werr << " of " << wscale);
-          const double tol = kFp64 ? 1e-6 : 2e-3;
+          // In fp32 the reference is what is coarse: its step must stay large against
+          // fp32 noise, and in the disordered structures it crosses the cutoffs'
+          // kinks. The product's own exactness is the fp64 build's check.
+          const double tol = kFp64 ? 1e-6 : 1e-2;
           CHECK(err <= tol * std::max(1.0, scale));
           CHECK(werr <= tol * std::max(1.0, wscale));
         }

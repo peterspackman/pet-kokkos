@@ -12,14 +12,13 @@ homogeneous strain. Two ways to get them:
 
 - ``method="exact"``: a Hessian-vector product, differentiating the network's
   forward and backward along each direction (:meth:`Calculator.response`). No
-  step, no truncation, and the translations' zero response is exact. So far
-  for the feedforward models (pet-mad, pet-omol) with the solver adaptive
-  cutoff or none.
+  step, no truncation, and the translations' zero response is exact. Every
+  published model (pet-mad, pet-omol, pet-mols).
 - ``method="fd"``: central finite differences of the forces, every displaced
   structure of a property in one batched evaluation. Any model.
 
-``method="auto"`` (the default) takes the exact product where the model has
-it.
+``method="auto"`` (the default) takes the exact product, and falls back to
+finite differences for a model it cannot differentiate.
 
 A structure is an ASE ``Atoms`` or a tuple ``(numbers, positions, cell, pbc)``
 as :meth:`Calculator.compute` takes it.

@@ -105,12 +105,12 @@ def test_exact_matches_finite_differences():
     assert np.abs(e.C - e4.C).max() < 0.05
 
 
-def test_exact_needs_a_supported_model():
-    calc = calculator("pet-mols-s")  # the residual featurizer: no exact product yet
-    a = molecule("H2O")
-    with pytest.raises(RuntimeError, match="Hessian-vector product"):
-        properties.hessian(calc, a, method="exact")
-    assert properties.hessian(calc, a).shape == (9, 9)  # auto falls back to fd
+def test_exact_residual_featurizer():
+    calc = calculator("pet-mols-s")  # residual featurizer, LayerNorm, SiLU, cosine cutoff
+    a = relaxed_benzene(calc)
+    v = properties.vibrations(calc, a, method="exact")
+    v4 = properties.vibrations(calc, a, method="fd", points=4, step=0.005)
+    assert np.abs(v.frequencies - v4.frequencies).max() < 0.1
 
 
 def test_phonons_match_gamma_vibrations():

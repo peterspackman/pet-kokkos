@@ -21,8 +21,8 @@
 // [K * R, C] buffer, tangent t's row r at t * R + r, so a linear layer's tangents
 // are one GEMM through the same weight (and no bias).
 //
-// So far: a single structure, the feedforward featurizer, the solver (or no)
-// adaptive cutoff, every activation kept, no CUDA graph and no exchange. The
+// Both featurizers, and the solver, grid or no adaptive cutoff; a single
+// structure, every activation kept, no CUDA graph and no exchange. The
 // kernels are a thread per value, a warp per norm row, and a thread per query
 // or key for the attention; tests/test_hvp.cpp holds the whole product to
 // finite differences.
@@ -497,28 +497,9 @@ void PetModel::ff_layer_tan(const PackedEdges& pk, int L, const LayerSaves& sav,
   Workspace::Scope layer_scope(ws_);
 
   // compress: z' = input_edge' wi^T + wx (v', |v|'); et' = compress.2(silu'(z) z')
-  const CompressFold f = compress_fold(L);
   ts.cpre = keep("cpre", -1, E, D);
-  if (f.wi.extent(0) > 0) linear(ts.cpre, ie_t, f.wi, View1D(), 0);
-  {
-    auto zt = ts.cpre;
-    auto wx = f.wx;
-    const bool gemm = f.wi.extent(0) > 0;
-    Kokkos::parallel_for(
-        "hv_compress", RangePolicy(0, K * E * D), KOKKOS_LAMBDA(int i) {
-          const int q = i / D, d = i % D;
-          Net z = gemm ? zt(q, d) : Net(0);
-          for (int c = 0; c < 4; ++c) z += wx(d, c) * x4_t(q, c);
-          zt(q, d) = z;
-        });
-  }
   View2D et_t = ws_.tmp(K * E, D);
-  {
-    Workspace::Scope s(ws_);
-    View2D a_t = ws_.tmp(K * E, D);
-    act_tan(a_t, sav.cpre, ts.cpre);
-    linear(et_t, a_t, mat(g + ".compress.2.weight"), View1D(), 0);
-  }
+  compress_tan(ts.cpre, et_t, L, sav.cpre, ie_t, x4_t);
 
   View2D node_cur = node_t, edge_cur = et_t;
   for (int a = 0; a < A; ++a) {
@@ -694,21 +675,47 @@ void PetModel::ff_layer_bwd2(const PackedEdges& pk, int L, const LayerSaves& sav
   }
 
   // edge_adj is et's: back through compress.2 and compress.0.
+  compress_bwd2(L, edge_adj, edge_adj_t, sav.cpre, ts.cpre, x4_adj, x4_adj_t, ie_adj, ie_adj_t);
+}
+
+void PetModel::compress_tan(View2D z_t, View2D et_t, int L, View2D z, View2D ie_t, View2D x4_t) {
   const CompressFold f = compress_fold(L);
+  const int D = z_t.extent(1), KE = z_t.extent(0);
+  const bool gemm = f.wi.extent(0) > 0;
+  if (gemm) linear(z_t, ie_t, f.wi, View1D(), 0);
+  auto wx = f.wx;
+  Kokkos::parallel_for(
+      "hv_compress", RangePolicy(0, KE * D), KOKKOS_LAMBDA(int i) {
+        const int q = i / D, d = i % D;
+        Net v = gemm ? z_t(q, d) : Net(0);
+        for (int c = 0; c < 4; ++c) v += wx(d, c) * x4_t(q, c);
+        z_t(q, d) = v;
+      });
+  Workspace::Scope s(ws_);
+  View2D a_t = ws_.tmp(KE, D);
+  act_tan(a_t, z, z_t);
+  linear(et_t, a_t, mat("gnn_layers." + std::to_string(L) + ".compress.2.weight"), View1D(), 0);
+}
+
+void PetModel::compress_bwd2(int L, View2D et_adj, View2D et_adj_t, View2D z, View2D z_t, View2D x4_adj,
+                             View2D x4_adj_t, View2D ie_adj, View2D ie_adj_t) {
+  const CompressFold f = compress_fold(L);
+  const int E = z.extent(0), D = z.extent(1), K = z_t.extent(0) / E;
+  Workspace::Scope s(ws_);
   View2D ca = ws_.tmp(E, D), ca_t = ws_.tmp(K * E, D), gz = ws_.tmp(E, D), gz_t = ws_.tmp(K * E, D);
-  const WeightRef w2 = mat(g + ".compress.2.weight");
-  linear_bwd(ca, edge_adj, w2, 0);
-  linear_bwd(ca_t, edge_adj_t, w2, 0);
-  act_bwd2(gz, gz_t, ca, ca_t, sav.cpre, ts.cpre);
+  const WeightRef w2 = mat("gnn_layers." + std::to_string(L) + ".compress.2.weight");
+  linear_bwd(ca, et_adj, w2, 0);
+  linear_bwd(ca_t, et_adj_t, w2, 0);
+  act_bwd2(gz, gz_t, ca, ca_t, z, z_t);
   auto wx = f.wx;
   Kokkos::parallel_for(
       "hv_bw_x4", RangePolicy(0, (K + 1) * E), KOKKOS_LAMBDA(int q) {
         const int t = q / E - 1, k = q % E;
         for (int c = 0; c < 4; ++c) {
-          Net s = Net(0);
-          for (int d = 0; d < D; ++d) s += (t < 0 ? gz(k, d) : gz_t(t * E + k, d)) * wx(d, c);
-          if (t < 0) x4_adj(k, c) += s;
-          else x4_adj_t(t * E + k, c) += s;
+          Net v = Net(0);
+          for (int d = 0; d < D; ++d) v += (t < 0 ? gz(k, d) : gz_t(t * E + k, d)) * wx(d, c);
+          if (t < 0) x4_adj(k, c) += v;
+          else x4_adj_t(t * E + k, c) += v;
         }
       });
   if (f.wi.extent(0) > 0) {
@@ -717,80 +724,182 @@ void PetModel::ff_layer_bwd2(const PackedEdges& pk, int L, const LayerSaves& sav
   }
 }
 
-// The readout's tangents: of the heads' pre-activations, and of the edge
+// Readout layer i's tangents: of the heads' pre-activations, and of the edge
 // predictions, which the cutoff factor's adjoint is.
-void PetModel::readout_tan(const ReadoutSaves& sav, ReadoutTangents& ts, int K, View2D node_t, View2D edge_t) {
-  const int N = sav.nh0[0].extent(0), E = sav.eh0[0].extent(0), Dh = h_.d_head;
-  const std::string nh = "node_heads.energy.0", eh = "edge_heads.energy.0";
-  ts.nh0 = ws_.n2("t_nh0", K * N, Dh), ts.nh1 = ws_.n2("t_nh1", K * N, Dh);
-  ts.eh0 = ws_.n2("t_eh0", K * E, Dh), ts.eh1 = ws_.n2("t_eh1", K * E, Dh), ts.epred = ws_.n2("t_epred", K * E, 1);
+void PetModel::readout_tan(const ReadoutSaves& sav, ReadoutTangents& ts, int i, int K, View2D node_t,
+                           View2D edge_t) {
+  const int N = sav.nh0[i].extent(0), E = sav.eh0[i].extent(0), Dh = h_.d_head, R = sav.nh0.size();
+  const std::string si = std::to_string(i), nh = "node_heads.energy." + si, eh = "edge_heads.energy." + si;
+  for (auto* v : {&ts.nh0, &ts.nh1, &ts.eh0, &ts.eh1, &ts.epred})
+    if ((int) v->size() != R) v->assign(R, View2D());
+  ts.nh0[i] = ws_.n2("t_nh0_" + si, K * N, Dh), ts.nh1[i] = ws_.n2("t_nh1_" + si, K * N, Dh);
+  ts.eh0[i] = ws_.n2("t_eh0_" + si, K * E, Dh), ts.eh1[i] = ws_.n2("t_eh1_" + si, K * E, Dh);
+  ts.epred[i] = ws_.n2("t_epred_" + si, K * E, 1);
   Workspace::Scope s(ws_);
   View2D a = ws_.tmp(K * N, Dh), b = ws_.tmp(K * E, Dh);
-  linear(ts.nh0, node_t, mat(nh + ".0.weight"), View1D(), 0);
-  act_tan(a, sav.nh0[0], ts.nh0);
-  linear(ts.nh1, a, mat(nh + ".2.weight"), View1D(), 0);
-  linear(ts.eh0, edge_t, mat(eh + ".0.weight"), View1D(), 0);
-  act_tan(b, sav.eh0[0], ts.eh0);
-  linear(ts.eh1, b, mat(eh + ".2.weight"), View1D(), 0);
-  act_tan(b, sav.eh1[0], ts.eh1);
-  linear(ts.epred, b, mat("edge_last_layers.energy.0.energy___0.weight"), View1D(), 0);
+  linear(ts.nh0[i], node_t, mat(nh + ".0.weight"), View1D(), 0);
+  act_tan(a, sav.nh0[i], ts.nh0[i]);
+  linear(ts.nh1[i], a, mat(nh + ".2.weight"), View1D(), 0);
+  linear(ts.eh0[i], edge_t, mat(eh + ".0.weight"), View1D(), 0);
+  act_tan(b, sav.eh0[i], ts.eh0[i]);
+  linear(ts.eh1[i], b, mat(eh + ".2.weight"), View1D(), 0);
+  act_tan(b, sav.eh1[i], ts.eh1[i]);
+  linear(ts.epred[i], b, mat("edge_last_layers.energy." + si + ".energy___0.weight"), View1D(), 0);
 }
 
-void PetModel::readout_bwd2(const ReadoutSaves& sav, const ReadoutTangents& ts, const PackedEdges& pk, int K,
-                            View1D cut_t, View2D node_adj, View2D node_adj_t, View2D edge_adj, View2D edge_adj_t,
-                            View1D cutoff_adj, View1D cutoff_adj_t) {
+void PetModel::readout_bwd2(const ReadoutSaves& sav, const ReadoutTangents& ts, int i, const PackedEdges& pk,
+                            int K, View1D cut_t, View2D node_adj, View2D node_adj_t, View2D edge_adj,
+                            View2D edge_adj_t, View1D cutoff_adj, View1D cutoff_adj_t, bool acc) {
   const int N = node_adj.extent(0), E = pk.E, Dh = h_.d_head;
   Workspace::Scope s(ws_);
   View2D npa = ws_.tmp(N, 1), epa = ws_.tmp(E, 1), epa_t = ws_.tmp(K * E, 1);
   auto cut = pk.cut;
-  auto epred = sav.epred[0], epred_t = ts.epred;
+  auto epred = sav.epred[i], epred_t = ts.epred[i];
   Kokkos::parallel_for("hv_ro_n", RangePolicy(0, N), KOKKOS_LAMBDA(int n) { npa(n, 0) = Net(1); });
   Kokkos::parallel_for(
       "hv_ro_e", RangePolicy(0, (K + 1) * E), KOKKOS_LAMBDA(int q) {
         const int t = q / E - 1, k = q % E;
-        if (t < 0) epa(k, 0) = cut(k), cutoff_adj(k) = epred(k, 0);
-        else epa_t(t * E + k, 0) = cut_t(t * E + k), cutoff_adj_t(t * E + k) = epred_t(t * E + k, 0);
+        if (t < 0) {
+          epa(k, 0) = cut(k);
+          cutoff_adj(k) = (acc ? cutoff_adj(k) : Net(0)) + epred(k, 0);
+        } else {
+          const int tk = t * E + k;
+          epa_t(tk, 0) = cut_t(tk);
+          cutoff_adj_t(tk) = (acc ? cutoff_adj_t(tk) : Net(0)) + epred_t(tk, 0);
+        }
       });
-  const std::string nh = "node_heads.energy.0", eh = "edge_heads.energy.0";
+  const std::string si = std::to_string(i), nh = "node_heads.energy." + si, eh = "edge_heads.energy." + si;
   // node: the seed is constant, so the tangents start at the activations'.
   View2D a1 = ws_.tmp(N, Dh), g1 = ws_.tmp(N, Dh), g1_t = ws_.tmp(K * N, Dh);
-  linear_bwd(a1, npa, mat("node_last_layers.energy.0.energy___0.weight"), 0);
-  act_bwd2(g1, g1_t, a1, View2D(), sav.nh1[0], ts.nh1);
+  linear_bwd(a1, npa, mat("node_last_layers.energy." + si + ".energy___0.weight"), 0);
+  act_bwd2(g1, g1_t, a1, View2D(), sav.nh1[i], ts.nh1[i]);
   View2D a0 = ws_.tmp(N, Dh), a0_t = ws_.tmp(K * N, Dh), g0 = ws_.tmp(N, Dh), g0_t = ws_.tmp(K * N, Dh);
   linear_bwd(a0, g1, mat(nh + ".2.weight"), 0);
   linear_bwd(a0_t, g1_t, mat(nh + ".2.weight"), 0);
-  act_bwd2(g0, g0_t, a0, a0_t, sav.nh0[0], ts.nh0);
+  act_bwd2(g0, g0_t, a0, a0_t, sav.nh0[i], ts.nh0[i]);
   linear_bwd(node_adj, g0, mat(nh + ".0.weight"), 0);
   linear_bwd(node_adj_t, g0_t, mat(nh + ".0.weight"), 0);
   // edges: the seed is the cutoff factor, whose tangent enters here.
   View2D b1 = ws_.tmp(E, Dh), b1_t = ws_.tmp(K * E, Dh), h1 = ws_.tmp(E, Dh), h1_t = ws_.tmp(K * E, Dh);
-  const WeightRef wl = mat("edge_last_layers.energy.0.energy___0.weight");
+  const WeightRef wl = mat("edge_last_layers.energy." + si + ".energy___0.weight");
   linear_bwd(b1, epa, wl, 0);
   linear_bwd(b1_t, epa_t, wl, 0);
-  act_bwd2(h1, h1_t, b1, b1_t, sav.eh1[0], ts.eh1);
+  act_bwd2(h1, h1_t, b1, b1_t, sav.eh1[i], ts.eh1[i]);
   View2D b0 = ws_.tmp(E, Dh), b0_t = ws_.tmp(K * E, Dh), h0 = ws_.tmp(E, Dh), h0_t = ws_.tmp(K * E, Dh);
   linear_bwd(b0, h1, mat(eh + ".2.weight"), 0);
   linear_bwd(b0_t, h1_t, mat(eh + ".2.weight"), 0);
-  act_bwd2(h0, h0_t, b0, b0_t, sav.eh0[0], ts.eh0);
+  act_bwd2(h0, h0_t, b0, b0_t, sav.eh0[i], ts.eh0[i]);
   linear_bwd(edge_adj, h0, mat(eh + ".0.weight"), 0);
   linear_bwd(edge_adj_t, h0_t, mat(eh + ".0.weight"), 0);
+}
+
+// ---- the residual featurizer ----------------------------------------------------------
+//
+// tokens = [species embedding ; compress(input_edge, geometry)], then per block
+// (PostLN) s1 = tokens + attention(tokens), tok_a = norm(s1), s2 = tok_a +
+// mlp(tok_a), tokens = norm(s2). Tangents stacked as [K T, D] token rows; the
+// atom rows' embedding is constant.
+
+void PetModel::residual_layer_tan(const PackedEdges& pk, int L, const ResidualSaves& sav, ResidualTangents& ts,
+                                  int K, View2D ie_t, View2D tokens_t, View2D x4_t, View2D cf, View2D cf_t) {
+  const int N = cf.extent(0), S = cf.extent(1), E = pk.E, D = h_.d_pet, A = h_.num_attention_layers, T = N + E;
+  const std::string g = "gnn_layers." + std::to_string(L), tag = "hr" + std::to_string(L);
+  const bool ln = h_.normalization == Normalization::LayerNorm;
+  const AttnShape as{Tokens{pk.off, N, false}, N, S, h_.num_heads, h_.head_dim, T,
+                     Net(1.0 / (Kokkos::sqrt((double) h_.head_dim) * h_.attention_temperature))};
+  for (auto* v : {&ts.qkv, &ts.pre, &ts.s1, &ts.s2}) v->assign(A, View2D());
+  auto keep = [&](const std::string& name, int a, int r, int c) {
+    return ws_.n2("t_" + name + std::to_string(a) + "_" + tag, K * r, c);
+  };
+  Workspace::Scope layer_scope(ws_);
+  ts.cpre = keep("cpre", -1, E, D);
+  {
+    Workspace::Scope s(ws_);
+    View2D et_t = ws_.tmp(K * E, D);
+    compress_tan(ts.cpre, et_t, L, sav.cpre, ie_t, x4_t);
+    Kokkos::parallel_for(
+        "hv_r_tokens", RangePolicy(0, K * T * D), KOKKOS_LAMBDA(int i) {
+          const int q = i / D, d = i % D, t = q / T, r = q % T;
+          tokens_t(q, d) = r < N ? Net(0) : et_t(t * E + r - N, d);
+        });
+  }
+  for (int a = 0; a < A; ++a) {
+    const std::string tl = g + ".trans.layers." + std::to_string(a);
+    Workspace::Scope s(ws_);
+    View2D qkv = ts.qkv[a] = keep("qkv", a, T, 3 * D), s1 = ts.s1[a] = keep("s1", a, T, D);
+    View2D s2 = ts.s2[a] = keep("s2", a, T, D), pre = ts.pre[a] = keep("pre", a, T, sav.pre[a].extent(1));
+    linear(qkv, tokens_t, mat(tl + ".attention.input_linear.weight"), View1D(), 0);
+    View2D merged = ws_.tmp(K * T, D);
+    attn_tan(merged, sav.qkv[a], qkv, cf, cf_t, as, K);
+    Kokkos::deep_copy(ExecSpace(), s1, tokens_t);
+    linear(s1, merged, mat(tl + ".attention.output_linear.weight"), View1D(), 1);
+    View2D tok_a = ws_.tmp(K * T, D);
+    norm_tan(tok_a, sav.s1[a], s1, vec(tl + ".norm_attention.weight"), ln);
+    Kokkos::deep_copy(ExecSpace(), s2, tok_a);
+    feedforward_tan(s2, tok_a, tl + ".mlp", sav.pre[a], pre, 1);
+    norm_tan(tokens_t, sav.s2[a], s2, vec(tl + ".norm_mlp.weight"), ln);
+  }
+}
+
+// tokens_adj (+_t): the adjoint of the layer's output tokens, turned into that of
+// its input tokens; then the edge rows go back through compress onto x4_adj and
+// ie_adj (+_t), the adjoint of the layer's input_edge.
+void PetModel::residual_layer_bwd2(const PackedEdges& pk, int L, const ResidualSaves& sav,
+                                   const ResidualTangents& ts, int K, View2D cf, View2D cf_t, View2D tokens_adj,
+                                   View2D tokens_adj_t, View2D ie_adj, View2D ie_adj_t, View2D x4_adj,
+                                   View2D x4_adj_t, View2D cf_adj, View2D cf_adj_t) {
+  const int N = cf.extent(0), S = cf.extent(1), E = pk.E, D = h_.d_pet, A = h_.num_attention_layers, T = N + E;
+  const std::string g = "gnn_layers." + std::to_string(L);
+  const bool ln = h_.normalization == Normalization::LayerNorm;
+  const AttnShape as{Tokens{pk.off, N, false}, N, S, h_.num_heads, h_.head_dim, T,
+                     Net(1.0 / (Kokkos::sqrt((double) h_.head_dim) * h_.attention_temperature))};
+  Workspace::Scope layer_scope(ws_);
+  for (int a = A - 1; a >= 0; --a) {
+    const std::string tl = g + ".trans.layers." + std::to_string(a);
+    Workspace::Scope s(ws_);
+    // tokens = norm(s2), s2 = tok_a + mlp(tok_a)
+    View2D s2a = ws_.tmp(T, D), s2a_t = ws_.tmp(K * T, D), ta = ws_.tmp(T, D), ta_t = ws_.tmp(K * T, D);
+    norm_bwd2(s2a, s2a_t, tokens_adj, tokens_adj_t, sav.s2[a], ts.s2[a], vec(tl + ".norm_mlp.weight"), ln, false);
+    Kokkos::deep_copy(ExecSpace(), ta, s2a);
+    Kokkos::deep_copy(ExecSpace(), ta_t, s2a_t);
+    feedforward_bwd2(ta, ta_t, s2a, s2a_t, tl + ".mlp", sav.pre[a], ts.pre[a], 1);
+    // tok_a = norm(s1), s1 = tokens_in + attention(tokens_in)
+    norm_bwd2(tokens_adj, tokens_adj_t, ta, ta_t, sav.s1[a], ts.s1[a], vec(tl + ".norm_attention.weight"), ln,
+              false);
+    const WeightRef wo = mat(tl + ".attention.output_linear.weight"), wi = mat(tl + ".attention.input_linear.weight");
+    View2D dm = ws_.tmp(T, D), dm_t = ws_.tmp(K * T, D);
+    linear_bwd(dm, tokens_adj, wo, 0);
+    linear_bwd(dm_t, tokens_adj_t, wo, 0);
+    View2D qa = ws_.tmp(T, 3 * D), qa_t = ws_.tmp(K * T, 3 * D), stats = ws_.tmp(K * N * h_.num_heads * S, 5);
+    attn_bwd2(qa, qa_t, cf_adj, cf_adj_t, dm, dm_t, sav.qkv[a], ts.qkv[a], cf, cf_t, stats, as, K);
+    linear_bwd(tokens_adj, qa, wi, 1);
+    linear_bwd(tokens_adj_t, qa_t, wi, 1);
+  }
+  View2D et = ws_.tmp(E, D), et_t = ws_.tmp(K * E, D);
+  Kokkos::parallel_for(
+      "hv_r_et", RangePolicy(0, (K + 1) * E * D), KOKKOS_LAMBDA(int i) {
+        const int q = i / D, d = i % D, t = q / E - 1, k = q % E;
+        if (t < 0) et(k, d) = tokens_adj(N + k, d);
+        else et_t(t * E + k, d) = tokens_adj_t(t * T + N + k, d);
+      });
+  compress_bwd2(L, et, et_t, sav.cpre, ts.cpre, x4_adj, x4_adj_t, ie_adj, ie_adj_t);
 }
 
 // ---- the whole product --------------------------------------------------------------
 
 HvpOut PetModel::hvp(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
-  if (h_.featurizer_type != FeaturizerType::FeedForward)
-    throw std::runtime_error("pet: the Hessian-vector product supports the feedforward featurizer only (so far)");
-  if (h_.adaptive() && h_.adaptive_cutoff_method != AdaptiveCutoffMethod::Solver)
-    throw std::runtime_error("pet: the Hessian-vector product supports the solver adaptive cutoff only (so far)");
-  if (h_.num_readout_layers != 1 || dev.exchange || dev.n_struct != 1 || dev.edge_capacity || dev.padded ||
-      (dev.n_local >= 0 && dev.n_local != dev.n_atoms) || dev.centres() != dev.n_atoms)
+  if ((h_.featurizer_type == FeaturizerType::FeedForward && h_.num_readout_layers != 1) || dev.exchange ||
+      dev.n_struct != 1 || dev.edge_capacity || dev.padded || (dev.n_local >= 0 && dev.n_local != dev.n_atoms) ||
+      dev.centres() != dev.n_atoms)
     throw std::runtime_error("pet: the Hessian-vector product takes one whole structure");
   const int R = dev.n_raw;
   if ((int) dev.raw_slot.extent(0) != R || (int) vdot_raw.extent(0) != K * R)
     throw std::runtime_error("pet: the Hessian-vector product needs the raw list's slots and K tangents per raw edge");
-  if (h_.adaptive() && ((int) dev.raw_off.extent(0) != dev.n_atoms + 1 || (int) dev.adapt_r.extent(0) != dev.n_atoms))
-    throw std::runtime_error("pet: the Hessian-vector product needs the raw list grouped by centre, and the solver's roots");
+  const bool solver = h_.adaptive_cutoff_method == AdaptiveCutoffMethod::Solver;
+  if (h_.adaptive() && ((int) dev.raw_off.extent(0) != dev.n_atoms + 1 ||
+                        (solver && (int) dev.adapt_r.extent(0) != dev.n_atoms) || (!solver && n_probes_ < 2)))
+    throw std::runtime_error(
+        "pet: the Hessian-vector product needs the raw list grouped by centre, and the solver's roots");
 
   const int N = dev.n_atoms, S = dev.max_neighbors + 1, D = h_.d_pet, Dn = h_.d_node, G = h_.num_gnn_layers;
   Workspace::Scope scope(ws_);
@@ -822,20 +931,92 @@ HvpOut PetModel::hvp(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
         ddot(q) = d > 0.0 ? (rvec(e, 0) * vdot_raw(q, 0) + rvec(e, 1) * vdot_raw(q, 1) + rvec(e, 2) * vdot_raw(q, 2)) / d
                           : 0.0;
       });
-  // An atom's cutoff c(d): c' = sum over its raw edges of dc/dd d', dc/dd = -n_d / n_r
-  // at the root (0 when clamped).
-  Kokkos::parallel_for(
-      "hv_rcdot", RangePolicy(0, K * N), KOKKOS_LAMBDA(int q) {
-        const int t = q / N, a = q % N;
-        double s = 0.0;
-        if (adaptive && adn(a) > 0.0)
-          for (int e = roff(a); e < roff(a + 1); ++e) {
-            double f1, f2;
-            cut_derivs(rdist(e), ar(a), wad, true, f1, f2);
-            s += -f1 / adn(a) * ddot(t * R + e);
+  // An atom's cutoff c(d) and its tangent c'. The solver's: c' = sum over its raw
+  // edges of dc/dd d', dc/dd = -n_d / n_r at the root (0 when clamped).
+  const int P = n_probes_;
+  auto probes = probes_;
+  RView2D geff, gdiff, ggrad, gsgn, gw, gdt, gwt;
+  RView1D gc;
+  if (adaptive && solver) {
+    Kokkos::parallel_for(
+        "hv_rcdot", RangePolicy(0, K * N), KOKKOS_LAMBDA(int q) {
+          const int t = q / N, a = q % N;
+          double s = 0.0;
+          if (adn(a) > 0.0)
+            for (int e = roff(a); e < roff(a + 1); ++e) {
+              double f1, f2;
+              cut_derivs(rdist(e), ar(a), wad, true, f1, f2);
+              s += -f1 / adn(a) * ddot(t * R + e);
+            }
+          rcdot(q) = s;
+        });
+  } else if (adaptive) {
+    // The grid's: eff_p = sum_e bump(d_e, probe p), diff = eff - target + target
+    // (p/(P-1))^3, grad = |gradient(diff)| (clamped at 1e-12, sign gsgn), u =
+    // -(diff/grad)^2 / 2, w = softmax(u), c = sum_p probe_p w_p; and along each
+    // direction eff' = sum_e f1 d', grad' = gsgn gradient(eff'), u' = -r r' with r =
+    // diff/grad, w' = w (u' - sum w u'), c' = sum_p probe_p w'_p.
+    geff = ws_.r2("hv:geff", N, P), gdiff = ws_.r2("hv:gdiff", N, P), ggrad = ws_.r2("hv:ggrad", N, P);
+    gsgn = ws_.r2("hv:gsgn", N, P), gw = ws_.r2("hv:gw", N, P), gc = ws_.r1("hv:gc", N);
+    gdt = ws_.r2("hv:gdt", K * N, P), gwt = ws_.r2("hv:gwt", K * N, P);
+    auto eff = geff, diff = gdiff, grad = ggrad, sgn = gsgn, w = gw, dt = gdt, wt = gwt;
+    auto c = gc;
+    Kokkos::parallel_for(
+        "hv_grid", RangePolicy(0, N), KOKKOS_LAMBDA(int a) {
+          for (int p = 0; p < P; ++p) {
+            double sum = 0.0;
+            for (int e = roff(a); e < roff(a + 1); ++e) sum += detail::dev_bump_cutoff(rdist(e), probes(p), wad);
+            eff(a, p) = sum;
+            const double x = (double) p / (P - 1);
+            diff(a, p) = sum - target + target * x * x * x;
           }
-        rcdot(q) = s;
-      });
+          double mx = -1e300;
+          for (int p = 0; p < P; ++p) {
+            const double g = p == 0 ? diff(a, 1) - diff(a, 0)
+                             : p == P - 1 ? diff(a, P - 1) - diff(a, P - 2)
+                                          : 0.5 * (diff(a, p + 1) - diff(a, p - 1));
+            const double ag = Kokkos::fabs(g);
+            grad(a, p) = ag > 1e-12 ? ag : 1e-12;
+            sgn(a, p) = ag >= 1e-12 ? (g > 0.0 ? 1.0 : (g < 0.0 ? -1.0 : 0.0)) : 0.0;
+            const double r = diff(a, p) / grad(a, p);
+            w(a, p) = -0.5 * r * r;
+            if (w(a, p) > mx) mx = w(a, p);
+          }
+          double sum = 0.0, cs = 0.0;
+          for (int p = 0; p < P; ++p) sum += (w(a, p) = Kokkos::exp(w(a, p) - mx));
+          for (int p = 0; p < P; ++p) cs += probes(p) * (w(a, p) /= sum);
+          c(a) = cs;
+        });
+    Kokkos::parallel_for(
+        "hv_grid_t", RangePolicy(0, K * N), KOKKOS_LAMBDA(int q) {
+          const int t = q / N, a = q % N;
+          const double p0 = probes(0), dp = probes(1) - probes(0);
+          for (int p = 0; p < P; ++p) dt(q, p) = 0.0;
+          for (int e = roff(a); e < roff(a + 1); ++e) {
+            const double d = rdist(e), dd = ddot(t * R + e);
+            const int lo = Kokkos::max((int) Kokkos::floor((d - p0) / dp), 0);
+            const int hi = Kokkos::min((int) Kokkos::ceil((d + wad - p0) / dp) + 1, P);
+            for (int p = lo; p < hi; ++p) {
+              double f1, f2;
+              cut_derivs(d, probes(p), wad, true, f1, f2);
+              dt(q, p) += f1 * dd;
+            }
+          }
+          double ubar = 0.0;
+          for (int p = 0; p < P; ++p) {
+            const double gtp = sgn(a, p) * (p == 0 ? dt(q, 1) - dt(q, 0)
+                                            : p == P - 1 ? dt(q, P - 1) - dt(q, P - 2)
+                                                         : 0.5 * (dt(q, p + 1) - dt(q, p - 1)));
+            const double gd = grad(a, p), r = diff(a, p) / gd;
+            const double rt = dt(q, p) / gd - diff(a, p) * gtp / (gd * gd);
+            wt(q, p) = -r * rt;  // u' for now
+            ubar += w(a, p) * wt(q, p);
+          }
+          double ct = 0.0;
+          for (int p = 0; p < P; ++p) ct += probes(p) * (wt(q, p) = w(a, p) * (wt(q, p) - ubar));
+          rcdot(q) = ct;
+        });
+  }
   View2D x4_t = ws_.n2("hv:x4_t", K * E, 4), cf_t = ws_.n2("hv:cf_t", K * N, S);
   View1D cut_t = ws_.n1("hv:cut_t", K * E);
   Kokkos::deep_copy(ExecSpace(), cf_t, Net(0));
@@ -854,38 +1035,124 @@ HvpOut PetModel::hvp(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
         cf_t(t * N + n, 1 + k - off(n)) = cut_t(q);
       });
 
-  // ---- the network: the forward with every save, and its tangents layer by layer
-  View2D node = ws_.n2("node", N, Dn), input_edge = ws_.n2("input_edge", E, D);
-  gather(node, mat("node_embedders.0.weight").v, dev.species);
-  gather(input_edge, mat("edge_embedder.weight").v, pk.species);
-  const View2D cond = conditioning(dev);
-  View2D node_t = ws_.n2("hv:node_t", K * N, Dn), ie_t = ws_.n2("hv:ie_t", K * E, D);
-  Kokkos::deep_copy(ExecSpace(), node_t, Net(0));
-  Kokkos::deep_copy(ExecSpace(), ie_t, Net(0));
-  std::vector<LayerSaves> sav(G);
-  std::vector<LayerTangents> tan(G);
-  for (int L = 0; L < G; ++L) {
-    sav[L].tag = std::to_string(L);
-    ff_layer(dev, pk, L, node, input_edge, cond, &sav[L], true);
-    ff_layer_tan(pk, L, sav[L], tan[L], K, node_t, ie_t, x4_t, cf_seq, cf_t);
-  }
-  View1D net = ws_.n1("per_atom_net", N);
-  ReadoutSaves rs;
-  readout({node}, {input_edge}, View2D(net.data(), N, 1), pk, &rs, "", "energy");
-  ReadoutTangents rt;
-  readout_tan(rs, rt, K, node_t, ie_t);
-
-  // ---- the backward, adjoints and their tangents together
+  // ---- the network: the forward with every save and its tangents, then the
+  // backward with the adjoints' tangents, leaving x4_adj, cutoff_adj and cf_adj
   View2D x4_adj = ws_.n2("x4_adj", E, 4), x4_adj_t = ws_.n2("hv:x4_adj_t", K * E, 4);
   View2D cf_adj = ws_.n2("cf_seq_adj", N, S), cf_adj_t = ws_.n2("hv:cf_adj_t", K * N, S);
   for (auto v : {x4_adj, x4_adj_t, cf_adj, cf_adj_t}) Kokkos::deep_copy(ExecSpace(), v, Net(0));
-  View2D node_adj = ws_.n2("node_adj", N, Dn), node_adj_t = ws_.n2("hv:node_adj_t", K * N, Dn);
-  View2D ie_adj = ws_.n2("ie_adj", E, D), ie_adj_t = ws_.n2("hv:ie_adj_t", K * E, D);
   View1D cutoff_adj = ws_.n1("cutoff_adj", E), cutoff_adj_t = ws_.n1("hv:cutoff_adj_t", K * E);
-  readout_bwd2(rs, rt, pk, K, cut_t, node_adj, node_adj_t, ie_adj, ie_adj_t, cutoff_adj, cutoff_adj_t);
-  for (int L = G - 1; L >= 0; --L)
-    ff_layer_bwd2(pk, L, sav[L], tan[L], K, cf_seq, cf_t, node_adj, node_adj_t, ie_adj, ie_adj_t, x4_adj, x4_adj_t,
-                  cf_adj, cf_adj_t);
+  const View2D cond = conditioning(dev);
+  View1D net = ws_.n1("per_atom_net", N);
+  ReadoutSaves rs;
+  ReadoutTangents rt;
+  View2D ie_t = ws_.n2("hv:ie_t", K * E, D);
+  Kokkos::deep_copy(ExecSpace(), ie_t, Net(0));
+  if (h_.featurizer_type == FeaturizerType::FeedForward) {
+    View2D node = ws_.n2("node", N, Dn), input_edge = ws_.n2("input_edge", E, D);
+    gather(node, mat("node_embedders.0.weight").v, dev.species);
+    gather(input_edge, mat("edge_embedder.weight").v, pk.species);
+    View2D node_t = ws_.n2("hv:node_t", K * N, Dn);
+    Kokkos::deep_copy(ExecSpace(), node_t, Net(0));
+    std::vector<LayerSaves> sav(G);
+    std::vector<LayerTangents> tan(G);
+    for (int L = 0; L < G; ++L) {
+      sav[L].tag = std::to_string(L);
+      ff_layer(dev, pk, L, node, input_edge, cond, &sav[L], true);
+      ff_layer_tan(pk, L, sav[L], tan[L], K, node_t, ie_t, x4_t, cf_seq, cf_t);
+    }
+    readout({node}, {input_edge}, View2D(net.data(), N, 1), pk, &rs, "", "energy");
+    readout_tan(rs, rt, 0, K, node_t, ie_t);
+    View2D node_adj = ws_.n2("node_adj", N, Dn), node_adj_t = ws_.n2("hv:node_adj_t", K * N, Dn);
+    View2D ie_adj = ws_.n2("ie_adj", E, D), ie_adj_t = ws_.n2("hv:ie_adj_t", K * E, D);
+    readout_bwd2(rs, rt, 0, pk, K, cut_t, node_adj, node_adj_t, ie_adj, ie_adj_t, cutoff_adj, cutoff_adj_t, false);
+    for (int L = G - 1; L >= 0; --L)
+      ff_layer_bwd2(pk, L, sav[L], tan[L], K, cf_seq, cf_t, node_adj, node_adj_t, ie_adj, ie_adj_t, x4_adj,
+                    x4_adj_t, cf_adj, cf_adj_t);
+  } else {
+    const int T = N + E, RL = h_.num_readout_layers;
+    View2D input_edge = ws_.n2("re_input_edge", E, D);
+    gather(input_edge, mat("edge_embedder.weight").v, pk.species);
+    std::vector<ResidualSaves> sav(G);
+    std::vector<ResidualTangents> tan(G);
+    std::vector<View2D> tokens(G), tokens_t(G), node_feat(G), edge_feat(G);
+    for (int L = 0; L < G; ++L) {
+      const std::string ls = std::to_string(L);
+      sav[L].tag = ls;
+      tokens[L] = ws_.n2("re_tokens_" + ls, T, D);
+      tokens_t[L] = ws_.n2("hv:tokens_t_" + ls, K * T, D);
+      node_feat[L] = View2D(tokens[L].data(), N, D);
+      edge_feat[L] = View2D(tokens[L].data() + std::size_t(N) * D, E, D);
+      residual_layer(dev, pk, L, input_edge, tokens[L], &sav[L], true);
+      residual_layer_tan(pk, L, sav[L], tan[L], K, ie_t, tokens_t[L], x4_t, cf_seq, cf_t);
+      View2D node_out = node_feat[L];
+      if (cond.extent(0) == (std::size_t) N)
+        Kokkos::parallel_for(
+            "hv_r_cond", RangePolicy(0, N * D), KOKKOS_LAMBDA(int i) { node_out(i / D, i % D) += cond(i / D, i % D); });
+      if (L + 1 < G) {  // input_edge = (input_edge + out_edge of the reverse) / 2, and its tangent
+        View2D tk = tokens[L], tkt = tokens_t[L];
+        Kokkos::parallel_for(
+            "hv_r_msg", RangePolicy(0, (K + 1) * E * D), KOKKOS_LAMBDA(int i) {
+              const int q = i / D, d = i % D, t = q / E - 1, k = q % E, r = rev(k);
+              if (t < 0) input_edge(k, d) = Net(0.5) * (input_edge(k, d) + (r >= 0 ? tk(N + r, d) : Net(0)));
+              else
+                ie_t(t * E + k, d) =
+                    Net(0.5) * (ie_t(t * E + k, d) + (r >= 0 ? tkt(t * T + N + r, d) : Net(0)));
+            });
+      }
+    }
+    readout(node_feat, edge_feat, View2D(net.data(), N, 1), pk, &rs, "re_", "energy");
+    // per readout layer: its tokens' tangents as [K N] node and [K E] edge rows,
+    // and back the same way for the adjoints
+    std::vector<View2D> tok_adj(G), tok_adj_t(G);
+    for (int L = 0; L < G; ++L) {
+      tok_adj[L] = ws_.n2("hv:tok_adj_" + std::to_string(L), T, D);
+      tok_adj_t[L] = ws_.n2("hv:tok_adj_t_" + std::to_string(L), K * T, D);
+      Kokkos::deep_copy(ExecSpace(), tok_adj[L], Net(0));
+      Kokkos::deep_copy(ExecSpace(), tok_adj_t[L], Net(0));
+    }
+    for (int i = 0; i < RL; ++i) {
+      Workspace::Scope s(ws_);
+      View2D nt = ws_.tmp(K * N, D), et = ws_.tmp(K * E, D), tt = tokens_t[i];
+      Kokkos::parallel_for(
+          "hv_r_ro_split", RangePolicy(0, K * T * D), KOKKOS_LAMBDA(int j) {
+            const int q = j / D, d = j % D, t = q / T, r = q % T;
+            if (r < N) nt(t * N + r, d) = tt(q, d);
+            else et(t * E + r - N, d) = tt(q, d);
+          });
+      readout_tan(rs, rt, i, K, nt, et);
+      View2D na = ws_.tmp(N, D), na_t = ws_.tmp(K * N, D), ea = ws_.tmp(E, D), ea_t = ws_.tmp(K * E, D);
+      readout_bwd2(rs, rt, i, pk, K, cut_t, na, na_t, ea, ea_t, cutoff_adj, cutoff_adj_t, i > 0);
+      View2D ta = tok_adj[i], tat = tok_adj_t[i];
+      Kokkos::parallel_for(
+          "hv_r_ro_join", RangePolicy(0, (K + 1) * T * D), KOKKOS_LAMBDA(int j) {
+            const int q = j / D, d = j % D, t = q / T - 1, r = q % T;
+            if (t < 0) ta(r, d) = r < N ? na(r, d) : ea(r - N, d);
+            else tat(t * T + r, d) = r < N ? na_t(t * N + r, d) : ea_t(t * E + r - N, d);
+          });
+    }
+    // ie_adj: the adjoint of the next layer's input_edge, zero past the last
+    View2D ie_adj = ws_.n2("hv:r_ie_adj", E, D), ie_adj_t = ws_.n2("hv:r_ie_adj_t", K * E, D);
+    for (int L = G - 1; L >= 0; --L) {
+      View2D ta = tok_adj[L], tat = tok_adj_t[L];
+      View2D ie_next = ws_.n2("hv:r_ie_" + std::to_string(L % 2), E, D);
+      View2D ie_next_t = ws_.n2("hv:r_ie_t_" + std::to_string(L % 2), K * E, D);
+      const bool msg = L + 1 < G;
+      Kokkos::parallel_for(
+          "hv_r_msg_bwd", RangePolicy(0, (K + 1) * E * D), KOKKOS_LAMBDA(int i) {
+            const int q = i / D, d = i % D, t = q / E - 1, k = q % E, r = rev(k);
+            if (t < 0) {
+              if (msg && r >= 0) ta(N + k, d) += Net(0.5) * ie_adj(r, d);
+              ie_next(k, d) = msg ? Net(0.5) * ie_adj(k, d) : Net(0);
+            } else {
+              if (msg && r >= 0) tat(t * T + N + k, d) += Net(0.5) * ie_adj_t(t * E + r, d);
+              ie_next_t(t * E + k, d) = msg ? Net(0.5) * ie_adj_t(t * E + k, d) : Net(0);
+            }
+          });
+      residual_layer_bwd2(pk, L, sav[L], tan[L], K, cf_seq, cf_t, ta, tat, ie_next, ie_next_t, x4_adj, x4_adj_t,
+                          cf_adj, cf_adj_t);
+      ie_adj = ie_next, ie_adj_t = ie_next_t;
+    }
+  }
 
   // ---- the geometry: dE/dv per raw edge and its tangents
   //   T = cutoff_adj + cf_adj (the factor's adjoint), dist_adj = x4_adj[3] + T f1,
@@ -940,40 +1207,104 @@ HvpOut PetModel::hvp(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
           if (t < 0) A(a) = s;
           else A_t(t * N + a) = s;
         });
-    Kokkos::parallel_for(
-        "hv_nr_t", RangePolicy(0, K * N), KOKKOS_LAMBDA(int q) {
-          const int t = q / N, a = q % N;
-          if (adn(a) <= 0.0) return (void) (nr_t(q) = 0.0);
-          const double r = ar(a), rt = rcdot(q);
-          double s = 6.0 * target * r / (rmax * rmax * rmax) * rt;
-          for (int e = roff(a); e < roff(a + 1); ++e) {
+    if (solver) {
+      Kokkos::parallel_for(
+          "hv_nr_t", RangePolicy(0, K * N), KOKKOS_LAMBDA(int q) {
+            const int t = q / N, a = q % N;
+            if (adn(a) <= 0.0) return (void) (nr_t(q) = 0.0);
+            const double r = ar(a), rt = rcdot(q);
+            double s = 6.0 * target * r / (rmax * rmax * rmax) * rt;
+            for (int e = roff(a); e < roff(a + 1); ++e) {
+              double f1, f2;
+              cut_derivs(rdist(e), r, wad, true, f1, f2);
+              s += f2 * (rt - ddot(t * R + e));
+            }
+            nr_t(q) = s;
+          });
+      Kokkos::parallel_for(
+          "hv_adaptive_g", RangePolicy(0, (K + 1) * R), KOKKOS_LAMBDA(int q) {
+            const int t = q / R - 1, e = q % R, c = rcen(e);
+            const double nr = adn(c), d = rdist(e);
+            if (nr <= 0.0 || d <= 0.0) return;
             double f1, f2;
-            cut_derivs(rdist(e), r, wad, true, f1, f2);
-            s += f2 * (rt - ddot(t * R + e));
-          }
-          nr_t(q) = s;
-        });
-    Kokkos::parallel_for(
-        "hv_adaptive_g", RangePolicy(0, (K + 1) * R), KOKKOS_LAMBDA(int q) {
-          const int t = q / R - 1, e = q % R, c = rcen(e);
-          const double nr = adn(c), d = rdist(e);
-          if (nr <= 0.0 || d <= 0.0) return;
-          double f1, f2;
-          cut_derivs(d, ar(c), wad, true, f1, f2);
-          const double qe = -f1 / nr, invd = 1.0 / d;
-          if (t < 0) {
-            for (int x = 0; x < 3; ++x) g(e, x) += scale * A(c) * qe * rvec(e, x) * invd;
-            return;
-          }
-          const int tn = t * N + c;
-          const double dd = ddot(t * R + e);
-          const double qt = -f2 * (dd - rcdot(tn)) / nr + f1 * nr_t(tn) / (nr * nr);
-          for (int x = 0; x < 3; ++x) {
-            const double vt = vdot_raw(t * R + e, x);
-            g_t(t * R + e, x) += scale * (A_t(tn) * qe * rvec(e, x) * invd + A(c) * qt * rvec(e, x) * invd +
-                                          A(c) * qe * (vt * invd - rvec(e, x) * dd * invd * invd));
-          }
-        });
+            cut_derivs(d, ar(c), wad, true, f1, f2);
+            const double qe = -f1 / nr, invd = 1.0 / d;
+            if (t < 0) {
+              for (int x = 0; x < 3; ++x) g(e, x) += scale * A(c) * qe * rvec(e, x) * invd;
+              return;
+            }
+            const int tn = t * N + c;
+            const double dd = ddot(t * R + e);
+            const double qt = -f2 * (dd - rcdot(tn)) / nr + f1 * nr_t(tn) / (nr * nr);
+            for (int x = 0; x < 3; ++x) {
+              const double vt = vdot_raw(t * R + e, x);
+              g_t(t * R + e, x) += scale * (A_t(tn) * qe * rvec(e, x) * invd + A(c) * qt * rvec(e, x) * invd +
+                                            A(c) * qe * (vt * invd - rvec(e, x) * dd * invd * invd));
+            }
+          });
+    } else {
+      // The grid's backward, as forces.cpp's: per probe A_p = A w_p (probe_p - c),
+      // diff_adj = A_p (-diff/grad^2) + gradient^T(Cq), Cq = A_p gsgn diff^2/grad^3,
+      // then per raw edge gmag = scale sum_p diff_adj f1(d, probe_p) / d; and each one's
+      // tangent.
+      auto diff = gdiff, grad = ggrad, sgn = gsgn, w = gw, dt = gdt, wt = gwt;
+      auto c = gc;
+      RView2D da = ws_.r2("hv:gda", (K + 1) * N, P), cq = ws_.r2("hv:gcq", (K + 1) * N, P);
+      Kokkos::parallel_for(
+          "hv_grid_adj", RangePolicy(0, (K + 1) * N), KOKKOS_LAMBDA(int q) {
+            const int t = q / N - 1, a = q % N, tq = t * N + a;
+            for (int p = 0; p < P; ++p) {
+              const double gd = grad(a, p), df = diff(a, p), Ap = A(a) * w(a, p) * (probes(p) - c(a));
+              if (t < 0) {
+                da(q, p) = Ap * (-df / (gd * gd));
+                cq(q, p) = Ap * sgn(a, p) * df * df / (gd * gd * gd);
+                continue;
+              }
+              const double gtp = sgn(a, p) * (p == 0 ? dt(tq, 1) - dt(tq, 0)
+                                              : p == P - 1 ? dt(tq, P - 1) - dt(tq, P - 2)
+                                                           : 0.5 * (dt(tq, p + 1) - dt(tq, p - 1)));
+              const double Apt = A_t(tq) * w(a, p) * (probes(p) - c(a)) + A(a) * wt(tq, p) * (probes(p) - c(a)) -
+                                 A(a) * w(a, p) * rcdot(tq);
+              da(q, p) = Apt * (-df / (gd * gd)) + Ap * (-dt(tq, p) / (gd * gd) + 2.0 * df * gtp / (gd * gd * gd));
+              cq(q, p) = sgn(a, p) * (Apt * df * df / (gd * gd * gd) +
+                                      Ap * (2.0 * df * dt(tq, p) / (gd * gd * gd) - 3.0 * df * df * gtp / (gd * gd * gd * gd)));
+            }
+            for (int r = 0; r < P; ++r) {  // the adjoint of the gradient stencil
+              double B = 0.0;
+              if (r - 1 >= 1 && r - 1 <= P - 2) B += 0.5 * cq(q, r - 1);
+              if (r + 1 >= 1 && r + 1 <= P - 2) B += -0.5 * cq(q, r + 1);
+              if (r == 1) B += cq(q, 0);
+              if (r == 0) B += -cq(q, 0);
+              if (r == P - 1) B += cq(q, P - 1);
+              if (r == P - 2) B += -cq(q, P - 1);
+              da(q, r) += B;
+            }
+          });
+      Kokkos::parallel_for(
+          "hv_grid_g", RangePolicy(0, (K + 1) * R), KOKKOS_LAMBDA(int q) {
+            const int t = q / R - 1, e = q % R, a = rcen(e);
+            const double d = rdist(e);
+            if (d <= 0.0) return;
+            const double p0 = probes(0), dp = probes(1) - probes(0);
+            const int lo = Kokkos::max((int) Kokkos::floor((d - p0) / dp), 0);
+            const int hi = Kokkos::min((int) Kokkos::ceil((d + wad - p0) / dp) + 1, P);
+            double gm = 0.0, gmt = 0.0;
+            const double dd = t < 0 ? 0.0 : ddot(t * R + e);
+            for (int p = lo; p < hi; ++p) {
+              double f1, f2;
+              cut_derivs(d, probes(p), wad, true, f1, f2);
+              gm += da(a, p) * f1;
+              if (t >= 0) gmt += da((t + 1) * N + a, p) * f1 + da(a, p) * f2 * dd;
+            }
+            gm *= scale / d;
+            if (t < 0) {
+              for (int x = 0; x < 3; ++x) g(e, x) += gm * rvec(e, x);
+              return;
+            }
+            gmt = scale * gmt / d - gm * dd / d;
+            for (int x = 0; x < 3; ++x) g_t(t * R + e, x) += gmt * rvec(e, x) + gm * vdot_raw(t * R + e, x);
+          });
+    }
   }
 
   // ---- folds: F(a) = sum over a's edges of g - sum over edges into a of g; the
