@@ -590,7 +590,7 @@ class Elastic:
 
 
 def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float = 1e-8, solver: str = "auto",
-                   rtol: float = 1e-6, maxiter: int = 300, symmetry=False, **fd) -> Elastic:
+                   rtol: float | None = None, maxiter: int = 300, symmetry=False, **fd) -> Elastic:
     """The elastic tensor of a periodic structure at its geometry, from one
     batch: C = C0 - L^T Phi^+ L / V, C0 the clamped-ion tensor (virial response
     to strain), Phi the Gamma-point Hessian and L the internal-strain tensor
@@ -609,6 +609,9 @@ def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float =
         not at a minimum) or CG does not converge. ``n_products`` and
         ``iterations`` on the result say what it took.
     rtol, maxiter: CG's convergence (relative residual per column) and limit.
+        By default 1e-6, or 1e-4 under TF32 (or any reduced-precision mode),
+        whose noise the residual cannot go below: 38 rather than 95 iterations
+        for a 384-atom cell, at the same accuracy.
     symmetry: True (or a spglib tolerance) to average C and C0 over the
         crystal's point group; ``asymmetry`` stays the raw tensor's.
     """
@@ -621,6 +624,9 @@ def elastic_tensor(calc, structure, *, relaxed_ions: bool = True, rcond: float =
         raise ValueError("solver must be auto, direct or cg")
     if solver == "auto":
         solver = "cg" if n >= 100 else "direct"
+    if rtol is None:
+        gemm, attention = precision_modes()
+        rtol = 1e-6 if gemm in ("native", "ozaki") and attention == "native" else 1e-4
     if solver == "cg" and relaxed_ions:
         r = response(calc, structure, None, _voigt_strains(), **fd)
         C0 = r.virial[:, _PET_FROM_VOIGT].T / V
