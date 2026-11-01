@@ -169,9 +169,17 @@ struct PackedEdges {
 
 // One evaluation's outputs, on the device: per-atom energy [N] and, with forces,
 // forces [N, 3] and the per-structure virial [n_struct, 9] (row-major 3x3).
+// The LLPR energy uncertainty of an evaluation (PetModel::set_uncertainty).
+struct Uncertainty {
+  RView1D energy;    // [B] eV, each structure's
+  RView1D per_atom;  // [N] eV, 0 past n_local
+  RView2D ensemble;  // [B, members] eV; empty for a model without an ensemble
+};
+
 struct DeviceOut {
   RView1D per_atom;
   RView2D forces, vir9, edge_grad;
+  Uncertainty uq;
 };
 
 // What one GNN layer of the feedforward featurizer saves for its backward, one
@@ -243,6 +251,21 @@ class PetModel {
   // Memory the saved activations may take before Recompute::Auto trades them for
   // recomputation (0 = unlimited), and the policy.
   void set_memory_policy(std::size_t budget_bytes, Recompute r) { mem_budget_ = budget_bytes, recompute_ = r; }
+  // Forces and virial from the non-conservative heads instead of the energy's
+  // gradient: the forward alone, no backward. Throws if the model has no force
+  // head; without a stress head the virial is zero.
+  void set_non_conservative(bool on);
+  bool non_conservative() const { return nc_; }
+  bool has_nc_force() const { return !nc_force_scale_.empty(); }
+  bool has_nc_stress() const { return !nc_stress_scale_.empty(); }
+  // Also compute the LLPR energy uncertainty (and the ensemble, where the model
+  // has one) with every evaluation; last_uncertainty() holds the latest. Throws
+  // if the model has none.
+  void set_uncertainty(bool on);
+  bool uncertainty() const { return uq_; }
+  bool has_uncertainty() const { return llpr_features_ > 0; }
+  int n_ensemble() const { return llpr_ensemble_.extent(0); }
+  const Uncertainty& last_uncertainty() const { return uq_last_; }
   // Replay repeated evaluations as one CUDA graph (graph.hpp). On by default.
   void set_graphs(bool on) { graphs_ = on; }
   bool graphs() const { return graphs_; }
@@ -287,6 +310,13 @@ class PetModel {
   View2D conditioning(const DeviceEdgeData& dev);
   void readout_bwd(const ReadoutSaves& sav, int i, const PackedEdges& pk, int N, View2D node_adj,
                    View2D edge_adj, View1D cutoff_adj, bool acc_cutoff);
+  // The LLPR energy uncertainty from the last-layer features `ll` [centres, F].
+  Uncertainty energy_uncertainty(const DeviceEdgeData& dev, const PackedEdges& pk, View2D ll,
+                                 RView1D per_atom, const std::string& key);
+  // The non-conservative heads' forces and virial from the read-out features,
+  // into a DeviceOut as the backward would leave them (no edge gradients).
+  DeviceOut nc_outputs(const DeviceEdgeData& dev, const PackedEdges& pk, const std::vector<View2D>& node_feat,
+                       const std::vector<View2D>& edge_feat, RView1D per_atom, const std::string& key);
 
  private:
   WeightRef mat(const std::string& name) const;
@@ -303,11 +333,17 @@ class PetModel {
   void feedforward(View2D out, View2D in, const std::string& key, View2D pre, bool save, Net beta = 0);
   void feedforward_bwd(View2D in_adj, View2D out_adj, const std::string& key, View2D pre, Net beta = 1);
   int ffn_pre_width(const std::string& key) const;
-  // Per readout layer i: node and edge heads (Linear-SiLU-Linear-SiLU-Linear),
-  // summed into per_atom_net, the edge terms weighted by the cutoff factor. `sav`
-  // null saves nothing.
-  void readout(const std::vector<View2D>& node_feat, const std::vector<View2D>& edge_feat,
-               View1D per_atom_net, const PackedEdges& pk, ReadoutSaves* sav, const std::string& key);
+  // Per readout layer i: `target`'s node and edge heads
+  // (Linear-SiLU-Linear-SiLU-Linear), summed into out [N, C], the edge terms
+  // weighted by the cutoff factor. `sav` null saves nothing. A non-empty `ll`
+  // [N, 2 * R * d_head] receives the last-layer features as metatrain
+  // concatenates them: per layer, the node head's output, then the edge heads'
+  // summed with the cutoff factor.
+  void readout(const std::vector<View2D>& node_feat, const std::vector<View2D>& edge_feat, View2D out,
+               const PackedEdges& pk, ReadoutSaves* sav, const std::string& key,
+               const std::string& target = "energy", View2D ll = {});
+  // The last-layer features buffer for this pass, or empty when not wanted.
+  View2D ll_features(int N, const std::string& key);
   // How much of the forward the backward keeps (see Recompute), from the shapes.
   Recompute recompute_tier(int N, int S, int E) const;
   std::vector<std::uintptr_t> graph_key(const DeviceEdgeData& dev, bool grad) const;
@@ -318,6 +354,14 @@ class PetModel {
   std::vector<double> composition_;    // [n_species]
   std::vector<int> species_to_index_;  // Z -> species index
   RView1D comp_view_;                  // composition_ on the device
+  std::vector<double> nc_force_scale_, nc_stress_scale_;  // Checkpoint's; empty without the head
+  RView1D nc_force_scale_view_;        // [n_species] on the device
+  bool nc_ = false;
+  int llpr_features_ = 0;
+  double llpr_multiplier_ = 0.0;
+  RView2D llpr_inv_, llpr_ensemble_;   // [F, F] lower triangular; [members, F]
+  bool uq_ = false;
+  Uncertainty uq_last_;
   RView1D probes_;
   int n_probes_ = 0;
 

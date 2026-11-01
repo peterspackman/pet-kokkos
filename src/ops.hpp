@@ -89,7 +89,7 @@ void compress_fwd(View2D out, View2D sav, const CompressFold& f, View2D input_ed
 void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, View2D ie_adj);
 
 // e(n) (+)= node_pred(n) + sum over n's edges of cutoff * edge_pred.
-void readout_accumulate(View1D e, View2D node_pred, View2D edge_pred, const PackedEdges& pk, bool acc);
+void readout_accumulate(View2D out, View2D node_pred, View2D edge_pred, const PackedEdges& pk, bool acc);
 // per_atom(n) = scale * net(n) + composition(species(n)), and 0 past n_local.
 void assemble_energy(RView1D per_atom, View1D net, IView1D species, RView1D composition,
                      double scale, int n_local);

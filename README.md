@@ -333,6 +333,56 @@ On AMD GPUs fp32 already runs on the matrix cores, so there is no `tf32`, and
 attention already uses them in fp32. A mode the device cannot run falls back
 to fp32.
 
+### Non-conservative forces
+
+Most published models also have heads that predict forces and stress
+directly. `pet::Options::non_conservative` (`non_conservative=True` in Python,
+`--non-conservative` for `pet-eval`) takes forces and virial from them instead
+of from the energy's gradient, as upet's `non_conservative=True` does. There is
+no backward pass, so an evaluation with forces costs about what the energy
+alone does. With pet-mad-s on an RTX 4080 SUPER:
+
+| | conservative | non-conservative |
+|---|---|---|
+| 624-atom Cu-BTC | 18.0 ms | 8.9 ms |
+| 384-atom anthracene supercell | 16.7 ms | 8.7 ms |
+
+Each structure's net force is removed, as metatomic does (except over several
+ranks, where no rank sees the whole structure). Edge gradients and per-atom
+virials need the backward pass, so they are not available in this mode.
+
+These forces are not the gradient of the energy. They differ from it by about
+0.1 eV/Å RMS on the structures above. They also aren't exactly rotationally
+equivariant, and they don't conserve energy in NVE; upet uses them with a
+conservative correction every few steps. Check the stress head before relying on
+it: pet-mad-s's gives about 0.15 GPa for an unrelaxed anthracene cell whose
+conservative stress is up to 20 GPa (metatomic gives the same), so it is no use
+for cell relaxations or NPT there. A model with a force head and no stress head
+(pet-omol) returns a zero virial in this mode.
+
+Models converted before the converter kept these heads don't have them:
+convert them again.
+
+### Uncertainty
+
+pet-mad (xs, s and m) and pet-mols-s come with metatrain's LLPR uncertainty.
+`pet::Options::uncertainty` (`uncertainty=True` in Python, `--uncertainty` for
+`pet-eval`) returns it alongside the energy:
+
+- `energy_uncertainty`: each structure's, a standard deviation in eV (upet's
+  `get_energy_uncertainty()`);
+- `per_atom_energy_uncertainty`: each atom's, the one upet's
+  `uncertainty_threshold` warns on;
+- `energy_ensemble`: the 128 members of the model's energy ensemble, which
+  average to the energy.
+
+It is computed from the last-layer features the forward pass already has, so
+it costs little: 0.5 ms on top of 18.9 ms for 624-atom Cu-BTC with pet-mad-s,
+forces included. The Cholesky factor it uses is badly conditioned (about 4e8
+for pet-mad-s), so pet-kokkos applies its inverse in double precision; the
+results match metatomic's float64 evaluation to about 1e-6. The force and
+stress uncertainties upet derives from ensembles are not implemented.
+
 ## Environment variables
 
 - `PET_MODEL_DIR`: extra directories to search for models.

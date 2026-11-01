@@ -48,15 +48,16 @@ chosen.
 """
 import argparse
 import json
+import math
 import warnings
 from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
 
-# Weight-name prefixes we keep (conservative energy path + backbone). Everything
-# under the non_conservative_* heads, the scaler, and additive_models is handled
-# separately or dropped.
+# Weight-name prefixes we keep (the backbone). The selected energy head and the
+# non-conservative force/stress heads are kept by HEAD_ROOTS below; the scaler
+# and additive_models are read separately, everything else is dropped.
 KEEP_PREFIXES = (
     "gnn_layers.",
     "combination_norms.",
@@ -65,7 +66,7 @@ KEEP_PREFIXES = (
     "edge_embedder.",
     "system_conditioning.",
 )
-# Head sub-trees: keep only the selected energy target.
+# Head sub-trees: kept only for the selected targets.
 HEAD_ROOTS = ("node_heads", "edge_heads", "node_last_layers", "edge_last_layers")
 
 # Adaptive-cutoff schemes the C++ evaluator implements; the loader in
@@ -74,43 +75,91 @@ HEAD_ROOTS = ("node_heads", "edge_heads", "node_last_layers", "edge_last_layers"
 SUPPORTED_ADAPTIVE_METHODS = {"grid", "solver"}
 
 
-def keep_weight(name: str, target: str) -> bool:
-    if name.startswith(KEEP_PREFIXES):
-        return True
+def head_target(name: str, targets) -> str | None:
+    """The selected target whose head `name` belongs to, if any."""
     for root in HEAD_ROOTS:
-        if name.startswith(root + "." + target + "."):
-            return True
-    return False
+        for t in targets:
+            if name.startswith(root + "." + t + "."):
+                return t
+    return None
 
 
-def canonical_name(name: str, target: str) -> str:
-    """Rename the selected target's head weights to the canonical 'energy' names.
+def keep_weight(name: str, targets) -> bool:
+    return name.startswith(KEEP_PREFIXES) or head_target(name, targets) is not None
 
-    The C++ loader hardcodes the target name 'energy'. When a non-default variant
+
+def canonical_name(name: str, renames: dict) -> str:
+    """Rename a selected head's weights to the names the C++ loader spells.
+
+    The loader hardcodes 'energy', 'nc_force' and 'nc_stress'. When a variant
     such as 'energy/pbe0' is selected, its state_dict keys look like
     `node_last_layers.energy/pbe0.0.energy/pbe0___0.weight`; rewriting the target
     substring to 'energy' yields `node_last_layers.energy.0.energy___0.weight`,
     which is exactly the layout the base 'energy' target would have produced.
-    Backbone weights never contain the target substring, so they pass through.
+    The non-conservative heads, `non_conservative_force` (or `..._forces`, as
+    some models spell it) and `non_conservative_stress`, become `nc_force` and
+    `nc_stress` the same way. Backbone weights carry no target name and pass
+    through.
     """
-    if target == "energy":
-        return name
-    return name.replace(target, "energy")
+    t = head_target(name, renames)
+    return name if t is None else name.replace(t, renames[t])
 
 
-def load_local_model(ckpt_path: str):
-    """Load a full metatrain PET model from a local .ckpt (composition+scaler)."""
+def find_nc_targets(sd, variant):
+    """The non-conservative heads that go with the selected energy, as
+    {upstream name: canonical name}. A variant's come from that variant, as in
+    upet's calculator."""
+    suffix = f"/{variant}" if variant else ""
+    found = {}
+    for canonical, names in (("nc_force", ("non_conservative_force", "non_conservative_forces")),
+                             ("nc_stress", ("non_conservative_stress",))):
+        for n in names:
+            if any(k.startswith(f"node_heads.{n}{suffix}.") for k in sd):
+                found[n + suffix] = canonical
+                break
+    return found
+
+
+def extract_scale_vector(model, target: str, n_species: int):
+    """A target's scale: one number, or one per species index."""
+    sc = model.scaler
+    inner = getattr(sc, "model", sc)
+    block = inner.scales[target].block(0)
+    vals = [float(x) for x in block.values.reshape(-1)]
+    if len(vals) == 1:
+        return vals
+    # Per atom type, rows labelled by species index 0..n-1 -- the order the
+    # composition energies and pet-kokkos's species indices use.
+    labels = [int(x) for x in block.samples.values[:, 0]]
+    if len(vals) != n_species or labels != list(range(n_species)):
+        raise SystemExit(f"{target}: unexpected per-type scale layout {block.samples.names} "
+                         f"({len(vals)} rows for {n_species} species)")
+    return vals
+
+
+def load_raw_model(ckpt_path: str):
+    """A local .ckpt as metatrain loads it: the PET module, or the wrapper
+    around it (an LLPRUncertaintyModel, for a model with uncertainties)."""
     import metatomic.torch  # noqa: F401  (registers torchscript classes)
     from metatrain.utils.io import load_model
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
-        model = load_model(ckpt_path)
-    # metatrain hands back the PET module directly (it exposes .additive_models,
-    # .scaler, .atomic_types, plus the network itself -- see pet_backbone()).
+        return load_model(ckpt_path)
+
+
+def unwrap(model):
+    """The PET module itself, out of any wrapper (composition and scaler
+    attached; it exposes .additive_models, .scaler, .atomic_types, plus the
+    network itself -- see pet_backbone())."""
     if not (hasattr(model, "gnn_layers") or hasattr(model, "backend")):
         model = getattr(model, "model", model)
     return model
+
+
+def load_local_model(ckpt_path: str):
+    """Load a full metatrain PET model from a local .ckpt (composition+scaler)."""
+    return unwrap(load_raw_model(ckpt_path))
 
 
 def pet_backbone(model):
@@ -199,6 +248,36 @@ def extract_energy_scale(model, target: str) -> float:
     return float(block.values.reshape(-1)[0])
 
 
+def extract_llpr(raw, target: str):
+    """The LLPR energy uncertainty of an uncertainty-wrapped model, or None.
+
+    metatrain's sigma is multiplier * |L^-1 f|, f the last-layer features and L
+    the Cholesky factor of their covariance. L^-1 is taken here, in float64:
+    for pet-mad-s the factor's condition number is ~4e8, and the C++ side then
+    needs only a triangular matrix-vector product. The ensemble's linear layer
+    (members x features, no bias) comes along when there is one.
+    """
+    if not hasattr(raw, "llpr_ensemble_layers"):
+        return None
+    name = "energy_uncertainty" if target == "energy" else f"mtt::aux::{target}_uncertainty"
+    if name not in raw.supported_outputs():
+        return None
+    L = raw._get_cholesky(name).detach().double()
+    multiplier = float(raw._get_multiplier(name).reshape(-1)[0])
+    if not math.isfinite(multiplier):
+        return None  # never calibrated
+    inv = torch.linalg.solve_triangular(L, torch.eye(L.shape[0], dtype=torch.float64), upper=False)
+    meta = {"multiplier": multiplier, "features": int(L.shape[0])}
+    tensors = {"llpr.energy.inv_cholesky": inv.contiguous()}
+    layer = raw.llpr_ensemble_layers[target] if target in raw.llpr_ensemble_layers else None
+    if layer is not None:
+        if layer.bias is not None:
+            raise SystemExit("LLPR ensemble layer with a bias: not implemented")
+        tensors["llpr.energy.ensemble"] = layer.weight.detach().double().contiguous()
+        meta["ensemble"] = int(layer.weight.shape[0])
+    return {"meta": {"energy": meta}, "tensors": tensors}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None,
@@ -218,10 +297,8 @@ def main():
     target = "energy" if not args.variant else f"energy/{args.variant}"
     source = args.ckpt or args.model
 
-    if args.ckpt:
-        model = load_local_model(args.ckpt)
-    else:
-        model = load_named_model(args.model, args.version)
+    raw = load_raw_model(args.ckpt or download_upet_checkpoint(args.model, args.version))
+    model = unwrap(raw)
     model.eval()
 
     h = dict(model.hypers)
@@ -307,6 +384,16 @@ def main():
         "species_to_index": species_to_index,
         "composition_energies": extract_composition(model, target, n_species),
     }
+    nc = find_nc_targets(sd, args.variant)
+    if nc:
+        meta["non_conservative"] = {
+            canonical[3:]: {"source": name, "scale": extract_scale_vector(model, name, n_species)}
+            for name, canonical in nc.items()
+        }
+    renames = {target: "energy", **nc}
+    llpr = extract_llpr(raw, target)
+    if llpr:
+        meta["uncertainty"] = llpr["meta"]
 
     # Collect kept float weights (contiguous, fp32), renaming variant heads.
     tensors = {}
@@ -315,10 +402,13 @@ def main():
         if not torch.is_floating_point(t):
             dropped.append(name)
             continue
-        if not keep_weight(name, target):
+        if not keep_weight(name, renames):
             dropped.append(name)
             continue
-        tensors[canonical_name(name, target)] = t.detach().to(torch.float32).contiguous()
+        tensors[canonical_name(name, renames)] = t.detach().to(torch.float32).contiguous()
+
+    if llpr:
+        tensors.update(llpr["tensors"])
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -340,6 +430,12 @@ def main():
           + ("  system_conditioning=on" if h.get("system_conditioning") else ""))
     print(f"  cutoff={h['cutoff']} fn={h['cutoff_function']} width={h['cutoff_width']} "
           f"adaptive={nna} ({adaptive_method})  energy_scale={meta['energy_scale']:.6f}")
+    if nc:
+        print(f"  non-conservative heads: {', '.join(f'{n} -> {c}' for n, c in nc.items())}")
+    if llpr:
+        u = llpr["meta"]["energy"]
+        print(f"  LLPR energy uncertainty: {u['features']} features, multiplier {u['multiplier']:.6g}"
+              + (f", {u['ensemble']}-member ensemble" if u.get("ensemble") else ""))
     print(f"  n_species={n_species}  dropped {len(dropped)} non-kept tensors")
 
 

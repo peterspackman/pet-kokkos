@@ -210,6 +210,8 @@ struct Calculator::Impl {
     // PET_GRAPHS=0 is for profilers that fence around every kernel.
     const char* g = std::getenv("PET_GRAPHS");
     model.set_graphs(o.graphs && !(g && g[0] == '0'));
+    model.set_non_conservative(o.non_conservative);
+    model.set_uncertainty(o.uncertainty);
     // PET_RECOMPUTE=never|wide|layers|auto overrides the option, to compare tiers.
     Recompute rc = o.recompute;
     if (const char* r = std::getenv("PET_RECOMPUTE"))
@@ -287,6 +289,10 @@ const std::vector<int>& Calculator::atomic_types() const { return impl_->atomic_
 const std::string& Calculator::length_unit() const { return impl_->ckpt.length_unit; }
 const std::string& Calculator::energy_unit() const { return impl_->ckpt.energy_unit; }
 double Calculator::energy_scale() const { return impl_->ckpt.energy_scale; }
+bool Calculator::has_non_conservative_forces() const { return impl_->model.has_nc_force(); }
+bool Calculator::has_non_conservative_stress() const { return impl_->model.has_nc_stress(); }
+bool Calculator::has_uncertainty() const { return impl_->model.has_uncertainty(); }
+int Calculator::n_ensemble() const { return impl_->model.n_ensemble(); }
 Options& Calculator::options() { return impl_->opts; }
 const Options& Calculator::options() const { return impl_->opts; }
 
@@ -299,6 +305,8 @@ DeviceGeom Calculator::stage(const std::vector<System>& systems) const {
   impl_->cache = NefCache{};
   return stage_systems(impl_->nbr_ws, systems, impl_->ckpt.species_to_index);
 }
+
+static void add_uncertainty(Results& out, const PetModel& model);
 
 Results Calculator::compute(const System& system, bool compute_forces) const {
   // Small structures stay on the host path, where the device build's fixed cost
@@ -320,6 +328,7 @@ Results Calculator::compute(const System& system, bool compute_forces) const {
   }
   out.energy = {r.total};
   out.per_atom_energy = std::move(r.per_atom);
+  add_uncertainty(out, impl_->model);
   return out;
 }
 
@@ -339,6 +348,10 @@ Results Calculator::compute(const std::vector<System>& systems, bool compute_for
     append(out.forces, r.forces);
     append(out.virial, r.virial);
     append(out.n_atoms, r.n_atoms);
+    append(out.energy_uncertainty, r.energy_uncertainty);
+    append(out.per_atom_energy_uncertainty, r.per_atom_energy_uncertainty);
+    append(out.energy_ensemble, r.energy_ensemble);
+    out.n_ensemble = r.n_ensemble;
     for (const int id : r.struct_id) out.struct_id.push_back(id + int(b));
   }
   return out;
@@ -355,6 +368,16 @@ static void to_host(std::vector<T>& out, const V& v) {
       if constexpr (V::rank == 1) out[i] = h(i);
       else out[i * n1 + c] = h(i, c);
     }
+}
+
+// The latest evaluation's uncertainty, when it was asked for.
+static void add_uncertainty(Results& out, const PetModel& model) {
+  if (!model.uncertainty()) return;
+  const Uncertainty& u = model.last_uncertainty();
+  to_host(out.energy_uncertainty, u.energy);
+  to_host(out.per_atom_energy_uncertainty, u.per_atom);
+  out.n_ensemble = model.n_ensemble();
+  if (out.n_ensemble) to_host(out.energy_ensemble, u.ensemble);
 }
 
 Results Calculator::compute_batch(const std::vector<System>& systems, bool compute_forces) const {
@@ -374,6 +397,7 @@ Results Calculator::compute_batch(const std::vector<System>& systems, bool compu
   for (const auto& s : systems) out.n_atoms.push_back(s.n_atoms);
   to_host(out.energy, br.energy);
   to_host(out.per_atom_energy, br.per_atom);
+  add_uncertainty(out, I.model);
   if (compute_forces) {
     to_host(out.forces, br.forces);
     to_host(out.struct_id, br.struct_id);
@@ -390,11 +414,14 @@ Results Calculator::session_results(const DeviceEdgeData& dev, bool compute_forc
   out.n_atoms = {dev.n_atoms};
   to_host(out.energy, br.energy);
   to_host(out.per_atom_energy, br.per_atom);
+  add_uncertainty(out, I.model);
   if (!compute_forces) return out;
   to_host(out.forces, br.forces);
   to_host(out.virial, br.virial);
   out.struct_id.assign(dev.n_atoms, 0);
   if (!edge_gradients) return out;
+  if (I.model.non_conservative())
+    throw std::runtime_error("pet::Calculator: edge gradients need the backward, which non_conservative skips");
   // A half list's pair gets both directions: g(i -> j) - g(j -> i).
   const EdgeSession& s = I.md;
   out.edge_gradient.assign(std::size_t(s.n_pairs) * 3, 0.0);
@@ -535,6 +562,8 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
   // Each directed edge's sym(v (x) g), half to each end, gathered per atom: its
   // own edges, their partners (the edges into it), and the partnerless edges
   // into it.
+  if (a.per_atom_virial && I.model.non_conservative())
+    throw std::runtime_error("pet::Calculator: per-atom virials need the backward, which non_conservative skips");
   if (a.per_atom_virial && br.edge_grad.extent(0) > 0) {
     auto g = br.edge_grad;
     auto v = dev.raw_vec;

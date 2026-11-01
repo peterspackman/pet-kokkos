@@ -81,6 +81,17 @@ nb::dict structure(const pet::Results& r, std::size_t b, std::size_t a0, std::si
   nb::dict d;
   d["energy"] = r.energy[b];
   d["energies"] = owned(std::vector<double>(r.per_atom_energy.begin() + a0, r.per_atom_energy.begin() + a0 + n), {n});
+  if (b < r.energy_uncertainty.size()) {
+    d["energy_uncertainty"] = r.energy_uncertainty[b];
+    d["energies_uncertainty"] = owned(
+        std::vector<double>(r.per_atom_energy_uncertainty.begin() + a0, r.per_atom_energy_uncertainty.begin() + a0 + n),
+        {n});
+    if (r.n_ensemble > 0) {
+      const std::size_t K = r.n_ensemble;
+      d["energy_ensemble"] = owned(
+          std::vector<double>(r.energy_ensemble.begin() + b * K, r.energy_ensemble.begin() + (b + 1) * K), {K});
+    }
+  }
   if (forces && !r.forces.empty()) {
     d["forces"] = owned(std::vector<double>(r.forces.begin() + 3 * a0, r.forces.begin() + 3 * (a0 + n)), {n, 3});
     if (r.virial.size() >= 6 * (b + 1))
@@ -93,9 +104,11 @@ class Calculator {
  public:
   Calculator(const std::string& model, std::optional<std::string> gemm, std::optional<std::string> attention,
              bool device_neighbors, bool cache_neighbors, std::optional<std::string> recompute,
-             double memory_budget_gib, int max_batch_atoms) {
+             double memory_budget_gib, int max_batch_atoms, bool non_conservative, bool uncertainty) {
     start_kokkos();
     pet::Options o;
+    o.non_conservative = non_conservative;
+    o.uncertainty = uncertainty;
     o.device_neighbors = device_neighbors;
     o.cache_neighbors = cache_neighbors;
     o.memory_budget_bytes = std::size_t(memory_budget_gib * double(1ull << 30));
@@ -153,6 +166,10 @@ class Calculator {
   std::string length_unit() const { return get().length_unit(); }
   std::string energy_unit() const { return get().energy_unit(); }
   double energy_scale() const { return get().energy_scale(); }
+  bool has_non_conservative_forces() const { return get().has_non_conservative_forces(); }
+  bool has_non_conservative_stress() const { return get().has_non_conservative_stress(); }
+  bool has_uncertainty() const { return get().has_uncertainty(); }
+  int n_ensemble() const { return get().n_ensemble(); }
   std::string memory_report() const { return get().memory_report(); }
 
  private:
@@ -187,10 +204,10 @@ NB_MODULE(_core, m) {
 
   nb::class_<Calculator>(m, "Calculator")
       .def(nb::init<const std::string&, std::optional<std::string>, std::optional<std::string>, bool, bool,
-                    std::optional<std::string>, double, int>(),
+                    std::optional<std::string>, double, int, bool, bool>(),
            "model"_a, "gemm"_a = nb::none(), "attention"_a = nb::none(), "device_neighbors"_a = true,
            "cache_neighbors"_a = false, "recompute"_a = nb::none(), "memory_budget_gib"_a = 0.0,
-           "max_batch_atoms"_a = 0)
+           "max_batch_atoms"_a = 0, "non_conservative"_a = false, "uncertainty"_a = false)
       .def("compute", &Calculator::compute, "numbers"_a, "positions"_a, "cell"_a = nb::none(),
            "pbc"_a = std::array<bool, 3>{false, false, false}, "forces"_a = true, "charge"_a = 0,
            "spin_multiplicity"_a = 1)
@@ -202,5 +219,9 @@ NB_MODULE(_core, m) {
       .def_prop_ro("length_unit", &Calculator::length_unit)
       .def_prop_ro("energy_unit", &Calculator::energy_unit)
       .def_prop_ro("energy_scale", &Calculator::energy_scale)
+      .def_prop_ro("has_non_conservative_forces", &Calculator::has_non_conservative_forces)
+      .def_prop_ro("has_non_conservative_stress", &Calculator::has_non_conservative_stress)
+      .def_prop_ro("has_uncertainty", &Calculator::has_uncertainty)
+      .def_prop_ro("n_ensemble", &Calculator::n_ensemble)
       .def("memory_report", &Calculator::memory_report);
 }

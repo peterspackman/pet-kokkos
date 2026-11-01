@@ -62,6 +62,9 @@ void PetModel::residual_layer(const DeviceEdgeData& dev, const PackedEdges& pk, 
 }
 
 DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
+  // The non-conservative heads read forces and virial off the forward alone.
+  const bool nc = grad && nc_;
+  grad = grad && !nc_;
   const int N = dev.centres(), S = dev.max_neighbors + 1;  // the model's rows
   const int D = h_.d_pet, G = h_.num_gnn_layers, A = h_.num_attention_layers, R = h_.num_readout_layers;
   Workspace::Scope scope(ws_);
@@ -130,10 +133,17 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
 
   View1D net = ws_.n1("re_per_atom_net", N);
   ReadoutSaves rs;
-  readout(node_feat, edge_feat, net, pk, grad ? &rs : nullptr, "re_");
+  const View2D ll = ll_features(N, "re_");
+  readout(node_feat, edge_feat, View2D(net.data(), N, 1), pk, grad ? &rs : nullptr, "re_", "energy", ll);
   RView1D per_atom = ws_.r1("re_per_atom", dev.n_atoms);  // every atom's, 0 past n_local
   assemble_energy(per_atom, net, dev.species, comp_view_, energy_scale_, pk.n_local);
-  if (!grad) return {per_atom, {}, {}, {}};
+  const Uncertainty uq = uq_ ? energy_uncertainty(dev, pk, ll, per_atom, "re_") : Uncertainty{};
+  if (nc) {
+    DeviceOut o = nc_outputs(dev, pk, node_feat, edge_feat, per_atom, "re_");
+    o.uq = uq;
+    return o;
+  }
+  if (!grad) return {per_atom, {}, {}, {}, uq};
 
   // As in the forward, every buffer's first writer overwrites it, and the few
   // the backward accumulates into are zeroed here: one memset per evaluation
@@ -228,7 +238,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     ie_adj = ie_next;
   }
 
-  DeviceOut out{per_atom, {}, {}, {}};
+  DeviceOut out{per_atom, {}, {}, {}, uq};
   forces_and_virial(ws_, dev, pk, h_, probes_, n_probes_, energy_scale_, x4_adj, cutoff_adj, cf_seq_adj,
                     out.forces, out.vir9, out.edge_grad);
   return out;

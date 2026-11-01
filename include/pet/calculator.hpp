@@ -70,6 +70,23 @@ struct Options {
   // A cap on atoms per batch ahead of the memory estimate; 0 = none.
   int max_batch_atoms = 0;
 
+  // Forces and virial from the model's non-conservative heads (upet's
+  // non_conservative=True): the forward pass alone, no backward, so roughly
+  // twice as fast -- but they are not the energy's gradient, so an energy and
+  // its forces no longer agree, and the forces are not exactly rotationally
+  // equivariant. Each structure's net force is taken out (not over several
+  // ranks). Throws at construction for a model without a force head; without a
+  // stress head the virial is zero. Edge gradients and per-atom virials come
+  // from the backward and are not available.
+  bool non_conservative = false;
+
+  // Also compute the model's LLPR energy uncertainty (upet's
+  // energy_uncertainty): each structure's and each atom's, and, for a model
+  // with one, the energy ensemble. A small extra cost after the forward
+  // (a triangular product per atom over the last-layer features). Throws at
+  // construction for a model without one. Results-returning calls only.
+  bool uncertainty = false;
+
   // compute_step: give every step between neighbour-list rebuilds the same
   // shapes -- capacities for the kept edges and the neighbour count, sized with
   // room to move and grown (the step redone) when outgrown -- so each replays
@@ -91,6 +108,12 @@ struct Results {
   // flux... are all folds of it: F_i = sum over i's edges of g - sum over edges
   // into i of g, W = sum over edges of v (x) g.
   std::vector<double> edge_gradient;    // [n_edges*3] eV/A
+  // Options::uncertainty only: the LLPR energy uncertainty (a standard
+  // deviation), and the ensemble's members, which average to `energy`.
+  std::vector<double> energy_uncertainty;           // [B] eV
+  std::vector<double> per_atom_energy_uncertainty;  // [Ntot] eV
+  std::vector<double> energy_ensemble;              // [B*n_ensemble] eV
+  int n_ensemble = 0;
 };
 
 // Whether the build can use vesin for the host neighbour search.
@@ -213,6 +236,14 @@ class Calculator {
   const std::string& energy_unit() const;
   // Applied internally; exposed as a fingerprint of which checkpoint is loaded.
   double energy_scale() const;
+  // Whether the model has non-conservative force and stress heads
+  // (Options::non_conservative).
+  bool has_non_conservative_forces() const;
+  bool has_non_conservative_stress() const;
+  // Whether the model has an LLPR energy uncertainty (Options::uncertainty),
+  // and its ensemble's size (0: none).
+  bool has_uncertainty() const;
+  int n_ensemble() const;
 
   // Atoms per batch the device can afford: the smaller of what memory allows
   // (the backward's saves scale with atoms x neighbours) and where throughput

@@ -59,6 +59,44 @@ def test_golden(path):
         assert np.max(np.abs(mine - ref)) <= 1e-4
 
 
+NC_GOLDENS = [p for p in GOLDENS if "nc_forces" in json.loads(p.read_text())]
+
+
+@pytest.mark.parametrize("path", NC_GOLDENS, ids=[p.stem for p in NC_GOLDENS])
+def test_non_conservative_golden(path):
+    g, calc, (z, x, cell, pbc) = load(path)
+    if not calc.has_non_conservative_forces:
+        pytest.skip(f"the installed {_model_of(path)} has no non-conservative heads (convert it again)")
+    nc = pet_kokkos.Calculator(calc.model, non_conservative=True)
+    r = nc.compute(z, x, cell, pbc)
+    assert np.max(np.abs(r["forces"] - np.array(g["nc_forces"]).reshape(-1, 3))) <= 1e-2
+    if g["periodic"] and g.get("nc_stress"):
+        ref = np.array(g["nc_stress"]).reshape(3, 3)
+        w = r["virial"] / g["volume"]  # xx yy zz xy xz yz
+        mine = np.array([[w[0], w[3], w[4]], [w[3], w[1], w[5]], [w[4], w[5], w[2]]])
+        assert np.max(np.abs(mine - ref)) <= 1e-4
+    nc.close()
+
+
+UQ_GOLDENS = [p for p in GOLDENS if "energy_uncertainty" in json.loads(p.read_text())]
+
+
+@pytest.mark.parametrize("path", UQ_GOLDENS, ids=[p.stem for p in UQ_GOLDENS])
+def test_uncertainty_golden(path):
+    g, calc, (z, x, cell, pbc) = load(path)
+    if not calc.has_uncertainty:
+        pytest.skip(f"the installed {_model_of(path)} has no LLPR uncertainty (convert it again)")
+    uq = pet_kokkos.Calculator(calc.model, uncertainty=True)
+    r = uq.compute(z, x, cell, pbc, forces=False)
+    assert r["energy_uncertainty"] == pytest.approx(g["energy_uncertainty"], rel=1e-4)
+    assert np.allclose(r["energies_uncertainty"], g["per_atom_energy_uncertainties"], rtol=1e-4, atol=1e-7)
+    if "energy_ensemble" in g:
+        tol = max(1e-3, 2e-6 * abs(g["total_energy"]))
+        assert np.max(np.abs(r["energy_ensemble"] - np.array(g["energy_ensemble"]))) <= tol
+        assert r["energy_ensemble"].mean() == pytest.approx(r["energy"], rel=1e-9)
+    uq.close()
+
+
 def test_batch_matches_single():
     paths = [p for p in GOLDENS if _model_of(p) == "pet-mad-xs"]
     if not paths:

@@ -57,6 +57,8 @@ ENERGY_RTOL = 2e-6
 FORCE_ATOL = 1e-3   # eV/Angstrom; forces are small numbers, so absolute here
 FORCE_RTOL = 1e-4   # ... unless they are large, in which case relative
 STRESS_ATOL = 1e-4  # eV/Angstrom^3
+# The LLPR uncertainty, relative: a standard deviation from fp32 features.
+UQ_RTOL = 1e-4
 
 
 @dataclass
@@ -70,6 +72,12 @@ class Result:
     d_stress: float = 0.0       # worst absolute stress deviation, eV/Angstrom^3
     seconds: float = 0.0
     conditioned: bool = False   # also checked at a non-default charge/spin
+    nc: str = ""                # non-conservative heads checked: "", "F" or "FS"
+    d_nc_force: float = 0.0     # worst absolute non-conservative force deviation
+    d_nc_stress: float = 0.0    # ... and stress
+    uq: bool = False            # LLPR energy uncertainty checked
+    d_uq: float = 0.0           # worst relative uncertainty deviation (structure and atoms)
+    d_ens: float = 0.0          # worst ensemble-member deviation, relative to the energy
 
 
 def list_checkpoints():
@@ -103,7 +111,8 @@ def list_checkpoints():
 
 
 def build_structures():
-    """A molecule, a crystal and a rattled crystal, as in the shipped goldens."""
+    """A molecule, a crystal, a rattled crystal (as in the shipped goldens) and
+    the rattled crystal strained."""
     import ase
     import numpy as np
 
@@ -126,21 +135,29 @@ def build_structures():
     rng = np.random.default_rng(0)
     rattled.positions += rng.normal(0.0, 0.15, rattled.positions.shape)
     cases["disordered"] = rattled
+    # Sheared and compressed, so the stress is tens of GPa with off-diagonal
+    # parts: near equilibrium a stress comparison is between two small numbers.
+    strained = rattled.copy()
+    strained.set_cell(rattled.cell @ np.array([[0.96, 0.03, 0.0], [0.0, 0.97, 0.02], [0.0, 0.0, 0.95]]),
+                      scale_atoms=True)
+    cases["strained"] = strained
     return cases
 
 
-def reference_values(ckpt_path, structures, charge=0, spin=1):
+def reference_values(ckpt_path, structures, charge=0, spin=1, non_conservative=False):
     """Evaluate with metatomic -- the reference implementation, via PyTorch.
 
     `charge`/`spin` go into atoms.info, which is where metatomic's ASE
     calculator reads the electronic state for a conditioned model. A model
     without system_conditioning ignores them, exactly as pet-kokkos does.
+    `non_conservative` is metatomic's own option: True, or "forces" for a model
+    with a force head and no stress head.
     """
     from metatomic.torch.ase_calculator import MetatomicCalculator
     from metatrain.utils.io import load_model
 
     model = load_model(str(ckpt_path)).export()
-    calc = MetatomicCalculator(model, device="cpu")
+    calc = MetatomicCalculator(model, device="cpu", non_conservative=non_conservative)
     out = {}
     for name, atoms in structures.items():
         a = atoms.copy()
@@ -157,6 +174,28 @@ def reference_values(ckpt_path, structures, charge=0, spin=1):
             sym = 0.5 * (s + s.T)
             entry["stress"] = [sym[0, 0], sym[1, 1], sym[2, 2],
                                sym[0, 1], sym[0, 2], sym[1, 2]]
+        out[name] = entry
+    return out
+
+
+def reference_uncertainty(ckpt_path, structures):
+    """metatomic's LLPR energy uncertainty (per structure and per atom) and
+    energy ensemble, through the uncertainty-wrapped model's outputs."""
+    from metatomic.torch import ModelOutput
+    from metatomic.torch.ase_calculator import MetatomicCalculator
+    from metatrain.utils.io import load_model
+
+    model = load_model(str(ckpt_path)).export()
+    outputs = model.capabilities().outputs
+    calc = MetatomicCalculator(model, device="cpu")
+    out = {}
+    for name, atoms in structures.items():
+        def run(key, kind):
+            o = calc.run_model(atoms, {key: ModelOutput(unit="eV", sample_kind=kind)})
+            return o[key].block().values.detach().double().numpy().reshape(-1).tolist()
+        entry = {"sigma": run("energy_uncertainty", "system")[0], "atoms": run("energy_uncertainty", "atom")}
+        if "energy_ensemble" in outputs:
+            entry["ensemble"] = run("energy_ensemble", "system")
         out[name] = entry
     return out
 
@@ -276,6 +315,42 @@ def process(entry, args, structures, xyz, workdir):
 
     ok = (res.d_energy <= ENERGY_RTOL and force_ok(res.d_force, ref, names)
           and res.d_stress <= STRESS_ATOL)
+
+    # The non-conservative heads, against metatomic's non_conservative mode. A
+    # model with a force head and no stress head has its stress from the
+    # backward there and none here, so only the forces are compared.
+    if res.arch.get("non_conservative_forces"):
+        stress = bool(res.arch.get("non_conservative_stress"))
+        res.nc = "FS" if stress else "F"
+        try:
+            ref_nc = reference_values(ckpt, structures, non_conservative=True if stress else "forces")
+            got_nc = run_pet_eval(args.pet_eval, prefix, xyz, extra=["--non-conservative"])
+            _, res.d_nc_force, res.d_nc_stress = compare(ref_nc, got_nc, names)
+            if not stress:
+                res.d_nc_stress = 0.0
+            ok = ok and force_ok(res.d_nc_force, ref_nc, names) and res.d_nc_stress <= STRESS_ATOL
+        except Exception as e:
+            res.status, res.detail = "error", f"non-conservative: {e}"
+            return res
+
+    # The LLPR energy uncertainty and ensemble, where the model has them.
+    if res.arch.get("uncertainty"):
+        res.uq = True
+        try:
+            ref_uq = reference_uncertainty(ckpt, structures)
+            got_uq = run_pet_eval(args.pet_eval, prefix, xyz, extra=["--uncertainty", "--per-atom"])
+            for i, name in enumerate(names):
+                r, g = ref_uq[name], got_uq["frames"][i]
+                res.d_uq = max(res.d_uq, abs(g["energy_uncertainty"] - r["sigma"]) / r["sigma"])
+                for a, b in zip(g["per_atom_energy_uncertainty"], r["atoms"]):
+                    res.d_uq = max(res.d_uq, abs(a - b) / max(b, 1e-12))
+                for a, b in zip(g.get("energy_ensemble", []), r.get("ensemble", [])):
+                    res.d_ens = max(res.d_ens, abs(a - b) / max(abs(g["energy"]), 1.0))
+            ok = ok and res.d_uq <= UQ_RTOL and res.d_ens <= ENERGY_RTOL
+        except Exception as e:
+            res.status, res.detail = "error", f"uncertainty: {e}"
+            return res
+
     res.status = "ok" if ok else "mismatch"
     return res
 
@@ -297,11 +372,18 @@ def render(results, args):
     lines = []
     w = max((len(r.name) for r in results), default=10)
     lines.append(f"{'':5s} {'model'.ljust(w)}  {'architecture':34s} "
-                 f"{'dE/E':>9s} {'dF':>9s} {'dStress':>9s}")
-    lines.append("-" * (5 + w + 2 + 34 + 31))
+                 f"{'dE/E':>9s} {'dF':>9s} {'dStress':>9s} {'nc':>3s} {'dF_nc':>9s} {'dS_nc':>9s}"
+                 f" {'dσ/σ':>9s} {'dEns/E':>9s}")
+    lines.append("-" * (5 + w + 2 + 34 + 31 + 24 + 20))
     for r in results:
         if r.status in ("ok", "mismatch"):
-            nums = f"{r.d_energy:9.1e} {r.d_force:9.1e} {r.d_stress:9.1e}"
+            nums = f"{r.d_energy:9.1e} {r.d_force:9.1e} {r.d_stress:9.1e} {r.nc or '-':>3s}"
+            if "F" in r.nc:
+                nums += f" {r.d_nc_force:9.1e}"
+            if "S" in r.nc:
+                nums += f" {r.d_nc_stress:9.1e}"
+            if r.uq:
+                nums = nums.ljust(29 + 4 + 20) + f" {r.d_uq:9.1e} {r.d_ens:9.1e}"
         else:
             nums = " " * 29
         lines.append(f"{mark[r.status]:5s} {r.name.ljust(w)}  {arch_summary(r.arch):34s} {nums}")

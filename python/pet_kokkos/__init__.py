@@ -67,6 +67,15 @@ class Calculator:
         the current mode, fp32 unless set).
     cache_neighbors: keep a Verlet cache of the neighbour topology across calls,
         for MD and relaxations of the same atoms.
+    non_conservative: forces and virial from the model's direct heads (upet's
+        ``non_conservative=True``): no backward pass, about twice as fast, but
+        not the energy's gradient. Most published models have the heads; a
+        model without them raises. Without a stress head the virial is zero.
+    uncertainty: also return the model's LLPR energy uncertainty (upet's
+        ``energy_uncertainty``, a standard deviation in eV) as
+        ``energy_uncertainty`` and per atom as ``energies_uncertainty``, and,
+        for a model with one, the ``energy_ensemble``. A model without one
+        raises.
     """
 
     def __init__(
@@ -80,6 +89,8 @@ class Calculator:
         recompute: str | None = None,
         memory_budget_gib: float = 0.0,
         max_batch_atoms: int = 0,
+        non_conservative: bool = False,
+        uncertainty: bool = False,
     ):
         self.model = resolve(model)
         self._calc = _core.Calculator(
@@ -91,6 +102,8 @@ class Calculator:
             recompute=recompute,
             memory_budget_gib=memory_budget_gib,
             max_batch_atoms=max_batch_atoms,
+            non_conservative=non_conservative,
+            uncertainty=uncertainty,
         )
         _live.add(self)
 
@@ -98,7 +111,9 @@ class Calculator:
         """Energy (and forces and virial) of one structure.
 
         Returns a dict with ``energy`` (float), ``energies`` [N] and, with
-        forces, ``forces`` [N, 3] and ``virial`` [6] (periodic structures).
+        forces, ``forces`` [N, 3] and ``virial`` [6] (periodic structures);
+        with ``uncertainty``, ``energy_uncertainty``, ``energies_uncertainty``
+        [N] and ``energy_ensemble`` [members].
         """
         z, x, c, p = _arrays(numbers, positions, cell, pbc)
         return self._calc.compute(z, x, c, p, forces, charge, spin_multiplicity)
@@ -121,6 +136,22 @@ class Calculator:
     @property
     def atomic_types(self) -> list[int]:
         return self._calc.atomic_types
+
+    @property
+    def has_non_conservative_forces(self) -> bool:
+        return self._calc.has_non_conservative_forces
+
+    @property
+    def has_non_conservative_stress(self) -> bool:
+        return self._calc.has_non_conservative_stress
+
+    @property
+    def has_uncertainty(self) -> bool:
+        return self._calc.has_uncertainty
+
+    @property
+    def n_ensemble(self) -> int:
+        return self._calc.n_ensemble
 
     def memory_report(self) -> str:
         return self._calc.memory_report()
