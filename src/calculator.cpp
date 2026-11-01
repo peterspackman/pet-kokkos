@@ -381,10 +381,10 @@ Calculator::Response Calculator::response(const System& system, int K, const std
     if ((int) I.resp_slot.extent(0) < R) I.resp_slot = IView1D("pet:raw_slot", R);
     IView1D raw_slot(I.resp_slot.data(), R);
     RView2D vdot(I.resp_vdot.data(), std::size_t(std::max(kc, 0)) * R, 3);
-    auto hs = Kokkos::create_mirror_view(raw_slot);
+    auto hs = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, raw_slot);  // every entry written
     for (int e = 0; e < R; ++e) hs(e) = ed.raw_slot[e];
     Kokkos::deep_copy(raw_slot, hs);
-    auto hv = Kokkos::create_mirror_view(vdot);
+    auto hv = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, vdot);
     for (int k = 0; k < kc; ++k)
       for (int e = 0; e < R; ++e) {
         const int i = ed.raw_center[e], j = ed.raw_neigh[e];

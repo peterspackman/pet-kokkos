@@ -542,6 +542,293 @@ bool with_blocks(int S, F&& f) {
   return done;
 }
 
+// ---- tangents, for the Hessian-vector product (hvp.cpp) ---------------------------
+//
+// Per (tangent, atom, head), from the forward's saved max m and 1/sum (so a
+// weight is p = exp(s - m) / sum outright) and output O, with s' = sc (q'.k +
+// q.k') + cf'/cf and p' = p (s' - pbar), pbar = sum_j p s':
+//   forward:  o' = sum_j p s' v - pbar o + sum_j p v'
+//   backward: dS = p (dP - Dq), dS' = p' (dP - Dq) + p (dP' - Dq'), dP' = dO' V^T
+//     + dO V'^T, Dq' = dO'.o + dO.o';
+//     queries: dQ' = sc (dS' K + dS K');
+//     keys:    dK' = sc (dS'^T Q + dS^T Q'), dV' = p'^T dO + p^T dO', and the key's
+//              dS and dS' summed over queries, for the cf adjoint's tangent.
+// Tangent t's rows of a [K T, w] buffer are t T + the primal's. The lanes as in
+// the passes above; the tangents' extra arrays halve the blocks a kernel holds.
+
+template <int HD>
+struct TanRows {  // a tangent's slices: tangent t's rows of a [K T, ld] buffer
+  __device__ static Slice of(const float* p, size_t t, int T, int ld, int col, Atom a) {
+    return Slice{p + t * size_t(T) * ld + col, ld, a};
+  }
+};
+
+template <int HD, int NB>
+__global__ void __launch_bounds__(64) tan_forward(const float* qkv, const float* qkv_t, int ldq, const int* off, int N,
+                                                  int T, const float* merged, int ldm, const float* ml,
+                                                  const float* cf_seq, const float* cf_t, int ldc, float* merged_t,
+                                                  int ldmt, float* pbar, int S, int H, float sc) {
+  constexpr int W = HD / 4, DT = HD / 16;
+  const int b = blockIdx.x, h = b % H, n = (b / H) % N, tg = b / (H * N);
+  const int l = threadIdx.x, c = l % 16, g = l / 16, D = H * HD;
+  const Atom at(off, N, n);
+  const Slice Q{qkv + h * HD, ldq, at}, K{qkv + D + h * HD, ldq, at}, V{qkv + 2 * D + h * HD, ldq, at};
+  const Slice Qt = TanRows<HD>::of(qkv_t, tg, T, ldq, h * HD, at), Kt = TanRows<HD>::of(qkv_t, tg, T, ldq, D + h * HD, at),
+              Vt = TanRows<HD>::of(qkv_t, tg, T, ldq, 2 * D + h * HD, at);
+  const Slice O{merged + h * HD, ldm, at};
+  const int nb = (at.cnt + 15) / 16;
+  const float* cf = cf_seq + (size_t) n * ldc;
+  const float* cft = cf_t + ((size_t) tg * N + n) * ldc;
+  const float* mls = ml + 2 * (size_t) (n * H + h) * S;
+  float q[NB][W], qt[NB][W], mi[NB], li[NB], ps[NB];
+  f4 a1[NB][DT], a2[NB][DT];
+  for (int I = 0; I < NB; ++I) {
+    const int i = 16 * I + c;
+    Q.chunk<W>(i, g * W, q[I]);
+    Qt.chunk<W>(i, g * W, qt[I]);
+    mi[I] = i < S ? mls[2 * i] : -1e30f, li[I] = i < S ? mls[2 * i + 1] : 0.0f, ps[I] = 0.0f;
+    for (int u = 0; u < DT; ++u) a1[I][u] = a2[I][u] = f4{0, 0, 0, 0};
+  }
+  for (int J = 0; J < NB; ++J) {
+    if (J >= nb) break;
+    float k[W], kt[W], v[DT][4], vt[DT][4], lc[4], bt[4];
+    K.chunk<W>(16 * J + c, g * W, k);
+    Kt.chunk<W>(16 * J + c, g * W, kt);
+    for (int r = 0; r < 4; ++r) {
+      const int j = 16 * J + 4 * g + r;
+      lc[r] = log_cf(cf, j, S);
+      bt[r] = lc[r] > -1e29f ? cft[j] / cf[j] : 0.0f;
+      for (int u = 0; u < DT; ++u) v[u][r] = V.at(j, 16 * u + c), vt[u][r] = Vt.at(j, 16 * u + c);
+    }
+    for (int I = 0; I < NB; ++I) {
+      if (I >= nb) continue;
+      f4 s = {0, 0, 0, 0}, st = {0, 0, 0, 0};
+      for (int w = 0; w < W; ++w) {
+        s = mma(k[w], q[I][w], s);  // s[r]: query 16I + c, key 16J + 4g + r
+        st = mma(k[w], qt[I][w], st);
+        st = mma(kt[w], q[I][w], st);
+      }
+      float p[4], pst[4];
+      for (int r = 0; r < 4; ++r) {
+        p[r] = li[I] > 0.0f && lc[r] > -1e29f ? __expf(s[r] * sc + lc[r] - mi[I]) * li[I] : 0.0f;
+        pst[r] = p[r] * (st[r] * sc + bt[r]);
+        ps[I] += pst[r];
+      }
+      for (int u = 0; u < DT; ++u)
+        for (int r = 0; r < 4; ++r) a1[I][u] = mma(v[u][r], pst[r], a1[I][u]), a2[I][u] = mma(vt[u][r], p[r], a2[I][u]);
+    }
+  }
+  for (int I = 0; I < NB; ++I) {
+    const int i = 16 * I + c;
+    const float pb = sum16(ps[I]);
+    if (i >= S || i >= at.cnt) continue;
+    float* o = merged_t + (size_t(tg) * T + at.row(i)) * ldmt + h * HD;
+    for (int u = 0; u < DT; ++u) {  // a[I][u][r]: query i, dim 16u + 4g + r
+      float x[4];
+      for (int r = 0; r < 4; ++r) x[r] = a1[I][u][r] - pb * O.at(i, 16 * u + 4 * g + r) + a2[I][u][r];
+      *reinterpret_cast<float4*>(o + 16 * u + 4 * g) = make_float4(x[0], x[1], x[2], x[3]);
+    }
+    if (g == 0) pbar[((size_t) (tg * N + n) * H + h) * S + i] = pb;
+  }
+}
+
+// The backward's queries: dQ', and each query's Dq, Dq' for the keys pass.
+template <int HD, int NB>
+__global__ void __launch_bounds__(64) tan_queries(const float* qkv, const float* qkv_t, int ldq, const int* off, int N,
+                                                  int T, const float* dm, const float* dm_t, const float* merged,
+                                                  const float* merged_t, int ldm, const float* ml, const float* pbar,
+                                                  const float* cf_seq, const float* cf_t, int ldc, float* qkv_adj_t,
+                                                  int lda, float* dq_out, int S, int H, float sc) {
+  constexpr int W = HD / 4, DT = HD / 16;
+  const int b = blockIdx.x, h = b % H, n = (b / H) % N, tg = b / (H * N);
+  const int l = threadIdx.x, c = l % 16, g = l / 16, D = H * HD;
+  const Atom at(off, N, n);
+  const Slice Q{qkv + h * HD, ldq, at}, K{qkv + D + h * HD, ldq, at}, V{qkv + 2 * D + h * HD, ldq, at};
+  const Slice Qt = TanRows<HD>::of(qkv_t, tg, T, ldq, h * HD, at), Kt = TanRows<HD>::of(qkv_t, tg, T, ldq, D + h * HD, at),
+              Vt = TanRows<HD>::of(qkv_t, tg, T, ldq, 2 * D + h * HD, at);
+  const Slice G{dm + h * HD, ldm, at}, Gt = TanRows<HD>::of(dm_t, tg, T, ldm, h * HD, at);
+  const Slice O{merged + h * HD, ldm, at}, Ot = TanRows<HD>::of(merged_t, tg, T, ldm, h * HD, at);
+  const int nb = (at.cnt + 15) / 16;
+  const float* cf = cf_seq + (size_t) n * ldc;
+  const float* cft = cf_t + ((size_t) tg * N + n) * ldc;
+  const float* mls = ml + 2 * (size_t) (n * H + h) * S;
+  const size_t si0 = ((size_t) (tg * N + n) * H + h) * S;
+  float q[NB][W], qt[NB][W], go[NB][W], got[NB][W], mi[NB], li[NB], pb[NB], dq[NB], dqt[NB];
+  f4 acc[NB][DT];
+  for (int I = 0; I < NB; ++I) {
+    const int i = 16 * I + c;
+    float o[W], ot[W];
+    Q.chunk<W>(i, g * W, q[I]);
+    Qt.chunk<W>(i, g * W, qt[I]);
+    G.chunk<W>(i, g * W, go[I]);
+    Gt.chunk<W>(i, g * W, got[I]);
+    O.chunk<W>(i, g * W, o);
+    Ot.chunk<W>(i, g * W, ot);
+    float d = 0.0f, dt = 0.0f;
+    for (int w = 0; w < W; ++w) d += go[I][w] * o[w], dt += got[I][w] * o[w] + go[I][w] * ot[w];
+    dq[I] = sum16(d), dqt[I] = sum16(dt);
+    mi[I] = i < S ? mls[2 * i] : -1e30f, li[I] = i < S ? mls[2 * i + 1] : 0.0f;
+    pb[I] = i < at.cnt ? pbar[si0 + i] : 0.0f;  // written for the atom's tokens only
+    for (int u = 0; u < DT; ++u) acc[I][u] = f4{0, 0, 0, 0};
+  }
+  for (int J = 0; J < NB; ++J) {
+    if (J >= nb) break;
+    float k[W], kt[W], v[W], vt[W], ka[DT][4], kta[DT][4], lc[4], bt[4];
+    K.chunk<W>(16 * J + c, g * W, k);
+    Kt.chunk<W>(16 * J + c, g * W, kt);
+    V.chunk<W>(16 * J + c, g * W, v);
+    Vt.chunk<W>(16 * J + c, g * W, vt);
+    for (int r = 0; r < 4; ++r) {
+      const int j = 16 * J + 4 * g + r;
+      lc[r] = log_cf(cf, j, S);
+      bt[r] = lc[r] > -1e29f ? cft[j] / cf[j] : 0.0f;
+      for (int u = 0; u < DT; ++u) ka[u][r] = K.at(j, 16 * u + c), kta[u][r] = Kt.at(j, 16 * u + c);
+    }
+    for (int I = 0; I < NB; ++I) {
+      if (I >= nb) continue;
+      f4 s = {0, 0, 0, 0}, st = {0, 0, 0, 0}, dp = {0, 0, 0, 0}, dpt = {0, 0, 0, 0};
+      for (int w = 0; w < W; ++w) {
+        s = mma(k[w], q[I][w], s);  // query 16I + c, key 16J + 4g + r
+        st = mma(k[w], qt[I][w], st), st = mma(kt[w], q[I][w], st);
+        dp = mma(v[w], go[I][w], dp);
+        dpt = mma(v[w], got[I][w], dpt), dpt = mma(vt[w], go[I][w], dpt);
+      }
+      float ds[4], dst[4];
+      for (int r = 0; r < 4; ++r) {
+        const float p = li[I] > 0.0f && lc[r] > -1e29f ? __expf(s[r] * sc + lc[r] - mi[I]) * li[I] : 0.0f;
+        const float pt = p * (st[r] * sc + bt[r] - pb[I]);
+        ds[r] = p * (dp[r] - dq[I]);
+        dst[r] = pt * (dp[r] - dq[I]) + p * (dpt[r] - dqt[I]);
+      }
+      for (int u = 0; u < DT; ++u)
+        for (int r = 0; r < 4; ++r) acc[I][u] = mma(ka[u][r], dst[r], acc[I][u]), acc[I][u] = mma(kta[u][r], ds[r], acc[I][u]);
+    }
+  }
+  for (int I = 0; I < NB; ++I) {
+    const int i = 16 * I + c;
+    if (i >= S) continue;
+    if (g == 0) dq_out[2 * (si0 + i)] = dq[I], dq_out[2 * (si0 + i) + 1] = dqt[I];
+    if (i >= at.cnt) continue;
+    float* o = qkv_adj_t + (size_t(tg) * T + at.row(i)) * lda + h * HD;
+    for (int u = 0; u < DT; ++u)
+      *reinterpret_cast<float4*>(o + 16 * u + 4 * g) =
+          make_float4(acc[I][u][0] * sc, acc[I][u][1] * sc, acc[I][u][2] * sc, acc[I][u][3] * sc);
+  }
+}
+
+// The backward's keys: dK', dV' and, per key and head, dS and dS' summed over
+// the queries (cfh [K N S, 2 H]: the primal's share, then the tangent's).
+template <int HD, int NB>
+__global__ void __launch_bounds__(64) tan_keys(const float* qkv, const float* qkv_t, int ldq, const int* off, int N,
+                                               int T, const float* dm, const float* dm_t, int ldm, const float* ml,
+                                               const float* pbar, const float* dq_in, const float* cf_seq,
+                                               const float* cf_t, int ldc, float* qkv_adj_t, int lda, float* cfh,
+                                               int S, int H, float sc) {
+  constexpr int W = HD / 4, DT = HD / 16;
+  const int b = blockIdx.x, h = b % H, n = (b / H) % N, tg = b / (H * N);
+  const int l = threadIdx.x, c = l % 16, g = l / 16, D = H * HD;
+  const Atom at(off, N, n);
+  const Slice Q{qkv + h * HD, ldq, at}, K{qkv + D + h * HD, ldq, at}, V{qkv + 2 * D + h * HD, ldq, at};
+  const Slice Qt = TanRows<HD>::of(qkv_t, tg, T, ldq, h * HD, at), Kt = TanRows<HD>::of(qkv_t, tg, T, ldq, D + h * HD, at),
+              Vt = TanRows<HD>::of(qkv_t, tg, T, ldq, 2 * D + h * HD, at);
+  const Slice G{dm + h * HD, ldm, at}, Gt = TanRows<HD>::of(dm_t, tg, T, ldm, h * HD, at);
+  const int nb = (at.cnt + 15) / 16;
+  const float* cf = cf_seq + (size_t) n * ldc;
+  const float* cft = cf_t + ((size_t) tg * N + n) * ldc;
+  const float* mls = ml + 2 * (size_t) (n * H + h) * S;
+  const size_t si0 = ((size_t) (tg * N + n) * H + h) * S;
+  float k[NB][W], kt[NB][W], v[NB][W], vt[NB][W], lcj[NB], btj[NB], bb[NB], bbt[NB];
+  f4 dk[NB][DT], dv[NB][DT];
+  for (int J = 0; J < NB; ++J) {
+    const int j = 16 * J + c;
+    K.chunk<W>(j, g * W, k[J]);
+    Kt.chunk<W>(j, g * W, kt[J]);
+    V.chunk<W>(j, g * W, v[J]);
+    Vt.chunk<W>(j, g * W, vt[J]);
+    lcj[J] = log_cf(cf, j, S);
+    btj[J] = lcj[J] > -1e29f ? cft[j] / cf[j] : 0.0f;
+    bb[J] = bbt[J] = 0.0f;
+    for (int u = 0; u < DT; ++u) dk[J][u] = dv[J][u] = f4{0, 0, 0, 0};
+  }
+  for (int I = 0; I < NB; ++I) {
+    if (I >= nb) break;
+    float q[W], qt[W], go[W], got[W], qa[DT][4], qta[DT][4], ga[DT][4], gta[DT][4];
+    float mi[4], li[4], pb[4], dq[4], dqt[4];
+    Q.chunk<W>(16 * I + c, g * W, q);
+    Qt.chunk<W>(16 * I + c, g * W, qt);
+    G.chunk<W>(16 * I + c, g * W, go);
+    Gt.chunk<W>(16 * I + c, g * W, got);
+    for (int r = 0; r < 4; ++r) {
+      const int i = 16 * I + 4 * g + r;
+      const bool in = i < S;
+      mi[r] = in ? mls[2 * i] : -1e30f, li[r] = in ? mls[2 * i + 1] : 0.0f, pb[r] = i < at.cnt ? pbar[si0 + i] : 0.0f;
+      dq[r] = in ? dq_in[2 * (si0 + i)] : 0.0f, dqt[r] = in ? dq_in[2 * (si0 + i) + 1] : 0.0f;
+      for (int u = 0; u < DT; ++u) {
+        qa[u][r] = Q.at(i, 16 * u + c), qta[u][r] = Qt.at(i, 16 * u + c);
+        ga[u][r] = G.at(i, 16 * u + c), gta[u][r] = Gt.at(i, 16 * u + c);
+      }
+    }
+    for (int J = 0; J < NB; ++J) {
+      if (J >= nb) continue;
+      f4 s = {0, 0, 0, 0}, st = {0, 0, 0, 0}, dp = {0, 0, 0, 0}, dpt = {0, 0, 0, 0};
+      for (int w = 0; w < W; ++w) {
+        s = mma(q[w], k[J][w], s);  // query 16I + 4g + r, key 16J + c
+        st = mma(qt[w], k[J][w], st), st = mma(q[w], kt[J][w], st);
+        dp = mma(go[w], v[J][w], dp);
+        dpt = mma(got[w], v[J][w], dpt), dpt = mma(go[w], vt[J][w], dpt);
+      }
+      float p[4], pt[4], ds[4], dst[4];
+      for (int r = 0; r < 4; ++r) {
+        p[r] = li[r] > 0.0f && lcj[J] > -1e29f ? __expf(s[r] * sc + lcj[J] - mi[r]) * li[r] : 0.0f;
+        pt[r] = p[r] * (st[r] * sc + btj[J] - pb[r]);
+        ds[r] = p[r] * (dp[r] - dq[r]);
+        dst[r] = pt[r] * (dp[r] - dq[r]) + p[r] * (dpt[r] - dqt[r]);
+        bb[J] += ds[r], bbt[J] += dst[r];
+      }
+      for (int u = 0; u < DT; ++u)
+        for (int r = 0; r < 4; ++r) {
+          dk[J][u] = mma(qa[u][r], dst[r], dk[J][u]), dk[J][u] = mma(qta[u][r], ds[r], dk[J][u]);
+          dv[J][u] = mma(ga[u][r], pt[r], dv[J][u]), dv[J][u] = mma(gta[u][r], p[r], dv[J][u]);
+        }
+    }
+  }
+  for (int J = 0; J < NB; ++J) {
+    const int j = 16 * J + c;
+    const float bs = sum16(bb[J]), bst = sum16(bbt[J]);
+    if (j >= S) continue;
+    if (g == 0) {
+      float* ch = cfh + ((size_t) (tg * N + n) * S + j) * 2 * H;
+      ch[h] = j < at.cnt ? bs : 0.0f, ch[H + h] = j < at.cnt ? bst : 0.0f;
+    }
+    if (j >= at.cnt) continue;
+    float* o = qkv_adj_t + (size_t(tg) * T + at.row(j)) * lda + D + h * HD;
+    for (int u = 0; u < DT; ++u) {  // dk[J][u][r]: key j, dim 16u + 4g + r
+      *reinterpret_cast<float4*>(o + 16 * u + 4 * g) =
+          make_float4(dk[J][u][0] * sc, dk[J][u][1] * sc, dk[J][u][2] * sc, dk[J][u][3] * sc);
+      *reinterpret_cast<float4*>(o + D + 16 * u + 4 * g) = make_float4(dv[J][u][0], dv[J][u][1], dv[J][u][2], dv[J][u][3]);
+    }
+  }
+}
+
+// with_blocks for the tangents, whose kernels hold about twice the arrays: as
+// many blocks as blocks x head_dim <= 128, where none of them spills (gfx90a,
+// rocm 6.3), and only those instantiated.
+template <int HD, class F>
+bool with_tan_blocks(int S, F&& f) {
+  const int nb = (S + 15) / 16;
+  bool done = false;
+  auto try_nb = [&](auto c) {
+    constexpr int NB = decltype(c)::value;
+    if constexpr (NB * HD <= 128)
+      if (nb == NB) f(c), done = true;
+  };
+  try_nb(std::integral_constant<int, 1>{}), try_nb(std::integral_constant<int, 2>{});
+  try_nb(std::integral_constant<int, 3>{}), try_nb(std::integral_constant<int, 4>{});
+  try_nb(std::integral_constant<int, 5>{}), try_nb(std::integral_constant<int, 6>{});
+  try_nb(std::integral_constant<int, 7>{}), try_nb(std::integral_constant<int, 8>{});
+  return done;
+}
+
 // Launched on Kokkos's stream, and reported to Kokkos Tools as a kernel.
 template <class F>
 void run(const char* name, F&& f) {
@@ -1255,6 +1542,82 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
 }
 
 }  // namespace
+
+bool attention_tan_mfma(View2D merged_t, View2D pbar, View2D qkv, View2D qkv_t, View2D merged, View2D ml,
+                        View2D cf_seq, View2D cf_t, const Tokens& tk, int S, int H, int hd, double temperature,
+                        int K) {
+#if defined(PET_MFMA)
+  const int N = tk.N, T = qkv.extent(0);
+  const float sc = float(1.0 / (std::sqrt((double) hd) * temperature));
+  bool ran = false;
+  with_head_dim(hd, [&](auto hdc) {
+    constexpr int HD = decltype(hdc)::value;
+    if constexpr (HD > 0 && HD % 16 == 0)
+      ran = mfma::with_tan_blocks<HD>(S, [&](auto nb) {
+        mfma::run("hv_attn_mfma", [&](hipStream_t st) {
+          hipLaunchKernelGGL((mfma::tan_forward<HD, decltype(nb)::value>), dim3(K * N * H), dim3(64), 0, st, qkv.data(),
+                             qkv_t.data(), int(qkv.stride(0)), tk.off.data(), N, T, merged.data(),
+                             int(merged.stride(0)), ml.data(), cf_seq.data(), cf_t.data(), int(cf_seq.stride(0)),
+                             merged_t.data(), int(merged_t.stride(0)), pbar.data(), S, H, sc);
+        });
+      });
+  });
+  return ran;
+#else
+  (void) merged_t, (void) pbar, (void) qkv, (void) qkv_t, (void) merged, (void) ml, (void) cf_seq, (void) cf_t;
+  (void) tk, (void) S, (void) H, (void) hd, (void) temperature, (void) K;
+  return false;
+#endif
+}
+
+bool attention_bwd_tan_mfma(Workspace& ws, View2D qkv_adj_t, View2D cf_adj_t, View2D dm, View2D dm_t, View2D qkv,
+                            View2D qkv_t, View2D merged, View2D merged_t, View2D ml, View2D pbar, View2D cf_seq,
+                            View2D cf_t, const Tokens& tk, int S, int H, int hd, double temperature, int K) {
+#if defined(PET_MFMA)
+  const int N = tk.N, T = qkv.extent(0);
+  const float sc = float(1.0 / (std::sqrt((double) hd) * temperature));
+  Workspace::Scope scope(ws);
+  View2D dq = ws.tmp(K * N * H * S, 2), cfh = ws.tmp(K * N * S, 2 * H);
+  bool ran = false;
+  with_head_dim(hd, [&](auto hdc) {
+    constexpr int HD = decltype(hdc)::value;
+    if constexpr (HD > 0 && HD % 16 == 0)
+      ran = mfma::with_tan_blocks<HD>(S, [&](auto nb) {
+        constexpr int NB = decltype(nb)::value;
+        mfma::run("hv_attn_q_mfma", [&](hipStream_t st) {
+          hipLaunchKernelGGL((mfma::tan_queries<HD, NB>), dim3(K * N * H), dim3(64), 0, st, qkv.data(), qkv_t.data(),
+                             int(qkv.stride(0)), tk.off.data(), N, T, dm.data(), dm_t.data(), merged.data(),
+                             merged_t.data(), int(dm.stride(0)), ml.data(), pbar.data(), cf_seq.data(), cf_t.data(),
+                             int(cf_seq.stride(0)), qkv_adj_t.data(), int(qkv_adj_t.stride(0)), dq.data(), S, H, sc);
+        });
+        mfma::run("hv_attn_k_mfma", [&](hipStream_t st) {
+          hipLaunchKernelGGL((mfma::tan_keys<HD, NB>), dim3(K * N * H), dim3(64), 0, st, qkv.data(), qkv_t.data(),
+                             int(qkv.stride(0)), tk.off.data(), N, T, dm.data(), dm_t.data(), int(dm.stride(0)),
+                             ml.data(), pbar.data(), dq.data(), cf_seq.data(), cf_t.data(), int(cf_seq.stride(0)),
+                             qkv_adj_t.data(), int(qkv_adj_t.stride(0)), cfh.data(), S, H, sc);
+        });
+      });
+  });
+  if (!ran) return false;
+  // The cf adjoint's tangent per key, the heads' shares summed:
+  // d/dt (sum dS / cf) = (sum dS' - sum dS cf'/cf) / cf.
+  Kokkos::parallel_for(
+      "hv_attn_cf_mfma", RangePolicy(0, K * N * S), KOKKOS_LAMBDA(int i) {
+        const int j = i % S, tn = i / S, n = tn % N;
+        const Net c = cf_seq(n, j);
+        if (c <= Net(0)) return;
+        Net bs = Net(0), bst = Net(0);
+        for (int h = 0; h < H; ++h) bs += cfh(i, h), bst += cfh(i, H + h);
+        cf_adj_t(tn, j) += (bst - bs * cf_t(tn, j) / c) / c;
+      });
+  return true;
+#else
+  (void) ws, (void) qkv_adj_t, (void) cf_adj_t, (void) dm, (void) dm_t, (void) qkv, (void) qkv_t, (void) merged;
+  (void) merged_t, (void) ml, (void) pbar, (void) cf_seq, (void) cf_t, (void) tk, (void) S, (void) H, (void) hd;
+  (void) temperature, (void) K;
+  return false;
+#endif
+}
 
 bool detail::tf32_attention_available() {
 #if defined(PET_TC)

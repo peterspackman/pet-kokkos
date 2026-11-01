@@ -253,12 +253,13 @@ pet-mad-s (`pet-eval STRUCTURE --hvp K` times it):
 
 | | RTX 4080 SUPER | MI250X (one GCD) |
 |---|---|---|
-| diamond, 64 atoms | 2.9 ms per direction (forces 4.9 ms) | 3.2 ms (forces 4.9 ms) |
-| water, 648 atoms | 41 ms (forces 21.7 ms) | 34 ms (forces 21 ms) |
+| diamond, 64 atoms | 2.9 ms per direction (forces 4.9 ms) | 2.5 ms (forces 4.9 ms) |
+| water, 648 atoms | 41 ms (forces 21.7 ms) | 26 ms (forces 21 ms) |
 
-So a direction costs about one evaluation in small cells and nearly two at
-several hundred atoms. That is what a 2-point difference costs per direction,
-with none of its error.
+So a direction costs about one evaluation in small cells, and up to two at
+several hundred atoms. That is at most what a 2-point difference costs per
+direction, with none of its error. On AMD's CDNA GPUs the attention's tangents
+run on the matrix cores, as its forward and backward do.
 
 `properties.HessianOperator(calc, structure)` wraps the exact product as a
 matrix-free operator (a scipy `LinearOperator` via `as_linear_operator()`;

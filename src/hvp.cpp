@@ -271,6 +271,7 @@ struct AttnShape {
   Tokens tk;
   int N, S, H, hd, T;
   Net sc;
+  double temperature;
 };
 
 template <int HD>
@@ -348,10 +349,10 @@ void attn_tan(View2D merged_t, View2D qkv, View2D qkv_t, View2D cf, View2D cf_t,
   with_head_dim(a.hd, [&](auto hd) { attn_tan_impl<decltype(hd)::value>(merged_t, qkv, qkv_t, cf, cf_t, a, K); });
 }
 
-// The backward from dm (the merged output's adjoint) and its tangent, into
-// qkv_adj and onto cf_adj (both with tangents). stats [K N H S, 5] is scratch.
+// The backward's tangents, from dm (the merged output's adjoint) and its
+// tangent, into qkv_adj_t and onto cf_adj_t. stats [K N H S, 5] is scratch.
 template <int HD>
-void attn_bwd2_impl(View2D qkv_adj, View2D qkv_adj_t, View2D cf_adj, View2D cf_adj_t, View2D dm, View2D dm_t,
+void attn_bwd2_impl(View2D qkv_adj_t, View2D cf_adj_t, View2D dm, View2D dm_t,
                     View2D qkv, View2D qkv_t, View2D cf, View2D cf_t, View2D stats, const AttnShape& a, int K) {
   const int N = a.N, S = a.S, H = a.H;
   // Queries: dq, and per query its softmax, delta = go.o and their tangents.
@@ -397,7 +398,6 @@ void attn_bwd2_impl(View2D qkv_adj, View2D qkv_adj_t, View2D cf_adj, View2D cf_a
           }
         }
         for (int d = 0; d < nd; ++d) {
-          if (t == 0) qkv_adj(ri, qo + d) = dq[d];
           qkv_adj_t(ti, qo + d) = dqt[d];
         }
         stats(idx, 0) = m, stats(idx, 1) = invl, stats(idx, 2) = pbar;
@@ -442,21 +442,53 @@ void attn_bwd2_impl(View2D qkv_adj, View2D qkv_adj_t, View2D cf_adj, View2D cf_a
             }
           }
           const Net ct = cf_t(t * N + n, j);
-          if (t == 0) Kokkos::atomic_add(&cf_adj(n, j), bb / c);
           Kokkos::atomic_add(&cf_adj_t(t * N + n, j), (bbt - bb * ct / c) / c);
         }
         for (int d = 0; d < nd; ++d) {
-          if (t == 0) qkv_adj(rj, ko + d) = dk[d], qkv_adj(rj, vo + d) = dv[d];
           qkv_adj_t(tj, ko + d) = dkt[d], qkv_adj_t(tj, vo + d) = dvt[d];
         }
       });
 }
-void attn_bwd2(View2D qkv_adj, View2D qkv_adj_t, View2D cf_adj, View2D cf_adj_t, View2D dm, View2D dm_t, View2D qkv,
+void attn_bwd2(View2D qkv_adj_t, View2D cf_adj_t, View2D dm, View2D dm_t, View2D qkv,
                View2D qkv_t, View2D cf, View2D cf_t, View2D stats, const AttnShape& a, int K) {
   with_head_dim(a.hd, [&](auto hd) {
-    attn_bwd2_impl<decltype(hd)::value>(qkv_adj, qkv_adj_t, cf_adj, cf_adj_t, dm, dm_t, qkv, qkv_t, cf, cf_t, stats,
+    attn_bwd2_impl<decltype(hd)::value>(qkv_adj_t, cf_adj_t, dm, dm_t, qkv, qkv_t, cf, cf_t, stats,
                                         a, K);
   });
+}
+
+// The attention's forward tangent: merged_t (before the output linear), and the
+// queries' pbar for the backward -- on AMD's matrix cores where it can, from the
+// forward's saves under `key`.
+void attention_tangent(Workspace& ws, const std::string& key, View2D merged_t, View2D pbar, View2D qkv, View2D qkv_t,
+                       View2D cf, View2D cf_t, const AttnShape& as, int K) {
+  if (attention_tan_mfma(merged_t, pbar, qkv, qkv_t, ws.peek2(key + ":merged"), ws.peek2(key + ":ml"), cf, cf_t,
+                         as.tk, as.S, as.H, as.hd, as.temperature, K))
+    return;
+  attn_tan(merged_t, qkv, qkv_t, cf, cf_t, as, K);
+}
+
+// Its backward, adjoints and tangents: from ao and ao_t (the output's adjoints,
+// before the output linear) onto beta times in_adj and in_adj_t (the input
+// linear's input), and onto cf_adj and cf_adj_t. The adjoint by the forward's own
+// backward (attention.cpp), whose saves are under `key`; in_adj may be ao.
+void attention_backward2(Workspace& ws, const std::string& key, View2D in_adj, View2D in_adj_t, View2D ao, View2D ao_t,
+                         View2D qkv, View2D qkv_t, View2D merged_t, View2D pbar, View2D cf, View2D cf_t,
+                         View2D cf_adj, View2D cf_adj_t, const WeightRef& wi, const WeightRef& wo,
+                         const AttnShape& as, int K, Net beta) {
+  const int T = as.T, D = as.H * as.hd;
+  Workspace::Scope scope(ws);
+  View2D dm = ws.tmp(T, D), dm_t = ws.tmp(K * T, D);
+  linear_bwd(dm, ao, wo, 0);  // before in_adj, which may be ao, changes
+  linear_bwd(dm_t, ao_t, wo, 0);
+  attention_bwd(ws, key, in_adj, cf_adj, ao, qkv, cf, wi, wo, as.tk, as.S, as.H, as.hd, as.temperature, beta);
+  View2D qa_t = ws.tmp(K * T, 3 * D);
+  if (!attention_bwd_tan_mfma(ws, qa_t, cf_adj_t, dm, dm_t, qkv, qkv_t, ws.peek2(key + ":merged"), merged_t,
+                              ws.peek2(key + ":ml"), pbar, cf, cf_t, as.tk, as.S, as.H, as.hd, as.temperature, K)) {
+    View2D stats = ws.tmp(K * as.N * as.H * as.S, 5);
+    attn_bwd2(qa_t, cf_adj_t, dm, dm_t, qkv, qkv_t, cf, cf_t, stats, as, K);
+  }
+  linear_bwd(in_adj_t, qa_t, wi, beta);
 }
 
 }  // namespace
@@ -499,8 +531,10 @@ void PetModel::ff_layer_tan(const PackedEdges& pk, int L, const LayerSaves& sav,
   auto off = pk.off, rev = pk.reverse;
   const Tokens tk{off, N, false};
   const AttnShape as{tk, N, S, h_.num_heads, h_.head_dim, T,
-                     Net(1.0 / (Kokkos::sqrt((double) h_.head_dim) * h_.attention_temperature))};
-  for (auto* v : {&ts.tokens, &ts.qkv, &ts.node_new, &ts.tmp_center, &ts.eps, &ts.tmp_edge}) v->assign(A, View2D());
+                     Net(1.0 / (Kokkos::sqrt((double) h_.head_dim) * h_.attention_temperature)),
+                     h_.attention_temperature};
+  for (auto* v : {&ts.tokens, &ts.qkv, &ts.node_new, &ts.tmp_center, &ts.eps, &ts.tmp_edge, &ts.merged, &ts.pbar})
+    v->assign(A, View2D());
   auto keep = [&](const std::string& name, int a, int r, int c) {
     return ws_.n2("t_" + name + (a < 0 ? "" : std::to_string(a)) + "_" + tag, K * r, c);
   };
@@ -529,8 +563,10 @@ void PetModel::ff_layer_tan(const PackedEdges& pk, int L, const LayerSaves& sav,
     norm_tan(attn_in, sav.tokens[a], tok, vec(tl + ".norm_attention.weight"), ln);
     View2D qkv = ts.qkv[a] = keep("qkv", a, T, 3 * D);
     linear(qkv, attn_in, mat(tl + ".attention.input_linear.weight"), View1D(), 0);
-    View2D merged = ws_.tmp(K * T, D), attn_out = ws_.tmp(K * T, D);
-    attn_tan(merged, sav.qkv[a], qkv, cf, cf_t, as, K);
+    View2D merged = ts.merged[a] = keep("mg", a, T, D), attn_out = ws_.tmp(K * T, D);
+    ts.pbar[a] = keep("pb", a, N * h_.num_heads * S, 1);
+    attention_tangent(ws_, "attn_" + sav.tag + "_" + std::to_string(a), merged, ts.pbar[a], sav.qkv[a], qkv, cf, cf_t,
+                      as, K);
     linear(attn_out, merged, mat(tl + ".attention.output_linear.weight"), View1D(), 0);
 
     View2D atom_rows = ws_.tmp(K * N, D), node_exp = ws_.tmp(K * N, Dn);
@@ -592,7 +628,8 @@ void PetModel::ff_layer_bwd2(const PackedEdges& pk, int L, const LayerSaves& sav
   auto off = pk.off, rev = pk.reverse;
   const Tokens tk{off, N, false};
   const AttnShape as{tk, N, S, h_.num_heads, h_.head_dim, T,
-                     Net(1.0 / (Kokkos::sqrt((double) h_.head_dim) * h_.attention_temperature))};
+                     Net(1.0 / (Kokkos::sqrt((double) h_.head_dim) * h_.attention_temperature)),
+                     h_.attention_temperature};
   Workspace::Scope layer_scope(ws_);
   View2D edge_adj = ws_.tmp(E, D), edge_adj_t = ws_.tmp(K * E, D);
 
@@ -655,14 +692,9 @@ void PetModel::ff_layer_bwd2(const PackedEdges& pk, int L, const LayerSaves& sav
     {
       Workspace::Scope s(ws_);
       const WeightRef wo = mat(tl + ".attention.output_linear.weight"), wi = mat(tl + ".attention.input_linear.weight");
-      View2D dm = ws_.tmp(T, D), dm_t = ws_.tmp(K * T, D);
-      linear_bwd(dm, ao, wo, 0);
-      linear_bwd(dm_t, ao_t, wo, 0);
-      View2D qa = ws_.tmp(T, 3 * D), qa_t = ws_.tmp(K * T, 3 * D), stats = ws_.tmp(K * N * h_.num_heads * S, 5);
-      attn_bwd2(qa, qa_t, cf_adj, cf_adj_t, dm, dm_t, sav.qkv[a], ts.qkv[a], cf, cf_t, stats, as, K);
       View2D ai = ws_.tmp(T, D), ai_t = ws_.tmp(K * T, D);
-      linear_bwd(ai, qa, wi, 0);
-      linear_bwd(ai_t, qa_t, wi, 0);
+      attention_backward2(ws_, "attn_" + sav.tag + "_" + std::to_string(a), ai, ai_t, ao, ao_t, sav.qkv[a], ts.qkv[a],
+                          ts.merged[a], ts.pbar[a], cf, cf_t, cf_adj, cf_adj_t, wi, wo, as, K, 0);
       norm_bwd2(tin, tin_t, ai, ai_t, sav.tokens[a], ts.tokens[a], vec(tl + ".norm_attention.weight"), ln, false);
     }
     // Tokens back where they came from: edge rows onto eps's residual share, atom
@@ -809,8 +841,9 @@ void PetModel::residual_layer_tan(const PackedEdges& pk, int L, const ResidualSa
   const std::string g = "gnn_layers." + std::to_string(L), tag = "hr" + std::to_string(L);
   const bool ln = h_.normalization == Normalization::LayerNorm;
   const AttnShape as{Tokens{pk.off, N, false}, N, S, h_.num_heads, h_.head_dim, T,
-                     Net(1.0 / (Kokkos::sqrt((double) h_.head_dim) * h_.attention_temperature))};
-  for (auto* v : {&ts.qkv, &ts.pre, &ts.s1, &ts.s2}) v->assign(A, View2D());
+                     Net(1.0 / (Kokkos::sqrt((double) h_.head_dim) * h_.attention_temperature)),
+                     h_.attention_temperature};
+  for (auto* v : {&ts.qkv, &ts.pre, &ts.s1, &ts.s2, &ts.merged, &ts.pbar}) v->assign(A, View2D());
   auto keep = [&](const std::string& name, int a, int r, int c) {
     return ws_.n2("t_" + name + std::to_string(a) + "_" + tag, K * r, c);
   };
@@ -832,8 +865,10 @@ void PetModel::residual_layer_tan(const PackedEdges& pk, int L, const ResidualSa
     View2D qkv = ts.qkv[a] = keep("qkv", a, T, 3 * D), s1 = ts.s1[a] = keep("s1", a, T, D);
     View2D s2 = ts.s2[a] = keep("s2", a, T, D), pre = ts.pre[a] = keep("pre", a, T, sav.pre[a].extent(1));
     linear(qkv, tokens_t, mat(tl + ".attention.input_linear.weight"), View1D(), 0);
-    View2D merged = ws_.tmp(K * T, D);
-    attn_tan(merged, sav.qkv[a], qkv, cf, cf_t, as, K);
+    View2D merged = ts.merged[a] = keep("mg", a, T, D);
+    ts.pbar[a] = keep("pb", a, N * h_.num_heads * S, 1);
+    attention_tangent(ws_, "re_attn_" + sav.tag + "_" + std::to_string(a), merged, ts.pbar[a], sav.qkv[a], qkv, cf,
+                      cf_t, as, K);
     copy(s1, tokens_t);
     linear(s1, merged, mat(tl + ".attention.output_linear.weight"), View1D(), 1);
     View2D tok_a = ws_.tmp(K * T, D);
@@ -855,7 +890,8 @@ void PetModel::residual_layer_bwd2(const PackedEdges& pk, int L, const ResidualS
   const std::string g = "gnn_layers." + std::to_string(L);
   const bool ln = h_.normalization == Normalization::LayerNorm;
   const AttnShape as{Tokens{pk.off, N, false}, N, S, h_.num_heads, h_.head_dim, T,
-                     Net(1.0 / (Kokkos::sqrt((double) h_.head_dim) * h_.attention_temperature))};
+                     Net(1.0 / (Kokkos::sqrt((double) h_.head_dim) * h_.attention_temperature)),
+                     h_.attention_temperature};
   Workspace::Scope layer_scope(ws_);
   for (int a = A - 1; a >= 0; --a) {
     const std::string tl = g + ".trans.layers." + std::to_string(a);
@@ -870,13 +906,11 @@ void PetModel::residual_layer_bwd2(const PackedEdges& pk, int L, const ResidualS
     norm_bwd2(tokens_adj, tokens_adj_t, ta, ta_t, sav.s1[a], ts.s1[a], vec(tl + ".norm_attention.weight"), ln,
               false);
     const WeightRef wo = mat(tl + ".attention.output_linear.weight"), wi = mat(tl + ".attention.input_linear.weight");
-    View2D dm = ws_.tmp(T, D), dm_t = ws_.tmp(K * T, D);
-    linear_bwd(dm, tokens_adj, wo, 0);
-    linear_bwd(dm_t, tokens_adj_t, wo, 0);
-    View2D qa = ws_.tmp(T, 3 * D), qa_t = ws_.tmp(K * T, 3 * D), stats = ws_.tmp(K * N * h_.num_heads * S, 5);
-    attn_bwd2(qa, qa_t, cf_adj, cf_adj_t, dm, dm_t, sav.qkv[a], ts.qkv[a], cf, cf_t, stats, as, K);
-    linear_bwd(tokens_adj, qa, wi, 1);
-    linear_bwd(tokens_adj_t, qa_t, wi, 1);
+    // s1 = tokens_in + attention(tokens_in): the attention's share onto the
+    // residual's, in place, as the forward's own backward does it
+    attention_backward2(ws_, "re_attn_" + sav.tag + "_" + std::to_string(a), tokens_adj, tokens_adj_t, tokens_adj,
+                        tokens_adj_t, sav.qkv[a], ts.qkv[a], ts.merged[a], ts.pbar[a], cf, cf_t, cf_adj, cf_adj_t, wi,
+                        wo, as, K, 1);
   }
   View2D et = ws_.tmp(E, D), et_t = ws_.tmp(K * E, D);
   Kokkos::parallel_for(

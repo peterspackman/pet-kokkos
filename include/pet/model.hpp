@@ -210,10 +210,11 @@ struct ReadoutSaves {
 struct LayerTangents {
   View2D cpre, concat, cph;
   std::vector<View2D> tokens, qkv, node_new, tmp_center, eps, tmp_edge;
+  std::vector<View2D> merged, pbar;  // the attention's, for its backward's tangent
 };
 struct ResidualTangents {
   View2D cpre;
-  std::vector<View2D> qkv, pre, s1, s2;
+  std::vector<View2D> qkv, pre, s1, s2, merged, pbar;
 };
 struct ReadoutTangents {
   std::vector<View2D> nh0, nh1, eh0, eh1, epred;  // per readout layer
