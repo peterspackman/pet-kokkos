@@ -315,7 +315,19 @@ NB_MODULE(_core, m) {
   m.doc() = "pet-kokkos: PET machine-learned potentials on Kokkos";
 
   m.def("backend", [] { return std::string(Kokkos::DefaultExecutionSpace::name()); },
-        "The Kokkos execution space this build computes on (Serial, OpenMP, Threads, Cuda, HIP).");
+        "The Kokkos execution space this build computes on (Serial, OpenMP, Threads, Cuda, HIP, Metal).");
+  m.def(
+      "precision",
+      [] {
+#if defined(PET_KOKKOS_FP64)
+        return "fp64";
+#elif defined(PET_KOKKOS_FP32)
+        return "fp32";
+#else
+        return "mixed";
+#endif
+      },
+      "The build's precision: mixed (an fp32 network, fp64 geometry), fp32 or fp64.");
   m.def("model_search_dirs", &pet::model_search_dirs, "Where named models are looked for, in order.");
   m.def(
       "precision_modes",

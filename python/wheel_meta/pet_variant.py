@@ -24,6 +24,7 @@ VARIANTS = {
     "cu13": ["nvidia-cuda-runtime>=13.0,<14", "nvidia-cublas>=13.0,<14"],
     "rocm6": [],
     "rocm7": [],
+    "metal": [],
 }
 
 

@@ -144,6 +144,7 @@ uv pip install pet-kokkos --extra-index-url https://peterspackman.github.io/pet-
 | `cu13` | as `cu12` | driver for CUDA 13 (580+) |
 | `rocm6` | AMD Instinct MI200 (gfx90a), MI300 (gfx942) | ROCm 6 installed |
 | `rocm7` | as `rocm6`, and MI350 (gfx950) | ROCm 7 installed |
+| `metal` | Apple silicon (M1 and later), fp32 | macOS 15 or later |
 
 In a uv project, pin the package to one:
 
@@ -189,8 +190,11 @@ only its GPU's core: `pet_kokkos.backend()` says which.
   through the module's RPATH.
 - ROCm: CDNA GPUs only (the attention's matrix-core kernels). It links the
   system's ROCm (HIP, rocBLAS, hipBLASLt), as CuPy's ROCm wheels do.
+- Metal: an fp32 build (Apple GPUs have no fp64) on the Kokkos fork's Metal
+  backend. Building it needs Homebrew's LLVM; the wheel needs only macOS 15,
+  which compiles the kernels on first use.
 
-`PET_KOKKOS_VARIANT=cu12|cu13|rocm6|rocm7 uv build --wheel` builds one
+`PET_KOKKOS_VARIANT=cu12|cu13|rocm6|rocm7|metal uv build --wheel` builds one
 yourself, e.g. for another architecture or toolkit (pyproject.toml's overrides
 say what each needs); `python/wheels/` has CI's toolchains. `python/tests`
 checks the package (`uv run --with pytest --with ase pytest python/tests` with

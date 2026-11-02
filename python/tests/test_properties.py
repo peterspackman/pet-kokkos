@@ -220,6 +220,9 @@ def test_smooth_cutoff():
     a, b = plain.compute(z, x), smooth.compute(z, x)
     assert abs(a["energy"] - b["energy"]) < 1e-3 * len(z)  # the model barely moves
     assert np.abs(np.asarray(a["forces"]) - np.asarray(b["forces"])).max() < 0.02
+    if _core.precision() == "fp32":  # forces in fp32: a 1e-3 A step's differences are rounding
+        plain.close(), smooth.close()
+        pytest.skip("finite differences need fp64 geometry")
     # and its Hessian no longer depends on the step across the taper
     H1 = properties.hessian(smooth, (z, x), method="fd", points=4, step=1e-3)
     H2 = properties.hessian(smooth, (z, x), method="fd", points=4, step=4e-3)

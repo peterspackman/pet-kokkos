@@ -142,7 +142,7 @@ def test_ase_forces_and_stress_match_finite_differences():
 
 
 def test_backend_and_closing():
-    assert pet_kokkos.backend() in {"Serial", "OpenMP", "Threads", "Cuda", "HIP"}
+    assert pet_kokkos.backend() in {"Serial", "OpenMP", "Threads", "Cuda", "HIP", "Metal"}
     if _core.find_model("pet-mad-xs") is None:
         pytest.skip("model pet-mad-xs is not installed")
     calc = pet_kokkos.Calculator("pet-mad-xs")

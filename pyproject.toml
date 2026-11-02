@@ -99,6 +99,16 @@ inherit.cmake.define = "append"
 build-dir = "build-py/rocm7-{wheel_tag}"
 cmake.define = { PET_BACKEND = "hip", Kokkos_ARCH_AMD_GFX90A = "ON", GPU_TARGETS = "gfx90a", PET_HOST_OPENMP = "OFF", CMAKE_CXX_FLAGS = { env = "PET_ROCM_CXXFLAGS", default = "--offload-arch=gfx942" }, CMAKE_CXX_COMPILER = { env = "PET_HIPCC", default = "hipcc" } }
 
+# Metal (metal): Apple-silicon GPUs, through the Metal backend of a Kokkos fork
+# (README). It needs Homebrew's LLVM, whose clang loads the fork's compiler
+# plugin; the wheel runs on macOS 15 or later, which the build must say:
+#   PET_KOKKOS_VARIANT=metal MACOSX_DEPLOYMENT_TARGET=15.0 uv build --wheel
+[[tool.scikit-build.overrides]]
+if.env.PET_KOKKOS_VARIANT = "metal"
+inherit.cmake.define = "append"
+build-dir = "build-py/metal-{wheel_tag}"
+cmake.define = { PET_BACKEND = "metal", CMAKE_CXX_COMPILER = { env = "PET_CLANG", default = "/opt/homebrew/opt/llvm/bin/clang++" } }
+
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]
 
