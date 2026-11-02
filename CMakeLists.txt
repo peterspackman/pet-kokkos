@@ -160,7 +160,7 @@ if(NOT TARGET Kokkos::kokkos)
     # pinned to a commit of its metal branch.
     if(PET_BACKEND STREQUAL "metal")
         set(_pet_kokkos_repo peterspackman/kokkos-metal)
-        set(_pet_kokkos_tag f030258c7aabb0898d1b068831a3d54aceb22082)
+        set(_pet_kokkos_tag 09f7b9c3aba02b399b0a6b8a8d44def16c5f8dd4)
     else()
         set(_pet_kokkos_repo kokkos/kokkos)
         set(_pet_kokkos_tag 5.2.2)
