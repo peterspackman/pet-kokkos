@@ -77,20 +77,23 @@ long blocks(int M, int N) {
 }
 
 // Reported to Kokkos Tools as a kernel called `name`, like any Kokkos kernel.
-// The tile by shape, timed on an MI250X GCD: 128 x 64 at k = 256, 128 x 128
-// from 512, each only while it gives two blocks a CU, else the next smaller
-// (the tile changes the speed, never a bit of the answer). Eight-wave 128 x 128
-// blocks were faster alone but 1% slower in the network.
+// The tile by shape (it changes the speed, never a bit of the answer): the
+// largest that still gives every CU several blocks, so that one block's
+// prologue and epilogue overlap others' main loops -- 128 x 128 from 9 blocks a
+// CU, 128 x 64 from 4, else 64 x 64. Chosen in the network on an MI250X GCD
+// over 15 structures of 250-5184 atoms (pet-mad-s, -xs, pet-omat-s): within 1%
+// of each structure's best of eight rules on average, 3.8% at worst, against
+// 2.2% and 5.8% for the previous rule (128 x 64 at k = 256, each tile while it
+// gave two blocks a CU). Eight-wave 128 x 128 blocks were faster alone but 1%
+// slower in the network.
 template <class LayoutB, class Epi, class Pro>
 void launch(const char* name, int M, int N, int K, Pro A, const float* B, Epi epi) {
   if (M == 0 || N == 0) return;
   constexpr bool NN = std::is_same_v<LayoutB, RM>;
   int t = forced_tile();
   if (t < 0) {
-    const long enough = 2L * cu_count();
-    t = K <= 256 ? 1 : 0;
-    if (t == 0 && blocks<Large>(M, N) < enough) t = 1;
-    if (t == 1 && blocks<Mid>(M, N) < enough) t = 2;
+    const long cus = cu_count();
+    t = blocks<Large>(M, N) >= 9 * cus ? 0 : blocks<Mid>(M, N) >= 4 * cus ? 1 : 2;
   }
   uint64_t id = 0;
   if (Kokkos::Tools::profileLibraryLoaded()) Kokkos::Tools::beginParallelFor(name, 0, &id);
