@@ -41,12 +41,12 @@ struct Options {
   // How the network's GEMMs run: fp32-accurate (Native on the CUDA cores, TF32x3
   // on tensor cores), or a faster, less exact mode on tensor cores (TF32, BF16,
   // FP16, FP8; see gemm.hpp). Unset leaves the default: PET_GEMM, else
-  // default_gemm_mode() (TF32x3 on CUDA, Native elsewhere). Process-global.
+  // default_gemm_mode() (Native). Process-global.
   std::optional<GemmMode> gemm;
 
   // How attention's products run: Native fp32, TF32x3 (as accurate, on tensor
   // cores) or TF32 (see gemm.hpp). Unset leaves the default: PET_ATTN, else
-  // default_attention_mode(). Process-global.
+  // default_attention_mode() (Native). Process-global.
   std::optional<AttentionMode> attention;
 
   // The host neighbour search: vesin's cell list, or the built-in O(N^2) one.

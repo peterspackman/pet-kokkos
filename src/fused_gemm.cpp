@@ -1,6 +1,6 @@
 // The fp32, 3xTF32 and TF32 modes' weight GEMMs on CUDA, every one in the
 // network: CUTLASS's main loop -- SIMT fp32 in the native mode, 3xTF32 on
-// tensor cores in the TF32x3 mode (the default; fp32-accurate), TF32 tensor
+// tensor cores in the TF32x3 mode (opt-in; fp32-accurate forces), TF32 tensor
 // cores in the TF32 mode -- with our own epilogue walking each thread's
 // accumulators: the bias, or the elementwise neighbours fused in. In the native
 // and TF32x3 modes the kernels give a row the same bits whatever the shape, so

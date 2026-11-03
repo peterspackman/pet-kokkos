@@ -10,7 +10,7 @@
 int main(int argc, char** argv) {
   Kokkos::initialize(argc, argv);
   // The tests check the implementation against fp32 references, in the default
-  // modes (fp32-accurate: TF32x3 on CUDA, Native elsewhere); test_gemm_modes and
+  // modes (Native); test_gemm_modes and
   // the determinism tests measure the others. PET_GEMM and PET_ATTN override.
   int rc = 0;
   {
