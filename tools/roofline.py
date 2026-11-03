@@ -127,7 +127,11 @@ class Counter:
 
     def __init__(self, backend):
         self.ops = []
-        self.fused = backend == 'cuda'  # CUTLASS epilogues (fused_gemm.cpp)
+        # Activations in the GEMM's epilogue: CUTLASS's on CUDA (fused_gemm.cpp),
+        # the MFMA kernel's on HIP (fused_gemm_hip.cpp); 'unfused' is the
+        # rocBLAS/hipBLASLt path (PET_MFMA_GEMM=0), activations as passes.
+        self.fused = backend in ('cuda', 'hip')
+        self.backend = backend
         self.phase = 'fwd'
 
     def add(self, *a, **k):
@@ -169,6 +173,10 @@ class Counter:
 
     def swiglu_bwd(self, name, M, F2, K, Nout):
         F = F2 // 2
+        if self.backend == 'hip' and M >= 50000:  # h_adj written; the next GEMM's loads make pre_adj
+            self.gemm(name + '.w_out^T', M, F, Nout)
+            self.gemm(name + '.w_in^T', M, K, F2, extra=F32 * M * F)
+            return
         if self.fused:  # h_adj in registers, the epilogue reads pre and writes pre_adj
             self.gemm(name + '.w_out^T', M, F, Nout, extra=F32 * M * F2 * 2 - F32 * M * F)
         else:
@@ -478,9 +486,10 @@ def main(argv=None):
     ap.add_argument('--tier', choices=['never', 'wide', 'layers'], default='never',
                     help='recompute tier (pet-eval --memory prints it)')
     ap.add_argument('--gpu', action='append', choices=list(GPUS), help='default: all')
-    ap.add_argument('--backend', choices=['cuda', 'hip', 'auto'], default='auto',
-                    help='cuda: the CUTLASS fused epilogues; hip: activations as separate passes '
-                    '(auto: hip on mi250x, else cuda)')
+    ap.add_argument('--backend', choices=['cuda', 'hip', 'unfused', 'auto'], default='auto',
+                    help='cuda: the CUTLASS fused epilogues; hip: the MFMA kernel\'s (the SwiGLU '
+                    'backward deferred above 50k rows); unfused: activations as separate passes, '
+                    'as with rocBLAS (auto: hip on mi250x, else cuda)')
     ap.add_argument('--ncu', help='an `ncu --csv --page raw` dump of one evaluation to set against the '
                     'bound of the first --gpu (tools/roofline.md has the command)')
     ap.add_argument('--ops', action='store_true', help='list every operation')

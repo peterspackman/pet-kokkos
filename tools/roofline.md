@@ -52,8 +52,11 @@ Rules:
 - **GEMM FLOPs** 2 M N K. **Bytes**: A read once, the weight once, C written once
   (read too when accumulating), plus what the epilogue reads or writes. On CUDA
   (`--backend cuda`) the CUTLASS epilogues carry bias, SiLU/SwiGLU and their
-  backward; on HIP (`--backend hip`, the default for mi250x) the activations are
-  separate passes (bias assumed in hipBLASLt's epilogue).
+  backward; on HIP (`--backend hip`, the default for mi250x) the MFMA kernel's
+  epilogues do the same (fused_gemm_hip.cpp), but for the SwiGLU backward above
+  50k rows, whose first GEMM writes h_adj and whose second makes pre_adj as it
+  loads it. `--backend unfused` is rocBLAS/hipBLASLt (PET_MFMA_GEMM=0): the
+  activations as separate passes, bias in the GEMM.
 - **Attention** per (atom, head) over the atom's real tokens cnt (not the padded
   S): forward 4 cnt^2 hd FLOPs (QK^T, PV), backward 10 cnt^2 hd (QK^T and dO V
   recomputed, dQ, dK, dV), one exp per pair; bytes qkv, merged, the adjoints,
@@ -112,14 +115,18 @@ brackets):
 
 | | MI250X GCD | H200 | RTX 4080 SUPER | 4080 measured |
 |---|---|---|---|---|
-| pet-mad-s | 79.3 (56.0) | 44.4 (40.0) | 86.3 (57.4) | 151.5 (159.9 before this branch) |
-| pet-omat-s | 55.3 (39.6) | 31.3 (28.3) | 59.5 (40.1) | 107.5 (111.4) |
-| pet-mad-xs | 14.7 (8.0) | 7.0 (5.7) | 22.1 (13.8) | 34.9 (36.8) |
+| pet-mad-s | 69.4 (56.1) | 44.4 (40.0) | 86.3 (57.4) | 151.5 (159.9 before this branch) |
+| pet-omat-s | 48.6 (39.7) | 31.3 (28.3) | 59.5 (40.1) | 107.5 (111.4) |
+| pet-mad-xs | 12.1 (8.3) | 7.0 (5.7) | 22.1 (13.8) | 34.9 (36.8) |
 
-Against earlier measurements: MI250X pet-mad-s ~150 ms a step in LAMMPS (53% of
-79 ms; that step also carries LAMMPS's own work), H200 native ~94 ms in October
-(47% of 44 ms). With fused activation epilogues the MI250X bound would be
-69.5 ms (the HIP passes add 15.9 GB).
+The MI250X column is the MFMA kernel's fused epilogues (`--backend hip`); with
+the activations as separate passes (`--backend unfused`, rocBLAS) it is 79.3,
+55.2 and 14.7 ms. At the 42.7 TF/s a loop of nothing but fp32 MFMAs reaches on
+a GCD (the practical peak) pet-mad-s's GEMMs alone take 62.6 ms, not 56.1.
+
+Against earlier measurements: MI250X pet-mad-s ~150 ms a step in LAMMPS (that
+step also carries LAMMPS's own work), H200 native ~94 ms in October (47% of
+44 ms).
 
 What each category reaches on the 4080 now (pet-mad-s 5184): GEMM 53% of its
 bound (56% with the CTA raster fixed), attention 55%, norms 91%, elementwise
