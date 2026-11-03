@@ -344,8 +344,32 @@ struct Block {
   }
 };
 
+// A streamed 16-token block's slice, staged in the wave's LDS (the backward's)
+// so the lanes can read it transposed -- lane (c, g) wants rows 4g..4g+3 at column 16t + c as an
+// MFMA B operand -- from one coalesced load of its rows, rather than as single-
+// float global loads (which kept the memory pipeline 98% busy at a fraction of
+// the HBM bandwidth). Rows HD + 4 apart: a half-wave's transposed read then
+// covers the 32 banks once.
+template <int HD>
+struct Stage {
+  static constexpr int W = HD / 4, RS = HD + 4;
+  float* p;
+  // Rows 16B + c of the slice (zeros past the atom's tokens), as this lane holds
+  // them for the row-layout operand: x[0..W) = row 16B + c, dims gW..gW+W.
+  __device__ void put(const float* x, int c, int g) const {
+    for (int j = 0; j < W; j += 4)
+      *reinterpret_cast<float4*>(p + c * RS + g * W + j) = make_float4(x[j], x[j + 1], x[j + 2], x[j + 3]);
+  }
+  // Row 4g + r, column 16t + c.
+  __device__ float at(int r, int col) const { return p[r * RS + col]; }
+};
+
 // The forward: lane c of the wave's query block keeps its query's slice, and
 // the key blocks stream past once, with a running max and sum (online softmax).
+// Each block's keys, values and cutoff factors are loaded while the previous
+// block is worked on. (Staging the values in LDS, as the backward does its
+// transposed operands, was slower here: 3.1 against 2.9 ms a pet-mad-s
+// evaluation at 5184 water.)
 template <int HD>
 __global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const int* off, int N, const float* cf_seq,
                                               int ldc, float* merged, int ldm, float* ml, int S, int H, float sc,
@@ -365,15 +389,24 @@ __global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const i
   const float* cf = cf_seq + (size_t) n * ldc;
   float q[W], mx = -1e30f, sum = 0.0f;
   f4 acc[DT];
+  float kn[W], vn[DT][4], lcn;
+  auto fetch = [&](int J) {  // key block J: lane c's key slice, the values it multiplies, key 16J + c's log cf
+    K.chunk<W>(16 * J + c, g * W, kn);
+    for (int r = 0; r < 4; ++r)
+      for (int t = 0; t < DT; ++t) vn[t][r] = V.at(16 * J + 4 * g + r, 16 * t + c);
+    lcn = log_cf(cf, 16 * J + c, S);
+  };
   Q.chunk<W>(i, g * W, q);
+  fetch(0);
   for (int t = 0; t < DT; ++t) acc[t] = f4{0, 0, 0, 0};
   for (int J = 0; J < nb; ++J) {
     float k[W], v[DT][4], lc[4];
-    K.chunk<W>(16 * J + c, g * W, k);
-    for (int r = 0; r < 4; ++r) {
-      lc[r] = log_cf(cf, 16 * J + 4 * g + r, S);
-      for (int t = 0; t < DT; ++t) v[t][r] = V.at(16 * J + 4 * g + r, 16 * t + c);
-    }
+    for (int t = 0; t < W; ++t) k[t] = kn[t];
+    for (int t = 0; t < DT; ++t)
+      for (int r = 0; r < 4; ++r) v[t][r] = vn[t][r];
+    const float lcc = lcn;
+    if (J + 1 < nb) fetch(J + 1);
+    for (int r = 0; r < 4; ++r) lc[r] = __shfl(lcc, 4 * g + r);
     f4 s = {0, 0, 0, 0};
     for (int t = 0; t < W; ++t) s = mma(k[t], q[t], s);  // s[r]: query i, key 16J + 4g + r
     float x[4], bm = -1e30f;
@@ -407,12 +440,10 @@ __global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const i
   if (save && g == 0) mlq[0] = live ? mx : -1e30f, mlq[1] = invl;
 }
 
-// Dq = dO . O of query 16I + c, in every lane with that c.
+// Dq = dO . O of query 16I + c, in every lane with that c, from the lanes'
+// slices of its dO and O rows.
 template <int W>
-__device__ inline float dq_of(const Slice& G, const Slice& O, int i, int g) {
-  float go[W], oo[W];
-  G.chunk<W>(i, g * W, go);
-  O.chunk<W>(i, g * W, oo);
+__device__ inline float dq_of(const float* go, const float* oo) {
   float dq = 0.0f;
   for (int t = 0; t < W; ++t) dq += go[t] * oo[t];
   return sum16(dq);
@@ -428,7 +459,8 @@ template <int HD>
 __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const int* off, int N, const float* dmerged,
                                                const float* merged, int ldm, const float* ml, const float* cf_seq,
                                                int ldc, float* qkv_adj, int lda, float* cfh, int S, int H, float sc) {
-  constexpr int W = HD / 4, DT = HD / 16;
+  constexpr int W = HD / 4, DT = HD / 16, RS = Stage<HD>::RS;
+  __shared__ float lds[2 * 16 * RS];
   const int NB = (S + 15) / 16, side = blockIdx.x % 2;
   const int B = (blockIdx.x / 2) % NB, h = (blockIdx.x / 2 / NB) % H, n = blockIdx.x / 2 / NB / H;
   const int l = threadIdx.x, c = l % 16, g = l / 16, D = H * HD;
@@ -440,23 +472,33 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
   const float* mls = ml + 2 * (size_t) (n * H + h) * S;
 
   if (side == 0) {  // queries
+    const Stage<HD> Ks{lds};
     const int I = B, i = 16 * I + c;
     if (I >= nb) return;
-    float q[W], go[W];
+    float q[W], go[W], oo[W], kn[W], vn[W], lcn;
     f4 acc[DT];
     Q.chunk<W>(i, g * W, q);
     G.chunk<W>(i, g * W, go);
-    const float dqi = dq_of<W>(G, O, i, g);
+    O.chunk<W>(i, g * W, oo);
+    K.chunk<W>(c, g * W, kn);  // key block 0, loaded with the query's own rows
+    V.chunk<W>(c, g * W, vn);
+    lcn = log_cf(cf, c, S);
+    const float dqi = dq_of<W>(go, oo);
     const float mi = i < S ? mls[2 * i] : -1e30f, li = i < S ? mls[2 * i + 1] : 0.0f;
     for (int t = 0; t < DT; ++t) acc[t] = f4{0, 0, 0, 0};
     for (int J = 0; J < nb; ++J) {
-      float k[W], v[W], ka[DT][4], lc[4];
-      K.chunk<W>(16 * J + c, g * W, k);
-      V.chunk<W>(16 * J + c, g * W, v);
-      for (int r = 0; r < 4; ++r) {
-        lc[r] = log_cf(cf, 16 * J + 4 * g + r, S);
-        for (int t = 0; t < DT; ++t) ka[t][r] = K.at(16 * J + 4 * g + r, 16 * t + c);
+      float k[W], v[W], lc[4];
+      for (int t = 0; t < W; ++t) k[t] = kn[t], v[t] = vn[t];
+      const float lcc = lcn;  // key 16J + c's
+      if (J + 1 < nb) {  // the next block's rows while this one is worked on
+        K.chunk<W>(16 * (J + 1) + c, g * W, kn);
+        V.chunk<W>(16 * (J + 1) + c, g * W, vn);
+        lcn = log_cf(cf, 16 * (J + 1) + c, S);
       }
+      for (int r = 0; r < 4; ++r) lc[r] = __shfl(lcc, 4 * g + r);
+      __syncthreads();
+      Ks.put(k, c, g);
+      __syncthreads();
       f4 s = {0, 0, 0, 0}, dp = {0, 0, 0, 0};
       for (int t = 0; t < W; ++t) s = mma(k[t], q[t], s), dp = mma(v[t], go[t], dp);
       float ds[4];
@@ -465,7 +507,7 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
         ds[r] = a * (dp[r] - dqi);
       }
       for (int t = 0; t < DT; ++t)
-        for (int r = 0; r < 4; ++r) acc[t] = mma(ka[t][r], ds[r], acc[t]);
+        for (int r = 0; r < 4; ++r) acc[t] = mma(Ks.at(4 * g + r, 16 * t + c), ds[r], acc[t]);
     }
     if (i >= at.cnt) return;
     float* o = qkv_adj + at.row(i) * lda + h * HD;
@@ -476,6 +518,7 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
   }
 
   // keys
+  const Stage<HD> Qs{lds}, Gs{lds + 16 * RS};
   const int J = B, j = 16 * J + c;
   if (J >= nb) {  // slots past the atom's tokens: no rows, no cf share
     if (g == 0 && j < S) cfh[(size_t) (n * S + j) * H + h] = 0.0f;
@@ -487,17 +530,29 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
   V.chunk<W>(j, g * W, v);
   const float lcj = log_cf(cf, j, S);
   for (int t = 0; t < DT; ++t) dk[t] = dv[t] = f4{0, 0, 0, 0};
+  float qn[W], gn[W], on[W], mcn, licn;
+  auto fetch = [&](int I) {  // query block I's rows, and each query's max and 1/sum
+    const int ic = 16 * I + c;
+    Q.chunk<W>(ic, g * W, qn);
+    G.chunk<W>(ic, g * W, gn);
+    O.chunk<W>(ic, g * W, on);
+    mcn = ic < S ? mls[2 * ic] : -1e30f, licn = ic < S ? mls[2 * ic + 1] : 0.0f;
+  };
+  fetch(0);
   for (int I = 0; I < nb; ++I) {
-    float q[W], go[W], qa[DT][4], ga[DT][4], mi[4], li[4], dqi[4];
-    Q.chunk<W>(16 * I + c, g * W, q);
-    G.chunk<W>(16 * I + c, g * W, go);
-    const float dq = dq_of<W>(G, O, 16 * I + c, g);  // query 16I + c's
-    for (int r = 0; r < 4; ++r) {
-      const int i = 16 * I + 4 * g + r;
-      mi[r] = i < S ? mls[2 * i] : -1e30f, li[r] = i < S ? mls[2 * i + 1] : 0.0f;
+    float q[W], go[W], oo[W], mi[4], li[4], dqi[4];
+    for (int t = 0; t < W; ++t) q[t] = qn[t], go[t] = gn[t], oo[t] = on[t];
+    const float mc = mcn, lic = licn;
+    if (I + 1 < nb) fetch(I + 1);  // the next block's while this one is worked on
+    const float dq = dq_of<W>(go, oo);  // query 16I + c's
+    for (int r = 0; r < 4; ++r) {  // query 16I + 4g + r's
+      mi[r] = __shfl(mc, 4 * g + r), li[r] = __shfl(lic, 4 * g + r);
       dqi[r] = __shfl(dq, 4 * g + r);
-      for (int t = 0; t < DT; ++t) qa[t][r] = Q.at(i, 16 * t + c), ga[t][r] = G.at(i, 16 * t + c);
     }
+    __syncthreads();
+    Qs.put(q, c, g);
+    Gs.put(go, c, g);
+    __syncthreads();
     f4 s = {0, 0, 0, 0}, dp = {0, 0, 0, 0};
     for (int t = 0; t < W; ++t) s = mma(q[t], k[t], s), dp = mma(go[t], v[t], dp);
     float a[4], ds[4];
@@ -507,7 +562,10 @@ __global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const 
       cfa += ds[r];
     }
     for (int t = 0; t < DT; ++t)
-      for (int r = 0; r < 4; ++r) dk[t] = mma(qa[t][r], ds[r], dk[t]), dv[t] = mma(ga[t][r], a[r], dv[t]);
+      for (int r = 0; r < 4; ++r) {
+        dk[t] = mma(Qs.at(4 * g + r, 16 * t + c), ds[r], dk[t]);
+        dv[t] = mma(Gs.at(4 * g + r, 16 * t + c), a[r], dv[t]);
+      }
   }
   const float cft = sum16(cfa);
   if (j >= S) return;
