@@ -184,10 +184,14 @@ struct DeviceOut {
 
 // What one GNN layer of the feedforward featurizer saves for its backward, one
 // entry per attention block where it is a vector. Workspace keys carry `tag`.
+// The combination norm's input [out_edge | out_edge of the reverse edge] is
+// kept as out_edge alone, the backward reading both halves from it, unless
+// keep_concat (the Hessian path reads concat) or the edges cross ranks.
 struct LayerSaves {
   std::string tag;
-  View2D cpre, concat, cph;
+  View2D cpre, concat, cph, out_edge;
   std::vector<View2D> tokens, qkv, node_new, tmp_center, eps, tmp_edge;
+  bool keep_concat = false;
 };
 
 // What one GNN layer of the residual featurizer saves for its backward, per

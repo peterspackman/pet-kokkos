@@ -140,6 +140,60 @@ void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln, 
   });
 }
 
+// The same arithmetic as norm_rows_bwd -- the same reductions in the same lane
+// order, the same expression per value -- so the adjoints come out bit for bit
+// as the norm pass and the gather after it gave them.
+void concat_norm_bwd(View2D edge_adj, View2D out_adj, View2D oe, View1D weight, bool ln, View2D ie_adj,
+                     IView1D rev) {
+  const int E = oe.extent(0), D = oe.extent(1), W = 2 * D;
+  struct Stats {
+    Net mu, inv, mg, mgx;
+  };
+  Kokkos::parallel_for(
+      "norm_cat_bwd", norm_policy(E), KOKKOS_LAMBDA(const Team& t) {
+        const int k = t.league_rank() * kNormRows + t.team_rank();
+        if (k >= E) return;
+        const int r = rev(k);
+        const bool pair = r >= 0 && r != k && rev(r) == k;
+        if (pair && r < k) return;  // the partner's team has both
+        // Row q of the concat, read from oe.
+        auto x = [&](int q, int d) {
+          if (d < D) return oe(q, d);
+          const int p = rev(q);
+          return p >= 0 ? oe(p, d - D) : Net(0);
+        };
+        auto stats = [&](int q) {
+          Net mu = Net(0);
+          if (ln) {
+            Net s = Net(0);
+            Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(t, W), [&](int d, Net& a) { a += x(q, d); }, s);
+            mu = s / W;
+          }
+          Net sq = Net(0), sg = Net(0), sgx = Net(0);
+          Kokkos::parallel_reduce(
+              Kokkos::ThreadVectorRange(t, W),
+              [&](int d, Net& a, Net& b, Net& c) {
+                const Net xv = x(q, d) - mu, gw = out_adj(q, d) * weight(d);
+                a += xv * xv;
+                b += gw;
+                c += gw * xv;
+              },
+              sq, sg, sgx);
+          const Net inv = norm_inv(sq, W, ln);
+          return Stats{mu, inv, ln ? sg / W : Net(0), sgx * inv / W};
+        };
+        auto g = [&](const Stats& s, int q, int d) {
+          const Net a = Kokkos::fma(out_adj(q, d), weight(d), -s.mg), b = mul_rn(x(q, d) - s.mu, s.inv);
+          return mul_rn(s.inv, Kokkos::fma(-b, s.mgx, a));
+        };
+        const Stats sk = stats(k), sr = r >= 0 ? stats(r) : sk;
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, D), [&](int d) {
+          edge_adj(k, d) = ie_adj(k, d) + g(sk, k, d) + (r >= 0 ? g(sr, r, D + d) : Net(0));
+          if (pair) edge_adj(r, d) = ie_adj(r, d) + g(sr, r, d) + g(sk, k, D + d);
+        });
+      });
+}
+
 // ---- SwiGLU -------------------------------------------------------------------
 
 void swiglu_in(View2D pre, View2D h, View2D in, const WeightRef& w_in, View1D b_in) {

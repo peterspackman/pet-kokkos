@@ -58,6 +58,16 @@ void copy(View2D a, View2D b);
 // also, unless empty, receives a second copy of in_adj.
 void norm_fwd(View2D out, View2D in, View1D weight, View1D bias, View2D add = {});
 void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool layernorm, bool acc, View2D also = {});
+// The combination norm's backward and the gather after it, in one pass. The
+// norm's input row k is [oe(k) | oe(rev(k))] (0 where an edge has no partner),
+// so out_edge's adjoint takes row k's first half and its partner's second:
+//   edge_adj(k) = ie_adj(k) + g(k)[:D] + g(rev(k))[D:],
+// g the norm's input adjoint from out_adj [E, 2D]. One team takes an edge and
+// its partner together, reading each oe and out_adj row once, and neither the
+// concat nor its adjoint is ever written. Requires rev to pair edges up
+// (rev(rev(k)) = k); an edge whose partner does not point back is done alone.
+void concat_norm_bwd(View2D edge_adj, View2D out_adj, View2D oe, View1D weight, bool layernorm, View2D ie_adj,
+                     IView1D rev);
 
 // out = w_out(v * sigmoid(g)) onto beta * out, where pre = w_in(in) holds v and
 // g interleaved (v_j, g_j at 2j, 2j+1: w_in's rows are reordered at load so the
@@ -164,6 +174,19 @@ constexpr int kNormRows = 1;
 #endif
 
 inline TeamPolicy norm_policy(int rows) { return TeamPolicy((rows + kNormRows - 1) / kNormRows, kNormRows, kLanes); }
+
+// a * b rounded on its own and never contracted into an add that follows: the
+// value a kernel that stores the product and another that reads it back would
+// see. A fused pass keeps the unfused passes' bits with it.
+KOKKOS_INLINE_FUNCTION Net mul_rn(Net a, Net b) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+  if constexpr (sizeof(Net) == 4) return __fmul_rn(a, b);
+  else return __dmul_rn(a, b);
+#else
+  volatile Net p = a * b;
+  return p;
+#endif
+}
 
 KOKKOS_INLINE_FUNCTION Net norm_inv(Net sq, int D, bool ln) {
   return Net(1) / Kokkos::sqrt(sq / D + Net(ln ? kLayerNormEps : kRmsNormEps));
