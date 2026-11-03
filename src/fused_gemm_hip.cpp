@@ -286,6 +286,7 @@ __global__ void __launch_bounds__(256) gemm_plain_nt(int M, int N, int K, const 
 bool batch_invariant_gemms() { return enabled() && gemm_mode() == GemmMode::Native; }
 void detail::set_cutlass_tile(int tile) { forced_tile() = tile; }
 int detail::tf32_tile_count() { return 0; }
+int detail::x3_tile_count() { return 0; }
 void detail::set_tf32_tile(int) {}
 
 bool linear_fused(View2D out, View2D in, const View2D& w, bool w_transposed, View1D b, Net beta) {
