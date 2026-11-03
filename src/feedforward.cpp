@@ -272,8 +272,7 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
 
   // edge_adj is now et's.
   View2D cpre_adj = ws_.tmp(E, D);
-  linear_bwd(cpre_adj, edge_adj, mat(g + ".compress.2.weight"), 0);
-  compress_bwd(cpre_adj, sav.cpre, compress_fold(L), x4_adj, input_edge_adj);
+  compress_bwd(cpre_adj, edge_adj, mat(g + ".compress.2.weight"), sav.cpre, compress_fold(L), x4_adj, input_edge_adj);
 }
 
 DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {

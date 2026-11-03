@@ -93,10 +93,11 @@ bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2
 // `sav`, unless empty, receives pre.
 void compress_fwd(View2D out, View2D sav, const CompressFold& f, View2D input_edge,
                   const PackedEdges& pk);
-// g: the adjoint of compress_fwd's output, turned in place into pre's. The
-// geometry adjoint accumulates into x4_adj [E, 4] and, past layer 0, input_edge's
-// into ie_adj.
-void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, View2D ie_adj);
+// g receives pre's adjoint, from et_adj (the adjoint of compress.2's output, w2
+// its weight) back through compress.2 and the silu. The geometry adjoint
+// accumulates into x4_adj [E, 4] and, past layer 0, input_edge's into ie_adj.
+void compress_bwd(View2D g, View2D et_adj, const WeightRef& w2, View2D pre, const CompressFold& f, View2D x4_adj,
+                  View2D ie_adj);
 
 // e(n) (+)= node_pred(n) + sum over n's edges of cutoff * edge_pred.
 void readout_accumulate(View2D out, View2D node_pred, View2D edge_pred, const PackedEdges& pk, bool acc);

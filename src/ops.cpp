@@ -54,27 +54,24 @@ void linear_bwd(View2D in_adj, View2D out_adj, const WeightRef& W, Net beta) {
 void linear_silu(View2D out, View2D pre, View2D in, const WeightRef& W, View1D b) {
   // The fused kernels run in the native and TF32 modes only.
   if (!W.split && silu_in_fused(out, pre, in, W.v, b)) return;
-  linear(out, in, W, b);
-  const int n = out.extent(0) * out.extent(1);
+  // The GEMM writes the pre-activation where it is kept, and the pass reads it
+  // from there: no copy of it to write.
   const bool save = pre.data() != nullptr;
-  if (quads(out) && (!save || quads(pre))) {
-    Net *o = out.data(), *p = pre.data();
+  const View2D z = save ? pre : out;
+  linear(z, in, W, b);
+  const int n = out.extent(0) * out.extent(1);
+  if (quads(out) && quads(z)) {
+    Net *o = out.data(), *p = z.data();
     Kokkos::parallel_for(
         "silu", RangePolicy(0, n / 4), KOKKOS_LAMBDA(int q) {
-          Quad z = quad(o, q);
-          if (save) quad(p, q) = z;
-          for (int j = 0; j < 4; ++j) z.v[j] = silu(z.v[j]);
-          quad(o, q) = z;
+          Quad v = quad(p, q);
+          for (int j = 0; j < 4; ++j) v.v[j] = silu(v.v[j]);
+          quad(o, q) = v;
         });
     return;
   }
-  View1D o(out.data(), n), p(pre.data(), save ? n : 0);
-  Kokkos::parallel_for(
-      "silu", RangePolicy(0, n), KOKKOS_LAMBDA(int i) {
-        const Net z = o(i);
-        if (save) p(i) = z;
-        o(i) = silu(z);
-      });
+  View1D o(out.data(), n), p(z.data(), n);
+  Kokkos::parallel_for("silu", RangePolicy(0, n), KOKKOS_LAMBDA(int i) { o(i) = silu(p(i)); });
 }
 
 void silu_bwd(View2D grad, View2D pre) {
@@ -315,9 +312,14 @@ void compress_fwd(View2D out, View2D sav, const CompressFold& f, View2D input_ed
 // One warp per edge, several edges a block (as the norms: one 32-thread block an
 // edge leaves a large GPU at its limit of resident blocks): silu' in place,
 // then the four geometry sums as one reduction. Nothing is computed for the
-// species blocks, which are constants.
-void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, View2D ie_adj) {
+// species blocks, which are constants. Where the GEMM can apply silu' in its
+// epilogue (CUDA's fused kernels) it does, and this pass only reads g for the
+// sums: one write and one read of g fewer, the same arithmetic.
+void compress_bwd(View2D g, View2D et_adj, const WeightRef& w2, View2D pre, const CompressFold& f, View2D x4_adj,
+                  View2D ie_adj) {
   const int D = g.extent(1), E = g.extent(0);
+  const bool fused = !w2.split && silu_bwd_fused(g, et_adj, w2.v, pre);
+  if (!fused) linear_bwd(g, et_adj, w2, 0);
   auto wx = f.wx;
   Kokkos::parallel_for(
       "compress_bwd", norm_policy(E), KOKKOS_LAMBDA(const Team& t) {
@@ -327,9 +329,11 @@ void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, Vi
         Kokkos::parallel_reduce(
             Kokkos::ThreadVectorRange(t, D),
             [&](int d, Net& s0, Net& s1, Net& s2, Net& s3) {
-              const Net x = pre(r, d), sg = sigmoid(x);
-              const Net gd = g(r, d) * sg * (Net(1) + x * (Net(1) - sg));
-              g(r, d) = gd;
+              Net gd = g(r, d);
+              if (!fused) {
+                const Net x = pre(r, d), sg = sigmoid(x);
+                g(r, d) = gd = gd * sg * (Net(1) + x * (Net(1) - sg));
+              }
               s0 += gd * wx(d, 0), s1 += gd * wx(d, 1), s2 += gd * wx(d, 2), s3 += gd * wx(d, 3);
             },
             a0, a1, a2, a3);
