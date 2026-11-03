@@ -888,16 +888,33 @@ std::string PetModel::memory_report() const {
   return r + "\n";
 }
 
-std::size_t PetModel::pass_elements(long centres, int max_neighbors, long edges) const {
+std::size_t PetModel::pass_elements(long centres, int max_neighbors, long edges, int chunk) const {
   const std::size_t C = std::max(0L, centres), S = std::size_t(std::max(0, max_neighbors)) + 1;
-  const std::size_t W = std::max({2 * h_.d_feedforward, 2 * h_.d_pet, h_.d_node, h_.d_head, 3 * h_.num_heads});
   const std::size_t rows = std::max(std::size_t(std::max(0L, edges)), C * (S - 1)) + C;
-  return std::max(rows * W, C * std::size_t(h_.num_heads) * S * S);
+  // Whole: the token and edge rows at the concat's, the nodes' and the heads'
+  // widths, and attention's per-(token, head) statistics.
+  const std::size_t narrow = std::max({2 * h_.d_pet, h_.d_node, h_.d_head});
+  // The widest two -- the edge MLP's pre-activation, attention's qkv -- are a
+  // chunk's under Wide and Layers (a run of whole atoms: up to S rows over), the
+  // qkv only where attention_chunks().
+  const std::size_t part = chunk > 0 ? std::min(rows, std::size_t(chunk) + S) : rows;
+  const std::size_t qkv_rows = attention_chunks(h_.head_dim) ? part : rows;
+  const std::size_t ffw = std::max<std::size_t>(2 * h_.d_feedforward, ffn_pre_width("gnn_layers.0.trans.layers.0.mlp"));
+  return std::max({rows * narrow, part * ffw, qkv_rows * 3 * h_.d_pet, C * h_.num_heads * S * 2});
 }
 
-int PetModel::max_index_directions(long centres, int max_neighbors, long edges) const {
-  const std::size_t per = std::max<std::size_t>(1, pass_elements(centres, max_neighbors, edges));
+int PetModel::max_index_directions(long centres, int max_neighbors, long edges, int chunk) const {
+  const std::size_t per = std::max<std::size_t>(1, pass_elements(centres, max_neighbors, edges, chunk));
   return int(std::min<std::size_t>(std::numeric_limits<int>::max(), std::numeric_limits<int>::max() / per)) - 1;
+}
+
+void PetModel::check_index_range(long centres, int max_neighbors, long edges, int chunk) const {
+  if (max_index_directions(centres, max_neighbors, edges, chunk) >= 0) return;
+  throw std::runtime_error("pet: " + std::to_string(centres) + " atoms with up to " + std::to_string(max_neighbors) +
+                           " neighbours make tensors of up to " +
+                           std::to_string(pass_elements(centres, max_neighbors, edges, chunk)) +
+                           " elements, past the 2^31 the kernels index: too many atoms for one device. Split the "
+                           "structure across more devices (in LAMMPS, more GPUs or ranks).");
 }
 
 std::size_t PetModel::bytes_per_slot() const {
@@ -931,13 +948,6 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   // The shapes now; the tier and estimate stay those of the pass that recorded a
   // replayed graph, or are 0 for a featurizer that never recomputes.
   plan_.atoms = N, plan_.max_neighbors = d.max_neighbors, plan_.edges = d.n_edges, plan_.budget = mem_budget_;
-  if (max_index_directions(d.centres(), d.max_neighbors, d.n_edges) < 0)
-    throw std::runtime_error(
-        "pet: " + std::to_string(d.centres()) + " atoms with up to " + std::to_string(d.max_neighbors) +
-        " neighbours make tensors of up to " +
-        std::to_string(pass_elements(d.centres(), d.max_neighbors, d.n_edges)) +
-        " elements, past the 2^31 the kernels index: too many atoms for one device. Split the structure "
-        "across more devices (in LAMMPS, more GPUs or ranks).");
   for (;;) {
     try {
       out = graphs_ && !ozaki_active() && !d.exchange ? graph_.run(graph_key(d, grad), pass) : pass();

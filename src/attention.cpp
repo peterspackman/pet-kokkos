@@ -2076,6 +2076,14 @@ void run_qkv(const QkvRows& make_qkv, View2D q, const Run& r, int N) {
 }  // namespace
 #endif
 
+bool attention_chunks(int hd) {
+#if defined(PET_MFMA)
+  return hd % 16 == 0 && hd >= 16 && hd <= 80;  // with_head_dim's
+#else
+  return false;
+#endif
+}
+
 bool attention_chunked(Workspace& ws, const std::string& key, View2D out, const QkvRows& make_qkv, View2D cf_seq,
                        const WeightRef& w_out, View1D b_out, const Tokens& tk, int S, int H, int hd,
                        double temperature, bool save, int chunk) {

@@ -367,6 +367,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
     ~Reset() { v = 0; }
   } reset{chunk_rows_};
   chunk_rows_ = rc != Recompute::Never && batch_invariant_gemms() ? edge_chunk_rows(E) : 0;
+  check_index_range(dev.centres(), dev.max_neighbors, E, chunk_rows_);
   std::vector<LayerSaves> sav(grad && !ckpt ? G : 0);
   std::vector<std::pair<View2D, View2D>> inputs(ckpt ? G : 0);
   // Over several ranks, each layer's rows from the partners' ranks, kept so a

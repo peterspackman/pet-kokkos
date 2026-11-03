@@ -317,11 +317,13 @@ class PetModel {
   std::size_t bytes_per_slot() const;
   // The kernels index a tensor's elements with 32-bit ints. The most elements one
   // copy of a pass's tensors holds for `centres` centres with up to `max_neighbors`
-  // neighbours and `edges` kept edges (edge and token rows times the widest row,
-  // and attention's per-head tables), over-estimated, never under; and how many
+  // neighbours and `edges` kept edges, over-estimated, never under; and how many
   // tangent directions (each a copy, plus the primal) stay within int range.
-  std::size_t pass_elements(long centres, int max_neighbors, long edges) const;
-  int max_index_directions(long centres, int max_neighbors, long edges) const;
+  // `chunk` is the tier's chunk of token rows (chunk_rows_), 0 for none. The pass
+  // checks (check_index_range) once it knows its tier, before any kernel.
+  std::size_t pass_elements(long centres, int max_neighbors, long edges, int chunk = 0) const;
+  int max_index_directions(long centres, int max_neighbors, long edges, int chunk = 0) const;
+  void check_index_range(long centres, int max_neighbors, long edges, int chunk) const;
   int peak_max_neighbors() const { return peak_max_neighbors_; }
 
   // Internal, and public only because nvcc refuses a KOKKOS_LAMBDA inside a

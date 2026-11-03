@@ -138,6 +138,8 @@ void attention_bwd(Workspace& ws, const std::string& key, View2D in_adj, View2D 
 // False, having done nothing, where the kernels cannot (not AMD's matrix cores),
 // for the caller to make the whole qkv and call the above.
 using QkvRows = std::function<void(View2D qkv_rows, int r0, int r1)>;
+// Whether attention_chunked runs here for this head width.
+bool attention_chunks(int head_dim);
 bool attention_chunked(Workspace& ws, const std::string& key, View2D out, const QkvRows& make_qkv, View2D cf_seq,
                        const WeightRef& w_out, View1D b_out, const Tokens& tk, int S, int heads, int head_dim,
                        double temperature, bool save, int chunk);

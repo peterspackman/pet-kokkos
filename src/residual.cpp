@@ -72,6 +72,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
 
   const PackedEdges pk = pack_edges(dev);
   const int E = pk.E;
+  check_index_range(N, dev.max_neighbors, E, 0);
   auto off = pk.off, rev = pk.reverse;
   const Tokens tk{off, N, dev.edge_capacity};
   const int T = N + E;
