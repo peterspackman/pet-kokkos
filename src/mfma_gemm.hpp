@@ -7,6 +7,10 @@
 //   out[M, N] = A[M, K] . B,  B = W^T for a weight W [N, K] (NT), or W [K, N] (NN),
 // all row-major, rows contiguous, K a multiple of 4 and (NN) N a multiple of 4.
 //
+// The epilogue: col(c, Col&) loads what columns c..c+3 need whatever the row
+// (before the main loop), row(r, c, Row&) what output row r's columns c..c+3
+// need, and run(r, c, v, Col, Row) gets the accumulators v[4] and writes.
+//
 // The product is formed transposed, out^T = B^T A^T: the weight is the
 // instruction's A operand and the activation its B, so a lane ends with four
 // consecutive columns of one output row -- one 16-byte store, and a SwiGLU
@@ -65,8 +69,17 @@ struct Rows {
   __device__ float4 operator()(int r, int k) const { return *reinterpret_cast<const float4*>(A + size_t(r) * K + k); }
 };
 
+// Waves a SIMD the compiler must leave room for: the 128 x 128 tile's
+// accumulators take 64 registers a lane, and with a small epilogue three of its
+// waves fit a SIMD if the rest stay under 104; left alone the compiler took 106.
+template <class T, class Epi>
+constexpr int min_waves() {
+  return T::BM * T::BN >= 128 * 128 && sizeof(typename Epi::Row) <= 16 ? 3 : 1;
+}
+
 template <class T, bool NN, class Epi, class Pro>
-__global__ void __launch_bounds__(T::kThreads) gemm(int M, int N, int K, Pro A, const float* __restrict__ W, Epi epi) {
+__global__ void __launch_bounds__(T::kThreads, (min_waves<T, Epi>())) gemm(int M, int N, int K, Pro A,
+                                                                         const float* __restrict__ W, Epi epi) {
   constexpr int BM = T::BM, BN = T::BN, FM = T::FM, FN = T::FN, NT = T::kThreads, PB = BN + 4;
   constexpr int AQ = BM * 4 / NT, BQ = BN * 4 / NT;  // 16-byte loads a thread per k tile
   __shared__ float As[BM * 16];
@@ -151,17 +164,29 @@ __global__ void __launch_bounds__(T::kThreads) gemm(int M, int N, int K, Pro A, 
     __syncthreads();
   }
 
-  // acc[i][j][r]: out[m0 + wm + 16i + c][n0 + wn + 16j + 4g + r].
+  // The epilogue's per-column inputs (the bias), loaded once.
+  typename Epi::Col cols[FN];
+#pragma unroll
+  for (int j = 0; j < FN; ++j)
+    if (n0 + wn + 16 * j + 4 * g < N) epi.col(n0 + wn + 16 * j + 4 * g, cols[j]);
+
+  // acc[i][j][r]: out[m0 + wm + 16i + c][n0 + wn + 16j + 4g + r]. A row's
+  // inputs (the output accumulated onto, a saved pre-activation) are all
+  // loaded before any is used, so their latencies overlap rather than add.
 #pragma unroll
   for (int i = 0; i < FM; ++i) {
     const int r = m0 + wm + 16 * i + c;
     if (r >= M) continue;
+    typename Epi::Row in[FN];
+#pragma unroll
+    for (int j = 0; j < FN; ++j)
+      if (n0 + wn + 16 * j + 4 * g < N) epi.row(r, n0 + wn + 16 * j + 4 * g, in[j]);
 #pragma unroll
     for (int j = 0; j < FN; ++j) {
       const int col = n0 + wn + 16 * j + 4 * g;
       if (col < N) {
         const float v[4] = {acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]};
-        epi.run(r, col, v);
+        epi.run(r, col, v, cols[j], in[j]);
       }
     }
   }

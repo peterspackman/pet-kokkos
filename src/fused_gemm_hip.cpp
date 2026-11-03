@@ -141,15 +141,23 @@ __device__ void store(float* p, const float* v) {
 // columns c..c+3.
 
 // pre = acc + b; h(j) = pre(2j) * sigmoid(pre(2j+1)).
+struct NoRow {};
+struct Bias {
+  float b[4];
+};
+
 struct SwigluFwd {
   float *pre, *h;
   const float* b;
   int N;
-  __device__ void run(int r, int c, const float* v) const {
-    float bb[4], p[4], q[2];
-    load<4>(b + c, bb);
+  using Col = Bias;
+  using Row = NoRow;
+  __device__ void col(int c, Col& x) const { load<4>(b + c, x.b); }
+  __device__ void row(int, int, Row&) const {}
+  __device__ void run(int r, int c, const float* v, const Col& bb, const Row&) const {
+    float p[4], q[2];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) p[j] = v[j] + bb[j];
+    for (int j = 0; j < 4; ++j) p[j] = v[j] + bb.b[j];
     store<4>(pre + std::size_t(r) * N + c, p);
     if (!h) return;
 #pragma unroll
@@ -163,10 +171,19 @@ struct SwigluBwd {
   const float* pre;
   float* pre_adj;
   int F;
-  __device__ void run(int r, int c, const float* ha) const {
+  using Col = NoRow;
+  struct Row {
+    float p[8];
+  };
+  __device__ void col(int, Col&) const {}
+  __device__ void row(int r, int c, Row& x) const {
     const std::size_t o = std::size_t(r) * 2 * F + 2 * c;
-    float p[8], q[8];
-    load<4>(pre + o, p), load<4>(pre + o + 4, p + 4);
+    load<4>(pre + o, x.p), load<4>(pre + o + 4, x.p + 4);
+  }
+  __device__ void run(int r, int c, const float* ha, const Col&, const Row& x) const {
+    const std::size_t o = std::size_t(r) * 2 * F + 2 * c;
+    const float* p = x.p;
+    float q[8];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const float v = p[2 * j], sg = sigmoid(p[2 * j + 1]);
@@ -182,15 +199,19 @@ struct SiluFwd {
   float *out, *pre;
   const float* b;
   int N;
-  __device__ void run(int r, int c, const float* v) const {
+  using Col = Bias;
+  using Row = NoRow;
+  __device__ void col(int c, Col& x) const {
+    if (b) load<4>(b + c, x.b);
+  }
+  __device__ void row(int, int, Row&) const {}
+  __device__ void run(int r, int c, const float* v, const Col& bb, const Row&) const {
     float p[4], o[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) p[j] = v[j];
     if (b) {
-      float bb[4];
-      load<4>(b + c, bb);
 #pragma unroll
-      for (int j = 0; j < 4; ++j) p[j] += bb[j];
+      for (int j = 0; j < 4; ++j) p[j] += bb.b[j];
     }
     const std::size_t at = std::size_t(r) * N + c;
     if (pre) store<4>(pre + at, p);
@@ -205,10 +226,16 @@ struct SiluBwd {
   const float* pre;
   float* grad;
   int N;
-  __device__ void run(int r, int c, const float* a) const {
+  using Col = NoRow;
+  struct Row {
+    float x[4];
+  };
+  __device__ void col(int, Col&) const {}
+  __device__ void row(int r, int c, Row& in) const { load<4>(pre + std::size_t(r) * N + c, in.x); }
+  __device__ void run(int r, int c, const float* a, const Col&, const Row& in) const {
     const std::size_t at = std::size_t(r) * N + c;
-    float x[4], g[4];
-    load<4>(pre + at, x);
+    const float* x = in.x;
+    float g[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const float sg = sigmoid(x[j]);
@@ -224,20 +251,28 @@ struct Plain {
   const float* b;
   float beta;
   int N;
-  __device__ void run(int r, int c, const float* v) const {
+  using Col = Bias;
+  struct Row {
+    float y[4];
+  };
+  __device__ void col(int c, Col& x) const {
+    if (b) load<4>(b + c, x.b);
+  }
+  __device__ void row(int r, int c, Row& x) const {
+    if (beta != 0.0f) load<4>(out + std::size_t(r) * N + c, x.y);
+  }
+  __device__ void run(int r, int c, const float* v, const Col& bb, const Row& in) const {
     float* o = out + std::size_t(r) * N + c;
-    float x[4], y[4];
+    float x[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) x[j] = v[j];
     if (b) {
-      load<4>(b + c, y);
 #pragma unroll
-      for (int j = 0; j < 4; ++j) x[j] += y[j];
+      for (int j = 0; j < 4; ++j) x[j] += bb.b[j];
     }
     if (beta != 0.0f) {
-      load<4>(o, y);
 #pragma unroll
-      for (int j = 0; j < 4; ++j) x[j] += beta * y[j];
+      for (int j = 0; j < 4; ++j) x[j] += beta * in.y[j];
     }
     store<4>(o, x);
   }
