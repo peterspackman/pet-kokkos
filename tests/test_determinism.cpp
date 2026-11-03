@@ -46,8 +46,9 @@ TEST_CASE("repeated evaluation is bit-identical", "[model][determinism]") {
       continue;
     }
     pet::Calculator calc(found->first, found->second);
-    // The process-global setting, which PET_GEMM could have changed.
-    REQUIRE(pet::gemm_mode() == pet::GemmMode::Native);
+    // The process-global setting, which PET_GEMM could have changed: an
+    // fp32-accurate one.
+    REQUIRE((pet::gemm_mode() == pet::GemmMode::Native || pet::gemm_mode() == pet::GemmMode::TF32x3));
 
     for (const auto& path : golden_paths(model)) {
       const Golden g = load_golden(path);
@@ -417,9 +418,10 @@ TEST_CASE("the TF32 mode's tensor-core tile does not change the answer", "[model
     return;
   }
   struct Restore {
+    pet::GemmMode gemm = pet::gemm_mode();
     ~Restore() {
       pet::detail::set_tf32_tile(-1);
-      pet::gemm_mode() = pet::GemmMode::Native;
+      pet::gemm_mode() = gemm;
     }
   } restore;
   pet::gemm_mode() = pet::GemmMode::TF32;
@@ -448,6 +450,71 @@ TEST_CASE("the TF32 mode's tensor-core tile does not change the answer", "[model
   }
 }
 
+TEST_CASE("the 3xTF32 modes keep fp32's accuracy, repeat themselves and keep batch invariance",
+          "[model][determinism]") {
+  // GemmMode::TF32x3 and AttentionMode::TF32x3 split each operand into two TF32
+  // parts and sum three products: about fp32's 24 bits, where TF32 keeps 11
+  // (0.1-0.4 meV/atom from fp32). Their distance from fp32 must be fp32
+  // rounding's, far below TF32's; every tile walks k in one order, and each
+  // (atom, head) is one block, so the bits repeat and do not depend on the
+  // batch or the tile.
+  const int tiles = pet::detail::x3_tile_count();
+  if (tiles == 0 || !pet::detail::tf32_attention_available()) {
+    WARN("the 3xTF32 modes do not run on CUTLASS tensor cores here; skipping");
+    return;
+  }
+  struct Restore {
+    pet::GemmMode gemm = pet::gemm_mode();
+    pet::AttentionMode attn = pet::attention_mode();
+    ~Restore() {
+      pet::detail::set_tf32_tile(-1);
+      pet::gemm_mode() = gemm;
+      pet::attention_mode() = attn;
+    }
+  } restore;
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    pet::Options opts;
+    opts.graphs = false;
+    const pet::Calculator calc(found->first, found->second, opts);
+    const std::vector<pet::System> batch = rattled_batch(model);
+    if (batch.empty()) continue;
+    DYNAMIC_SECTION(model) {
+      pet::gemm_mode() = pet::GemmMode::Native;
+      pet::attention_mode() = pet::AttentionMode::Native;
+      const Device fp32 = device_eval(calc, batch);
+      pet::gemm_mode() = pet::GemmMode::TF32x3;
+      pet::attention_mode() = pet::AttentionMode::TF32x3;
+      REQUIRE(pet::batch_invariant_gemms());
+      const Device a = device_eval(calc, batch), b = device_eval(calc, batch);
+      for (std::size_t s = 0; s < batch.size(); ++s) {
+        INFO("structure " << s);
+        REQUIRE(a.energy[s] == b.energy[s]);
+        REQUIRE(a.forces[s] == b.forces[s]);
+        const double de = std::abs(a.energy[s] - fp32.energy[s]) / batch[s].n_atoms;
+        double df = 0.0;
+        for (std::size_t i = 0; i < a.forces[s].size(); ++i) df = worst(df, std::abs(a.forces[s][i] - fp32.forces[s][i]));
+        INFO("|dE| = " << 1e3 * de << " meV/atom, max |dF| = " << 1e3 * df << " meV/A from fp32");
+        CHECK(de <= 1e-5);
+        CHECK(df <= 1e-3);
+        require_same_structure(a, int(s), device_eval(calc, {batch[s]}), "alone");
+      }
+      for (int tile = 0; tile < tiles; ++tile) {
+        INFO("tile " << tile);
+        pet::detail::set_tf32_tile(tile);
+        const Device pinned = device_eval(calc, batch);
+        for (std::size_t s = 0; s < batch.size(); ++s) {
+          REQUIRE(pinned.energy[s] == a.energy[s]);
+          REQUIRE(pinned.forces[s] == a.forces[s]);
+          REQUIRE(pinned.virial[s] == a.virial[s]);
+        }
+      }
+      pet::detail::set_tf32_tile(-1);
+    }
+  }
+}
+
 TEST_CASE("TF32 attention repeats itself, keeps batch invariance, and stays near fp32", "[model][determinism]") {
   // AttentionMode::TF32 rounds attention's operands to TF32 (10-bit mantissa)
   // on tensor cores. Each (atom, head) is one block in a fixed order, so it
@@ -459,7 +526,8 @@ TEST_CASE("TF32 attention repeats itself, keeps batch invariance, and stays near
     return;
   }
   struct Restore {
-    ~Restore() { pet::attention_mode() = pet::AttentionMode::Native; }
+    pet::AttentionMode attn = pet::attention_mode();
+    ~Restore() { pet::attention_mode() = attn; }
   } restore;
   for (const auto& model : golden_models()) {
     const auto found = find_model(model);

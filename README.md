@@ -420,7 +420,7 @@ The virial is `W = V·σ`, a symmetric tensor in Voigt order
 
 ### Faster modes
 
-Everything runs in fp32 unless you ask otherwise: the answers are the
+Everything runs fp32-accurate unless you ask otherwise: the answers are the
 reference's, to fp32 rounding, on every device. Two independent switches trade
 a little accuracy for speed on tensor cores. Each is process-wide and can be
 set by environment variable, by `pet::Options`, or as a metatomic option:
@@ -429,6 +429,33 @@ set by environment variable, by `pet::Options`, or as a metatomic option:
 |---|---|---|---|
 | GEMM mode | the dense layers' matrix products | see below | `PET_GEMM` / `gemm` / `gemm` |
 | attention mode | attention's own products (scores, weights times values, their adjoints) | NVIDIA, compute capability 8.0+ | `PET_ATTN` / `attention` / `attention` |
+
+**fp32 on tensor cores (3xTF32, the default on A100, H100/H200 and B200).**
+On these GPUs the TF32 tensor cores run 7-8x the rate of the fp32 CUDA cores,
+so by default (`PET_GEMM` and `PET_ATTN` unset, or `3xtf32`) the GEMMs and
+attention's products run there with each fp32 operand split into two TF32
+parts, both rounded to nearest, and three of their four products summed in
+fp32. That carries fp32's 24 bits, not TF32's 11. Measured against the fp64
+build on pet-mad-xs, pet-mad-s, pet-omat-s and pet-mols-s, 648- and 5184-atom
+water and 1728-atom diamond:
+
+| against fp64 | energy | largest force error | RMS force error |
+|---|---|---|---|
+| fp32 on the CUDA cores (`PET_GEMM=native PET_ATTN=native`) | 1e-5-2.2e-4 meV/atom | 3.4-9.6e-3 meV/Å | 0.8-2.2e-3 meV/Å |
+| 3xTF32 (the default here) | 5e-5-2.2e-3 meV/atom | 3.6-11e-3 meV/Å | 1.0-2.5e-3 meV/Å |
+| `PET_GEMM=tf32 PET_ATTN=tf32` | 0.02-0.31 meV/atom | 1.4-9.3 meV/Å | 0.3-2.1 meV/Å |
+
+The forces are as accurate as CUDA-core fp32's; the energy's error, though up
+to 15x fp32's, is under 2.2e-6 eV per atom, about 3e-7 of the energy per atom:
+an fp32 ulp or two. Results repeat to the bit, do not depend on the batch or
+on which tensor-core tile the GEMMs time fastest, but differ from the CUDA-core
+path's at rounding level. On an H200 it is 23-25% faster than the CUDA cores
+(the table below). (CUTLASS's own 3xTF32 truncates the big part, which biases
+the energy by up to 5e-3 meV/atom; rounding both parts to nearest removes most
+of that.)
+On other GPUs (RTX, RTX Ada / workstation, before compute capability 8.0) the
+default is the CUDA cores, where TF32 would not be faster; `3xtf32` still runs
+there when asked for, from compute capability 8.0.
 
 **For MD or relaxations on a recent NVIDIA GPU** (A100, H100/H200, RTX 30xx/40xx),
 `PET_GEMM=tf32 PET_ATTN=tf32` is the one to use. Measured against fp32, on
@@ -444,11 +471,18 @@ pet-mad-xs, pet-mad-s, pet-mols-s and pet-omat-l, 648-atom water and
 all far below the models' own errors. With `PET_GEMM=tf32` the NVE energy drift
 is the same as fp32's; it has not yet been measured with `PET_ATTN=tf32`.
 
-What they buy, ms per evaluation with forces:
+What they buy, ms per evaluation with forces. On an H200 (best of 20):
+
+| | fp32, CUDA cores (`native`) | fp32, 3xTF32 (default) | `PET_GEMM=tf32 PET_ATTN=tf32` |
+|---|---|---|---|
+| pet-mad-s, 5184-atom water | 87.9 | 65.7 | 30.7 |
+| pet-omat-s, 5184-atom water | 60.9 | 46.0 | 21.8 |
+| pet-mad-xs, 5184-atom water | 17.7 | 13.7 | 9.0 |
+
+and, measured earlier (2026-10, CUDA-core fp32 as the default then):
 
 | | fp32 | `PET_GEMM=tf32` | + `PET_ATTN=tf32` |
 |---|---|---|---|
-| H200, pet-mad-s, 5184-atom water | 92.0 | 37.6 | 33.2 |
 | H200, pet-mols-s, 5184-atom water | 98.5 | 51.0 | 39.0 |
 | H200, pet-omat-l, 2592-atom water | 439 | 138 | 116 |
 | RTX 4080 SUPER, pet-mad-s, 648-atom water | 24.5 | 17.3 | 16.7 |
@@ -456,7 +490,8 @@ What they buy, ms per evaluation with forces:
 
 An H200's fp32 runs on its CUDA cores, several times slower than its TF32
 tensor cores, so it gains the most; an RTX 4080's TF32 and fp32 peaks are about
-equal, and what it gains is from better-used kernels.
+equal, and what it gains is from better-used kernels (and there the default
+stays on the CUDA cores).
 
 The other GEMM modes:
 
@@ -526,10 +561,13 @@ stress uncertainties upet derives from ensembles are not implemented.
 ## Environment variables
 
 - `PET_MODEL_DIR`: extra directories to search for models.
-- `PET_GEMM`: `native` (default, fp32), `tf32`, `fp16`, `bf16`, `fp8` or
-  `ozaki`; see [Faster modes](#faster-modes).
-- `PET_ATTN`: `native` (default, fp32) or `tf32`; see
-  [Faster modes](#faster-modes).
+- `PET_GEMM`: `native` (fp32 on the CUDA cores or CPU), `3xtf32` (as
+  accurate, on tensor cores; the default on A100, H100/H200 and B200),
+  `tf32`, `fp16`, `bf16`, `fp8` or `ozaki`; see [Faster modes](#faster-modes).
+- `PET_ATTN`: `native`, `3xtf32` (the default where `PET_GEMM`'s is) or
+  `tf32`; see [Faster modes](#faster-modes).
+- `PET_TF32_TILE=0..7`: pin the CUTLASS tensor-core tile (`tf32` on Ampere and
+  Ada, `3xtf32`) instead of timing them; for tests and profiling.
 - `PET_CUTLASS=0`: use plain cuBLAS instead of the CUTLASS kernels.
 - `PET_GRAPHS=0`: don't use CUDA graphs (useful when profiling). On HIP graphs
   are off unless `PET_GRAPHS=1`: under ROCm 7.0.1 a replayed graph gave wrong

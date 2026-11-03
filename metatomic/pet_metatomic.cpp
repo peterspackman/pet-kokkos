@@ -75,9 +75,8 @@ void kokkos_release() {
 
 struct PetOptions {
   pet::Options calc;
-  // The GEMM mode, when given. pet::Options::gemm = Native means "the default"
-  // (PET_GEMM, else fp32), so an explicit "native" is set directly, over PET_GEMM.
-  // Process-global, as in pet-kokkos: the last model loaded sets it.
+  // The GEMM mode, when given, set directly over PET_GEMM. Process-global, as in
+  // pet-kokkos: the last model loaded sets it.
   std::optional<pet::GemmMode> gemm;
   std::optional<pet::AttentionMode> attention;  // the same, for attention's products
   int device_id = -1;  // -1: by node-local MPI rank
@@ -102,9 +101,9 @@ PetOptions parse_options(const std::map<std::string, std::string>& options) {
     if (key == "gemm") {
       o.gemm = pet::parse_gemm_mode(value.c_str());
     } else if (key == "attention") {
-      if (value != "native" && value != "tf32")
-        throw metatomic::Error("pet-kokkos option 'attention' must be native or tf32");
-      o.attention = value == "tf32" ? pet::AttentionMode::TF32 : pet::AttentionMode::Native;
+      if (value != "native" && value != "tf32" && value != "3xtf32")
+        throw metatomic::Error("pet-kokkos option 'attention' must be native, tf32 or 3xtf32");
+      o.attention = pet::parse_attention_mode(value.c_str());
     } else if (key == "recompute") {
       bool found = false;
       for (auto r : {pet::Recompute::Auto, pet::Recompute::Never, pet::Recompute::Wide, pet::Recompute::Layers})
