@@ -1115,7 +1115,7 @@ HvpOut PetModel::hvp_pass(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
     std::vector<LayerSaves> sav(G);
     std::vector<LayerTangents> tan(G);
     for (int L = 0; L < G; ++L) {
-      sav[L].tag = std::to_string(L);
+      sav[L].tag = std::to_string(L), sav[L].keep_concat = true;
       ff_layer(dev, pk, L, node, input_edge, cond, &sav[L], true);
       ff_layer_tan(pk, L, sav[L], tan[L], K, node_t, ie_t, x4_t, cf_seq, cf_t);
     }
