@@ -9,9 +9,9 @@ Units are the model's: Angstrom, eV, eV/A. ``virial`` is the symmetric
 W = V * stress in Voigt order [xx, yy, zz, xy, xz, yz]. For ASE, see
 ``pet_kokkos.ase.PETCalculator``.
 
-Everything runs fp32-accurate unless asked otherwise (on A100, H100/H200 and
-B200 as 3xTF32 on the tensor cores, elsewhere on the CUDA cores or CPU):
-``gemm="tf32"`` and ``attention="tf32"`` run on TF32 tensor cores on recent
+Everything runs in plain fp32 unless asked otherwise: ``gemm="3xtf32"`` and
+``attention="3xtf32"`` keep fp32's force accuracy on the tensor cores of A100,
+H100/H200 and B200, faster there; ``gemm="tf32"`` and ``attention="tf32"`` run on TF32 tensor cores on recent
 NVIDIA GPUs, faster and less exact (see the README's "Faster modes"); both are
 process-wide.
 """
@@ -73,7 +73,7 @@ class Calculator:
         to ``<prefix>.json`` and ``<prefix>.safetensors``.
     gemm, attention: "native" (fp32 on the CUDA cores), "3xtf32" (as accurate,
         on tensor cores) or "tf32", ... (process-wide; None leaves the current
-        mode, the fp32-accurate default unless set).
+        mode, native unless set).
     cache_neighbors: keep a Verlet cache of the neighbour topology across calls,
         for MD and relaxations of the same atoms.
     non_conservative: forces and virial from the model's direct heads (upet's

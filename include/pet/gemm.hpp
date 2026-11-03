@@ -79,12 +79,10 @@ bool fast_tf32_device();
 int x3_tile_count();
 }  // namespace detail
 
-// The fp32-accurate mode that is fastest here: TF32x3 where the tensor cores
-// make it faster (detail::fast_tf32_device) and the build has CUTLASS, else
-// Native.
-inline GemmMode default_gemm_mode() {
-  return detail::fast_tf32_device() && detail::x3_tile_count() > 0 ? GemmMode::TF32x3 : GemmMode::Native;
-}
+// The default: Native, plain fp32. TF32x3 is as accurate on the forces and
+// faster where detail::fast_tf32_device(), but its energy error is up to 15x
+// fp32's, so it is asked for (PET_GEMM=3xtf32), never assumed.
+inline GemmMode default_gemm_mode() { return GemmMode::Native; }
 
 inline GemmMode& gemm_mode() {
   static GemmMode m = [] {
@@ -100,13 +98,11 @@ inline GemmMode& gemm_mode() {
 // GemmMode::TF32x3), as accurate as Native (CUDA, compute capability 8.0 and
 // later, else Native); or TF32 on tensor cores, which changes the answer and is
 // off unless asked for. Separate from the GEMM mode, so each can be measured on
-// its own. Process-global, from PET_ATTN=native|tf32|3xtf32; unset, TF32x3
-// where detail::fast_tf32_device(), else Native.
+// its own. Process-global, from PET_ATTN=native|tf32|3xtf32; unset, Native
+// (TF32x3, like the GEMM mode's, is opt-in).
 enum class AttentionMode { Native, TF32, TF32x3 };
 
-inline AttentionMode default_attention_mode() {
-  return detail::fast_tf32_device() ? AttentionMode::TF32x3 : AttentionMode::Native;
-}
+inline AttentionMode default_attention_mode() { return AttentionMode::Native; }
 
 inline AttentionMode parse_attention_mode(const char* e) {
   if (!e || !*e) return default_attention_mode();
