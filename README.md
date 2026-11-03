@@ -531,7 +531,11 @@ stress uncertainties upet derives from ensembles are not implemented.
 - `PET_ATTN`: `native` (default, fp32) or `tf32`; see
   [Faster modes](#faster-modes).
 - `PET_CUTLASS=0`: use plain cuBLAS instead of the CUTLASS kernels.
-- `PET_GRAPHS=0`: don't use CUDA/HIP graphs (useful when profiling).
+- `PET_GRAPHS=0`: don't use CUDA graphs (useful when profiling). On HIP graphs
+  are off unless `PET_GRAPHS=1`: under ROCm 7.0.1 a replayed graph gave wrong
+  forces in a stepping loop, and they never made an MI250X evaluation faster.
+- `PET_MFMA_GEMM=0`: on AMD CDNA GPUs, use rocBLAS/hipBLASLt instead of the
+  built-in fp32 matrix-core GEMMs and their fused epilogues.
 - `PET_RECOMPUTE`: `never`, `wide` or `layers` forces how much of the forward
   the backward recomputes; by default the cheapest tier whose estimate fits the
   device (less a reserve of 10% or 1.5 GiB) is taken, and a pass that runs out

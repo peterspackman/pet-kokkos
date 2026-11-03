@@ -70,6 +70,13 @@ void swiglu_in(View2D pre, View2D h, View2D in, const WeightRef& w_in, View1D b_
 void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const WeightRef& w_in,
                 const WeightRef& w_out, Net beta);
 
+// On AMD's CDNA GPUs the fused GEMMs are fused_gemm_hip.cpp's (MFMA), not
+// fused_gemm.cpp's.
+#if defined(KOKKOS_ENABLE_HIP) && !defined(PET_KOKKOS_FP64) &&                                     \
+    (defined(KOKKOS_ARCH_AMD_GFX908) || defined(KOKKOS_ARCH_AMD_GFX90A) || defined(KOKKOS_ARCH_AMD_GFX940) || \
+     defined(KOKKOS_ARCH_AMD_GFX942) || defined(KOKKOS_ARCH_AMD_GFX942_APU))
+#define PET_FUSED_HIP 1
+#endif
 // The same with the GEMM and the elementwise step fused (fused_gemm.cpp), h
 // optional; false when that cannot run here.
 bool swiglu_in_fused(View2D pre, View2D h, View2D in, const View2D& w, View1D b);
