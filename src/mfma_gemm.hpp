@@ -57,9 +57,16 @@ struct Tile {
 // padded by 4 floats, so a read's g = 0 and g = 1 lanes are 16 banks apart.
 __device__ inline int swz(int r, int chunk) { return r * 16 + ((chunk ^ (r >> 1)) & 3) * 4; }
 
-template <class T, bool NN, class Epi>
-__global__ void __launch_bounds__(T::kThreads) gemm(int M, int N, int K, const float* __restrict__ A,
-                                                     const float* __restrict__ W, Epi epi) {
+// The activation operand: A's rows as they are, or (a prologue) four values a
+// load computed from other buffers, row r's columns k..k+3.
+struct Rows {
+  const float* A;
+  int K;
+  __device__ float4 operator()(int r, int k) const { return *reinterpret_cast<const float4*>(A + size_t(r) * K + k); }
+};
+
+template <class T, bool NN, class Epi, class Pro>
+__global__ void __launch_bounds__(T::kThreads) gemm(int M, int N, int K, Pro A, const float* __restrict__ W, Epi epi) {
   constexpr int BM = T::BM, BN = T::BN, FM = T::FM, FN = T::FN, NT = T::kThreads, PB = BN + 4;
   constexpr int AQ = BM * 4 / NT, BQ = BN * 4 / NT;  // 16-byte loads a thread per k tile
   __shared__ float As[BM * 16];
@@ -80,8 +87,7 @@ __global__ void __launch_bounds__(T::kThreads) gemm(int M, int N, int K, const f
 #pragma unroll
     for (int q = 0; q < AQ; ++q) {
       const int e = tid + q * NT, r = e / 4, k = k0 + (e % 4) * 4;
-      ra[q] = (m0 + r < M && k < K) ? *reinterpret_cast<const float4*>(A + size_t(m0 + r) * K + k)
-                                    : float4{0, 0, 0, 0};
+      ra[q] = (m0 + r < M && k < K) ? A(m0 + r, k) : float4{0, 0, 0, 0};
     }
 #pragma unroll
     for (int q = 0; q < BQ; ++q) {
@@ -161,10 +167,14 @@ __global__ void __launch_bounds__(T::kThreads) gemm(int M, int N, int K, const f
   }
 }
 
+template <class T, bool NN, class Epi, class Pro>
+void launch(hipStream_t st, int M, int N, int K, Pro A, const float* W, Epi epi) {
+  const int blocks = ((M + T::BM - 1) / T::BM) * ((N + T::BN - 1) / T::BN);
+  hipLaunchKernelGGL((gemm<T, NN, Epi, Pro>), dim3(blocks), dim3(T::kThreads), 0, st, M, N, K, A, W, epi);
+}
 template <class T, bool NN, class Epi>
 void launch(hipStream_t st, int M, int N, int K, const float* A, const float* W, Epi epi) {
-  const int blocks = ((M + T::BM - 1) / T::BM) * ((N + T::BN - 1) / T::BN);
-  hipLaunchKernelGGL((gemm<T, NN, Epi>), dim3(blocks), dim3(T::kThreads), 0, st, M, N, K, A, W, epi);
+  launch<T, NN>(st, M, N, K, Rows{A, K}, W, epi);
 }
 
 }  // namespace pet::mfma_gemm

@@ -85,6 +85,10 @@ bool linear_fused(View2D out, View2D in, const View2D& w, bool w_transposed, Vie
 bool silu_in_fused(View2D out, View2D pre, View2D in, const View2D& w, View1D b);
 bool silu_bwd_fused(View2D grad, View2D out_adj, const View2D& w, View2D pre);
 bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2D pre);
+// All of swiglu_bwd with pre_adj never written out: made as the second GEMM
+// loads it (fused_gemm_hip.cpp, AMD CDNA); false elsewhere.
+bool swiglu_bwd_deferred(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const WeightRef& w_in,
+                         const WeightRef& w_out, Net beta);
 
 // out = silu(pre), pre = compress.0 of one GNN layer through its CompressFold.
 // `sav`, unless empty, receives pre.

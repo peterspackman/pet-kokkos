@@ -176,6 +176,7 @@ void swiglu(Workspace& ws, View2D out, View2D in, const WeightRef& w_in, View1D 
 
 void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const WeightRef& w_in,
                 const WeightRef& w_out, Net beta) {
+  if (swiglu_bwd_deferred(ws, in_adj, out_adj, pre, w_in, w_out, beta)) return;
   const int R = out_adj.extent(0), F = pre.extent(1) / 2;
   Workspace::Scope scope(ws);
   View2D pre_adj = ws.tmp(R, 2 * F);

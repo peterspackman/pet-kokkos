@@ -81,8 +81,8 @@ long blocks(int M, int N) {
 // from 512, each only while it gives two blocks a CU, else the next smaller
 // (the tile changes the speed, never a bit of the answer). Eight-wave 128 x 128
 // blocks were faster alone but 1% slower in the network.
-template <class LayoutB, class Epi>
-void launch(const char* name, int M, int N, int K, const float* A, const float* B, Epi epi) {
+template <class LayoutB, class Epi, class Pro>
+void launch(const char* name, int M, int N, int K, Pro A, const float* B, Epi epi) {
   if (M == 0 || N == 0) return;
   constexpr bool NN = std::is_same_v<LayoutB, RM>;
   int t = forced_tile();
@@ -103,6 +103,23 @@ void launch(const char* name, int M, int N, int K, const float* A, const float* 
 
 // The main loop reads both operands' rows 16 bytes at a time and the epilogues
 // write whole runs of four: contiguous, 16-byte aligned, K and N multiples of 4.
+mg::Rows rows(const View2D& v) { return {v.data(), int(v.extent(1))}; }
+
+// The SwiGLU backward's pre-activation adjoint, made as the next GEMM loads
+// it: from h_adj [R, F] and pre [R, 2F] (v and gate interleaved), columns
+// k..k+3 of pre_adj [R, 2F] -- the epilogue SwigluBwd's arithmetic, so the
+// same bits, without writing pre_adj out and reading it back.
+struct SwigluAdj {
+  const float *h_adj, *pre;
+  int F;
+  __device__ float4 operator()(int r, int k) const {
+    const float2 ha = *reinterpret_cast<const float2*>(h_adj + size_t(r) * F + k / 2);
+    const float4 p = *reinterpret_cast<const float4*>(pre + size_t(r) * 2 * F + k);
+    const float s0 = sigmoid(p.y), s1 = sigmoid(p.w);
+    return float4{ha.x * s0, ha.x * p.x * s0 * (1.0f - s0), ha.y * s1, ha.y * p.z * s1 * (1.0f - s1)};
+  }
+};
+
 bool vec_ok(const View2D& v) { return v.span_is_contiguous() && v.extent(1) % 4 == 0 && aligned(v.data()); }
 bool vec_ok(const View1D& v) { return aligned(v.data()); }
 bool usable(const View2D& in, const View2D& w) { return enabled() && fp32_mode() && vec_ok(in) && vec_ok(w); }
@@ -277,8 +294,8 @@ bool linear_fused(View2D out, View2D in, const View2D& w, bool w_transposed, Vie
   if (K % 4 == 0 && N % 4 == 0) {  // the main loop's shapes: unless an operand is laid out oddly
     if (!usable(in, w) || !vec_ok(out) || (b.data() && !vec_ok(b))) return false;
     const Plain epi{out.data(), b.data(), float(beta), N};
-    if (w_transposed) launch<CM>("linear", M, N, K, in.data(), w.data(), epi);
-    else launch<RM>("linear_bwd", M, N, K, in.data(), w.data(), epi);
+    if (w_transposed) launch<CM>("linear", M, N, K, rows(in), w.data(), epi);
+    else launch<RM>("linear_bwd", M, N, K, rows(in), w.data(), epi);
     return true;
   }
   if (in.stride(1) != 1 || out.stride(1) != 1) return false;
@@ -298,29 +315,50 @@ bool linear_fused(View2D out, View2D in, const View2D& w, bool w_transposed, Vie
 
 bool silu_in_fused(View2D out, View2D pre, View2D in, const View2D& w, View1D b) {
   if (!usable(in, w) || !vec_ok(out) || (pre.data() && !vec_ok(pre)) || (b.data() && !vec_ok(b))) return false;
-  launch<CM>("fused linear_silu", out.extent(0), out.extent(1), in.extent(1), in.data(), w.data(),
+  launch<CM>("fused linear_silu", out.extent(0), out.extent(1), in.extent(1), rows(in), w.data(),
              SiluFwd{out.data(), pre.data(), b.data(), int(out.extent(1))});
   return true;
 }
 
 bool silu_bwd_fused(View2D grad, View2D out_adj, const View2D& w, View2D pre) {
   if (!usable(out_adj, w) || !vec_ok(grad) || !vec_ok(pre)) return false;
-  launch<RM>("fused silu_bwd", grad.extent(0), grad.extent(1), out_adj.extent(1), out_adj.data(), w.data(),
+  launch<RM>("fused silu_bwd", grad.extent(0), grad.extent(1), out_adj.extent(1), rows(out_adj), w.data(),
              SiluBwd{pre.data(), grad.data(), int(grad.extent(1))});
   return true;
 }
 
 bool swiglu_in_fused(View2D pre, View2D h, View2D in, const View2D& w, View1D b) {
   if (!usable(in, w) || !vec_ok(pre) || (h.data() && !vec_ok(h)) || !vec_ok(b)) return false;
-  launch<CM>("fused swiglu_in", pre.extent(0), pre.extent(1), in.extent(1), in.data(), w.data(),
+  launch<CM>("fused swiglu_in", pre.extent(0), pre.extent(1), in.extent(1), rows(in), w.data(),
              SwigluFwd{pre.data(), h.data(), b.data(), int(pre.extent(1))});
   return true;
 }
 
 bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2D pre) {
   if (!usable(out_adj, w_out) || !vec_ok(pre) || !vec_ok(pre_adj) || w_out.extent(1) % 4) return false;
-  launch<RM>("fused swiglu_bwd", out_adj.extent(0), w_out.extent(1), out_adj.extent(1), out_adj.data(), w_out.data(),
+  launch<RM>("fused swiglu_bwd", out_adj.extent(0), w_out.extent(1), out_adj.extent(1), rows(out_adj), w_out.data(),
              SwigluBwd{pre.data(), pre_adj.data(), int(w_out.extent(1))});
+  return true;
+}
+
+bool swiglu_bwd_deferred(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const WeightRef& w_in,
+                         const WeightRef& w_out, Net beta) {
+  const int R = out_adj.extent(0), F = pre.extent(1) / 2;
+  // Below some 50k rows (a 648-molecule water's edges) the one-pass epilogue
+  // is faster: 20.7 against 21.0 ms there, 138.6 against 137.3 at 5184. The
+  // two give the same bits, so the choice by size keeps batch invariance.
+  if (R < 50000) return false;
+  if (w_in.split || w_out.split || !usable(out_adj, w_out.v) || !vec_ok(pre) || !vec_ok(in_adj) ||
+      !vec_ok(w_in.v) || F % 4 || int(w_out.extent(1)) != F || int(w_in.extent(0)) != 2 * F)
+    return false;
+  Workspace::Scope scope(ws);
+  View2D h_adj = ws.tmp(R, F);
+  if (!vec_ok(h_adj)) return false;
+  const int N = in_adj.extent(1);
+  launch<RM>("swiglu_bwd h_adj", R, F, out_adj.extent(1), rows(out_adj), w_out.v.data(),
+             Plain{h_adj.data(), nullptr, 0.0f, F});
+  launch<RM>("swiglu_bwd in_adj", R, N, 2 * F, SwigluAdj{h_adj.data(), pre.data(), F}, w_in.v.data(),
+             Plain{in_adj.data(), nullptr, float(beta), N});
   return true;
 }
 
