@@ -39,6 +39,7 @@ add_library(pet_kokkos STATIC
     gemm_lowp.cpp
     vesin_neighbors.cpp
     fused_gemm.cpp
+    fused_gemm_hip.cpp
 )
 add_library(pet::kokkos ALIAS pet_kokkos)
 

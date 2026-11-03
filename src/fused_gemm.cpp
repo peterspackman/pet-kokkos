@@ -500,7 +500,7 @@ bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2
   return true;
 }
 
-#else
+#elif !defined(PET_FUSED_HIP)  // else fused_gemm_hip.cpp
 
 bool batch_invariant_gemms() {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(PET_HAVE_CBLAS)
@@ -519,6 +519,10 @@ bool silu_bwd_fused(View2D, View2D, const View2D&, View2D) { return false; }
 bool swiglu_in_fused(View2D, View2D, View2D, const View2D&, View1D) { return false; }
 bool swiglu_bwd_fused(View2D, View2D, const View2D&, View2D) { return false; }
 
+#endif
+
+#if !defined(PET_FUSED_HIP)
+bool swiglu_bwd_deferred(Workspace&, View2D, View2D, View2D, const WeightRef&, const WeightRef&, Net) { return false; }
 #endif
 
 }  // namespace pet

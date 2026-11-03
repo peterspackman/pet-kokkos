@@ -227,7 +227,16 @@ struct Calculator::Impl {
     device_memory(o, free_b, total_b);
     // PET_GRAPHS=0 is for profilers that fence around every kernel.
     const char* g = std::getenv("PET_GRAPHS");
+#if defined(KOKKOS_ENABLE_HIP)
+    // On HIP only when asked for (PET_GRAPHS=1): under ROCm 7.0.1 on an MI250X a
+    // stepping engine's replayed graph gave garbage forces from its second
+    // replay on (tests [edges]; eager runs are right), and graphs never made an
+    // evaluation there faster (pet-mad-s, 5184 water 147.7 ms either way;
+    // pet-mad-xs, 648 water 6.3 ms).
+    model.set_graphs(o.graphs && g && g[0] == '1');
+#else
     model.set_graphs(o.graphs && !(g && g[0] == '0'));
+#endif
     model.set_non_conservative(o.non_conservative);
     model.set_uncertainty(o.uncertainty);
     // PET_RECOMPUTE=never|wide|layers|auto overrides the option, to compare tiers.
