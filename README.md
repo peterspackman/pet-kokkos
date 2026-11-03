@@ -578,6 +578,10 @@ stress uncertainties upet derives from ensembles are not implemented.
   the backward recomputes; by default the cheapest tier whose estimate fits the
   device (less a reserve of 10% or 1.5 GiB) is taken, and a pass that runs out
   of memory anyway is rerun a tier lower. `pet-eval --memory` shows the choice.
+  Under `wide` and `layers` the edge MLP (and, on AMD CDNA GPUs, the
+  attention) runs over chunks of rows, an eighth of the edges and at least 64k
+  rows, so its widest temporaries are a chunk's; the answer is the same to the
+  bit. `PET_EDGE_CHUNK=rows` sets the chunk, for tests.
 - `PET_DEVICE_SEARCH`: `auto`, `cells` or `brute`, for the GPU neighbour search.
 - `PET_NEIGHBORS=builtin`: use the built-in host neighbour search instead of
   vesin.
