@@ -93,6 +93,7 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::rebuild()
     Kokkos::parallel_reduce(
         "pet_max_tag", Range(0, nall), KOKKOS_LAMBDA(int i, tagint &m) { m = tag(i) > m ? tag(i) : m; },
         Kokkos::Max<tagint>(max_tag));
+    max_tag = std::max<tagint>(max_tag, 0);  // an empty range reduces to Max's identity, the lowest tagint
     if ((tagint) d_owned_by_tag.extent(0) <= max_tag) d_owned_by_tag = decltype(d_owned_by_tag)("pet:owned_by_tag", max_tag + 1);
     auto by_tag = d_owned_by_tag, image_of = d_image_of;
     Kokkos::deep_copy(by_tag, -1);
@@ -135,6 +136,7 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::route_on_device(cons
   Kokkos::parallel_reduce(
       "pet_max_tag", Range(0, nall), KOKKOS_LAMBDA(int i, tagint &m) { m = tag(i) > m ? tag(i) : m; },
       Kokkos::Max<tagint>(max_tag));
+  max_tag = std::max<tagint>(max_tag, 0);  // an empty range reduces to Max's identity, the lowest tagint
   if (int64_t(max_tag) >= (int64_t(1) << 31)) error->one(FLERR, "pair_style pet/kk mode exchange: atom IDs past 2^31");
 
   // Each ghost's owner: every rank's own number, forward to its ghosts.
@@ -308,6 +310,7 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::atoms_map(const pet:
   Kokkos::parallel_reduce(
       "pet_max_tag", Range(0, nlocal), KOKKOS_LAMBDA(int i, tagint &m) { m = tag(i) > m ? tag(i) : m; },
       Kokkos::Max<tagint>(max_tag));
+  max_tag = std::max<tagint>(max_tag, 0);  // an empty range reduces to Max's identity, the lowest tagint
   IV by_tag("pet:by_tag", max_tag + 1);
   Kokkos::deep_copy(by_tag, -1);
   Kokkos::parallel_for("pet_by_tag", Range(0, nlocal), KOKKOS_LAMBDA(int i) { by_tag(tag(i)) = i; });
