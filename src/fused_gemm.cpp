@@ -1,9 +1,10 @@
-// The fp32 and TF32 modes' weight GEMMs on CUDA, every one in the network:
-// CUTLASS's main loop -- SIMT fp32 in the native mode, TF32 tensor cores in the
-// TF32 mode -- with our own epilogue walking each thread's accumulators: the
-// bias, or the elementwise neighbours fused in. In the native mode one kernel
-// family serves every shape, so a structure's answer does not depend on its
-// batch.
+// The fp32, 3xTF32 and TF32 modes' weight GEMMs on CUDA, every one in the
+// network: CUTLASS's main loop -- SIMT fp32 in the native mode, 3xTF32 on
+// tensor cores in the TF32x3 mode (the default; fp32-accurate), TF32 tensor
+// cores in the TF32 mode -- with our own epilogue walking each thread's
+// accumulators: the bias, or the elementwise neighbours fused in. In the native
+// and TF32x3 modes the kernels give a row the same bits whatever the shape, so
+// a structure's answer does not depend on its batch.
 //
 // Each function returns false when it cannot run here -- no CUTLASS, a double
 // network, another GEMM mode, PET_CUTLASS=0, or an unaligned operand -- and the
@@ -22,6 +23,13 @@
 #define PET_FUSED 1
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/threadblock/default_mma.h>
+#endif
+// The 3xTF32 tiles' CTA k-step (see TcTiles), which is also how many k the
+// tensor cores sum before each fp32 add. On an H200, 32 is 4% faster than 16
+// (pet-mad-s 5184 water 63.0 against 65.8 ms) but its force error against fp64
+// 2-3x fp32's (RMS 2.6-4.3e-3 meV/A against 1.3-1.6e-3); at 16 it is fp32's.
+#ifndef PET_X3_K
+#define PET_X3_K 16
 #endif
 
 namespace pet {
@@ -58,21 +66,42 @@ using Small = Tiles<64, 32, 32, 32>;
 // they are memory-bound at k = 128-256, and a tile narrower than a row rereads
 // the large activation operand -- so each shape takes the one timed fastest on
 // its first call (pick_tile).
-template <int TM, int TN, int TK, int WM, int WN, int S>
+//
+// X3 (the TF32x3 mode): the same tiles on CUTLASS's 3xTF32 warp product. Each
+// operand is split, in registers, into a TF32 "big" part and a TF32 "small"
+// part for what big leaves out; each k-step accumulates small.big, big.small
+// and big.big (small.small, ~2^-22 relative, dropped), so a product carries
+// about fp32's 24 bits instead of TF32's 11, at a third of TF32's tensor-core
+// rate -- still above the CUDA cores' fp32 rate on Ampere and Hopper. CUTLASS
+// sums each CTA k-step's products into fresh accumulators and adds those to the
+// running ones in fp32 (staged accumulation), so the k-step sets the order:
+// every X3 tile takes the same one (PET_X3_K), and then the tile never changes
+// a bit. The split is rounded to nearest (FastF32Rn).
+template <int TM, int TN, int TK, int WM, int WN, int S, bool X3 = false>
 struct TcTiles {
-  using Tile = cutlass::gemm::GemmShape<TM, TN, TK>;
-  using Warp = cutlass::gemm::GemmShape<WM, WN, TK>;
+  static constexpr int kK = X3 ? PET_X3_K : TK;
+  using Tile = cutlass::gemm::GemmShape<TM, TN, kK>;
+  using Warp = cutlass::gemm::GemmShape<WM, WN, kK>;
   static constexpr bool kTensor = true;
   static constexpr int kStages = S;
+  using Op = std::conditional_t<X3, cutlass::arch::OpMultiplyAddFastF32, cutlass::arch::OpMultiplyAdd>;
 };
-using Tc64x64 = TcTiles<64, 64, 32, 32, 32, 4>;
-using Tc64x64s = TcTiles<64, 64, 16, 32, 32, 3>;  // the s tiles: small shared memory, more CTAs per SM
-using Tc64x128s = TcTiles<64, 128, 16, 32, 64, 3>;
-using Tc128x64s = TcTiles<128, 64, 16, 64, 32, 3>;
-using Tc128x128 = TcTiles<128, 128, 16, 64, 64, 3>;
-using Tc128x128w8 = TcTiles<128, 128, 32, 32, 64, 3>;
-using Tc128x256 = TcTiles<128, 256, 16, 64, 64, 3>;
-using Tc256x128 = TcTiles<256, 128, 16, 64, 64, 3>;
+template <bool X3>
+using Tc64x64 = TcTiles<64, 64, 32, 32, 32, 4, X3>;
+template <bool X3>
+using Tc64x64s = TcTiles<64, 64, 16, 32, 32, 3, X3>;  // the s tiles: small shared memory, more CTAs per SM
+template <bool X3>
+using Tc64x128s = TcTiles<64, 128, 16, 32, 64, 3, X3>;
+template <bool X3>
+using Tc128x64s = TcTiles<128, 64, 16, 64, 32, 3, X3>;
+template <bool X3>
+using Tc128x128 = TcTiles<128, 128, 16, 64, 64, 3, X3>;
+template <bool X3>
+using Tc128x128w8 = TcTiles<128, 128, 32, 32, 64, 3, X3>;
+template <bool X3>
+using Tc128x256 = TcTiles<128, 256, 16, 64, 64, 3, X3>;
+template <bool X3>
+using Tc256x128 = TcTiles<256, 128, 16, 64, 64, 3, X3>;
 
 // out[M, N] = A[M, K] . B, B = W^T for a [N, K] weight (ColumnMajor) or W for a
 // [K, N] one (RowMajor).
@@ -82,12 +111,62 @@ struct MmaOf {
       float, RM, 1, float, LayoutB, 1, float, RM, cutlass::arch::OpClassSimt, cutlass::arch::Sm80, typename Cfg::Tile,
       typename Cfg::Warp, cutlass::gemm::GemmShape<1, 1, 1>, Cfg::kStages, cutlass::arch::OpMultiplyAdd>::ThreadblockMma;
 };
+// CUTLASS's 3xTF32 warp product with its split rounded to nearest. CUTLASS
+// truncates the big part (round toward zero) and rounds the small one half an
+// ulp up then truncates: then small always has its value's sign, the dropped
+// small.small term always has the product's, and the error does not average
+// out -- on the published models a bias of up to 5e-3 meV/atom in the energy,
+// 30x fp32's. Rounded to nearest, both parts carry symmetric errors, and the
+// dropped term is as often positive as negative.
+// To TF32, to nearest (ties away, as cvt.rna.tf32.f32), on the integer pipe:
+// add half of the last kept bit and clear the 13 dropped ones.
+__device__ inline uint32_t tf32_rn(float x) { return (__float_as_uint(x) + 0x1000u) & 0xffffe000u; }
+template <class Base>
+struct FastF32Rn : Base {
+  // Big and small of each source value, the layout Base::transform writes: B's
+  // big parts, then its small ones; A's in quarters, big and small of its first
+  // half at 0 and 2, of its second at 1 and 3.
+  CUTLASS_DEVICE
+  void transform(typename Base::TransformedFragmentA& dst_A, typename Base::TransformedFragmentB& dst_B,
+                 typename Base::FragmentA const& A, typename Base::FragmentB const& B) const {
+    constexpr int NA = Base::FragmentA::kElements, NB = Base::FragmentB::kElements;
+    uint32_t* da = reinterpret_cast<uint32_t*>(&dst_A);
+    uint32_t* db = reinterpret_cast<uint32_t*>(&dst_B);
+    const float* a = reinterpret_cast<const float*>(&A);
+    const float* b = reinterpret_cast<const float*>(&B);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < NB; ++i) {
+      const uint32_t big = tf32_rn(b[i]);
+      db[i] = big, db[NB + i] = tf32_rn(b[i] - __uint_as_float(big));
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < NA; ++i) {
+      const int h = i / (NA / 2), j = i % (NA / 2);
+      const uint32_t big = tf32_rn(a[i]);
+      da[h * (NA / 2) + j] = big, da[(2 + h) * (NA / 2) + j] = tf32_rn(a[i] - __uint_as_float(big));
+    }
+  }
+};
+// The threadblock main loop with its warp product swapped for FastF32Rn.
+template <class M>
+struct WithRn;
+template <class Shape, class IA, class SIA, cutlass::arch::CacheOperation::Kind CA, class IB, class SIB,
+          cutlass::arch::CacheOperation::Kind CB, class EC, class LC, class Pol, int St,
+          cutlass::gemm::SharedMemoryClearOption Clr, class En>
+struct WithRn<cutlass::gemm::threadblock::MmaMultistage<Shape, IA, SIA, CA, IB, SIB, CB, EC, LC, Pol, St, Clr, En>> {
+  using Policy = cutlass::gemm::threadblock::MmaPolicy<FastF32Rn<typename Pol::Operator>, typename Pol::SmemPaddingA,
+                                                       typename Pol::SmemPaddingB, Pol::kPartitionsK>;
+  using type = cutlass::gemm::threadblock::MmaMultistage<Shape, IA, SIA, CA, IB, SIB, CB, EC, LC, Policy, St, Clr, En>;
+};
+
 template <class Cfg, class LayoutB>
 struct MmaOf<Cfg, LayoutB, true> {
-  using type = typename cutlass::gemm::threadblock::DefaultMma<
+  using Default = typename cutlass::gemm::threadblock::DefaultMma<
       float, RM, 4, float, LayoutB, 4, float, RM, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
       typename Cfg::Tile, typename Cfg::Warp, cutlass::gemm::GemmShape<16, 8, 8>, Cfg::kStages,
-      cutlass::arch::OpMultiplyAdd>::ThreadblockMma;
+      typename Cfg::Op>::ThreadblockMma;
+  using type = std::conditional_t<std::is_same_v<typename Cfg::Op, cutlass::arch::OpMultiplyAddFastF32>,
+                                  typename WithRn<Default>::type, Default>;
 };
 template <class Cfg, class LayoutB>
 using Mma = typename MmaOf<Cfg, LayoutB>::type;
@@ -214,9 +293,27 @@ bool sm8x() {
   return yes;
 }
 bool tensor() { return sm8x() && gemm_mode() == GemmMode::TF32; }
+// 3xTF32 on any device with TF32 tensor cores (compute capability 8.0+): on
+// Hopper too, where it is matched not against cuBLAS's TF32 but its fp32.
+bool tf32_device() {
+  static const bool tc = [] {
+    int dev = 0, major = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    return major >= 8;
+  }();
+  return tc;
+}
+bool x3() { return tf32_device() && gemm_mode() == GemmMode::TF32x3; }
+// The fp32-accurate modes, which every GEMM here can run.
+bool simt_or_x3() { return gemm_mode() == GemmMode::Native || gemm_mode() == GemmMode::TF32x3; }
 
+// detail::set_tf32_tile, from PET_TF32_TILE=0..7: a pinned tensor-core tile or -1.
 int& pinned_tf32_tile() {
-  static int t = -1;
+  static int t = [] {
+    const char* e = std::getenv("PET_TF32_TILE");
+    return e && *e ? std::atoi(e) : -1;
+  }();
   return t;
 }
 
@@ -227,14 +324,15 @@ constexpr int kTf32Tiles = 8;
 // being recorded nothing can be timed, so an untimed shape takes 128 x 128. An
 // epilogue that reads its output (`keep`, n floats) has it restored between
 // the timed runs.
-template <class LayoutB, class Epi>
+template <bool X3, class LayoutB, class Epi>
 void launch_tc(const char* name, int M, int N, int K, const float* A, const float* B, Epi epi, float* keep,
                std::size_t n) {
   using Fn = void (*)(const char*, int, int, int, const float*, const float*, Epi);
-  static constexpr Fn fns[] = {launch_tile<Tc64x64, LayoutB, Epi>,     launch_tile<Tc64x64s, LayoutB, Epi>,
-                               launch_tile<Tc128x128, LayoutB, Epi>,   launch_tile<Tc64x128s, LayoutB, Epi>,
-                               launch_tile<Tc128x64s, LayoutB, Epi>,   launch_tile<Tc128x128w8, LayoutB, Epi>,
-                               launch_tile<Tc128x256, LayoutB, Epi>,   launch_tile<Tc256x128, LayoutB, Epi>};
+  static constexpr Fn fns[] = {
+      launch_tile<Tc64x64<X3>, LayoutB, Epi>,     launch_tile<Tc64x64s<X3>, LayoutB, Epi>,
+      launch_tile<Tc128x128<X3>, LayoutB, Epi>,   launch_tile<Tc64x128s<X3>, LayoutB, Epi>,
+      launch_tile<Tc128x64s<X3>, LayoutB, Epi>,   launch_tile<Tc128x128w8<X3>, LayoutB, Epi>,
+      launch_tile<Tc128x256<X3>, LayoutB, Epi>,   launch_tile<Tc256x128<X3>, LayoutB, Epi>};
   constexpr int kFns = sizeof fns / sizeof fns[0];
   static_assert(kFns == kTf32Tiles);
   if (pinned_tf32_tile() >= 0) return fns[pinned_tf32_tile()](name, M, N, K, A, B, epi);
@@ -283,8 +381,12 @@ template <class LayoutB, class Epi>
 void launch(const char* name, int M, int N, int K, const float* A, const float* B, Epi epi, float* keep = nullptr,
             std::size_t n = 0) {
   if (M == 0 || N == 0) return;
-  if (tensor()) return launch_tc<LayoutB>(name, M, N, K, A, B, epi, keep, n);
-  int t = forced_tile();
+  if (tensor()) return launch_tc<false, LayoutB>(name, M, N, K, A, B, epi, keep, n);
+  // 3xTF32 where the operands' rows are 16-byte aligned (k and N multiples of
+  // 4); elsewhere (the energy heads' one-column GEMMs) the SIMT tiles below,
+  // fp32 too, and like them independent of the batch.
+  const auto a16 = [](const float* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 == 0; };
+  if (x3() && N % 4 == 0 && K % 4 == 0 && a16(A) && a16(B)) return launch_tc<true, LayoutB>(name, M, N, K, A, B, epi, keep, n);  int t = forced_tile();
   if (t < 0) t = tiles<Large>(M, N) >= 2L * sm_count() ? 0 : tiles<Mid>(M, N) >= 2L * sm_count() ? 1 : 2;
   if (t == 0) launch_tile<Large, LayoutB>(name, M, N, K, A, B, epi);
   else if (t == 1) launch_tile<Mid, LayoutB>(name, M, N, K, A, B, epi);
@@ -301,13 +403,16 @@ bool enabled() {
   return on;
 }
 
-// Whether the GEMM can run here at all: CUTLASS on, an fp32 or TF32 mode, and
-// for tensor cores the operands' rows 16-byte aligned (k and N multiples of 4).
-// That leaves the energy heads' one-column GEMMs to cuBLAS, which runs them in
-// fp32: on tensor cores they are what TF32's error in the energy comes from.
+// Whether the GEMM can run here at all: CUTLASS on, an fp32, 3xTF32 or TF32
+// mode, and for TF32 the operands' rows 16-byte aligned (k and N multiples of
+// 4). That leaves TF32's energy heads' one-column GEMMs to cuBLAS, which runs
+// them in fp32: on tensor cores they are what TF32's error in the energy comes
+// from.
 bool usable(const View2D& in, const View2D& w) {
   if (!enabled() || !in.span_is_contiguous() || !w.span_is_contiguous()) return false;
-  if (gemm_mode() == GemmMode::Native) return true;
+  // TF32x3 takes the SIMT tiles for what 3xTF32 cannot (launch), and where the
+  // device has no TF32 for everything.
+  if (simt_or_x3()) return true;
   return tensor() && aligned(in.data()) && aligned(w.data()) && w.extent(0) % 4 == 0 && w.extent(1) % 4 == 0;
 }
 
@@ -459,9 +564,10 @@ struct Plain {
 
 }  // namespace
 
-bool batch_invariant_gemms() { return enabled() && gemm_mode() == GemmMode::Native; }
+bool batch_invariant_gemms() { return enabled() && simt_or_x3(); }
 void detail::set_cutlass_tile(int tile) { forced_tile() = tile; }
 int detail::tf32_tile_count() { return enabled() && sm8x() ? kTf32Tiles : 0; }
+int detail::x3_tile_count() { return enabled() && tf32_device() ? kTf32Tiles : 0; }
 void detail::set_tf32_tile(int tile) { pinned_tf32_tile() = tile; }
 
 bool linear_fused(View2D out, View2D in, const View2D& w, bool w_transposed, View1D b, Net beta) {
@@ -510,11 +616,13 @@ bool batch_invariant_gemms() {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(PET_HAVE_CBLAS)
   return false;
 #else
-  return gemm_mode() == GemmMode::Native;  // the naive loop: one dot product per element
+  // The naive loop, one dot product per element (TF32x3 runs it too here).
+  return gemm_mode() == GemmMode::Native || gemm_mode() == GemmMode::TF32x3;
 #endif
 }
 void detail::set_cutlass_tile(int) {}
 int detail::tf32_tile_count() { return 0; }
+int detail::x3_tile_count() { return 0; }
 void detail::set_tf32_tile(int) {}
 
 bool linear_fused(View2D, View2D, const View2D&, bool, View1D, Net) { return false; }

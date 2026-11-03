@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,15 +38,16 @@ struct Options {
   // stepping the same atoms (MD, a relaxation). See NefCache.
   bool cache_neighbors = false;
 
-  // How the network's GEMMs run: Native, or a faster, less exact mode on tensor
-  // cores (TF32, BF16, FP16, FP8; see gemm.hpp). Native leaves the default:
-  // PET_GEMM, else native fp32.
-  // Process-global.
-  GemmMode gemm = GemmMode::Native;
+  // How the network's GEMMs run: fp32-accurate (Native on the CUDA cores, TF32x3
+  // on tensor cores), or a faster, less exact mode on tensor cores (TF32, BF16,
+  // FP16, FP8; see gemm.hpp). Unset leaves the default: PET_GEMM, else
+  // default_gemm_mode() (TF32x3 on CUDA, Native elsewhere). Process-global.
+  std::optional<GemmMode> gemm;
 
-  // How attention's products run: Native fp32, or TF32 on tensor cores (see
-  // gemm.hpp). Native leaves the default: PET_ATTN, else Native. Process-global.
-  AttentionMode attention = AttentionMode::Native;
+  // How attention's products run: Native fp32, TF32x3 (as accurate, on tensor
+  // cores) or TF32 (see gemm.hpp). Unset leaves the default: PET_ATTN, else
+  // default_attention_mode(). Process-global.
+  std::optional<AttentionMode> attention;
 
   // The host neighbour search: vesin's cell list, or the built-in O(N^2) one.
   // Without vesin in the build, the built-in one either way. They agree on the

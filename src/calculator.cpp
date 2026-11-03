@@ -220,8 +220,8 @@ struct Calculator::Impl {
       : ckpt(adjusted(Checkpoint(json_path, weights_path), o)), model(ckpt), opts(o) {
     for (int z = 0; z < (int) ckpt.species_to_index.size(); ++z)
       if (ckpt.species_to_index[z] >= 0) atomic_types.push_back(z);
-    if (o.gemm != GemmMode::Native) gemm_mode() = o.gemm;
-    if (o.attention != AttentionMode::Native) attention_mode() = o.attention;
+    if (o.gemm) gemm_mode() = *o.gemm;
+    if (o.attention) attention_mode() = *o.attention;
     if (const char* f = std::getenv("PET_MD_FIXED")) opts.md_fixed_shapes = f[0] == '1';
     std::size_t free_b = 0, total_b = 0;
     device_memory(o, free_b, total_b);

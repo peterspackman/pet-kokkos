@@ -871,6 +871,41 @@ __device__ inline void mma(float (&c)[4], float a0, float a1, float a2, float a3
         "r"(__float_as_uint(b0)), "r"(__float_as_uint(b1)));
 #endif
 }
+// With PET_ATTN=3xtf32 (X3) the same kernels carry fp32-class products: each
+// operand is split into a TF32 big part and a TF32 small part for what big
+// leaves out, and each product accumulates small.big, big.small and big.big
+// (small.small, ~2^-22 relative, dropped), as CUTLASS's 3xTF32 GEMMs do. The
+// staged rows stay fp32, split as each fragment is loaded.
+// (Rounded to nearest as cvt.rna.tf32.f32 does, on the integer pipe.)
+__device__ inline float tf32i(float x) { return __uint_as_float((__float_as_uint(x) + 0x1000u) & 0xffffe000u); }
+__device__ inline void split(float x, float& b, float& s) {
+  b = tf32i(x);
+  s = tf32i(x - b);
+}
+// An A fragment (a0..a3): TF32, or with X3 each value's two parts.
+template <bool X3>
+struct Frag {
+  float v[4];
+  __device__ void set(int j, float x) { v[j] = tf32(x); }
+};
+template <>
+struct Frag<true> {
+  float v[4], s[4];
+  __device__ void set(int j, float x) { split(x, v[j], s[j]); }
+};
+// c += A B: b0 and b1 already TF32 (staged rounded), or with X3 fp32, split here.
+template <bool X3>
+__device__ inline void mmaf(float (&c)[4], const Frag<X3>& a, float b0, float b1) {
+  if constexpr (X3) {
+    float bb0, bs0, bb1, bs1;
+    split(b0, bb0, bs0), split(b1, bb1, bs1);
+    mma(c, a.s[0], a.s[1], a.s[2], a.s[3], bb0, bb1);
+    mma(c, a.v[0], a.v[1], a.v[2], a.v[3], bs0, bs1);
+    mma(c, a.v[0], a.v[1], a.v[2], a.v[3], bb0, bb1);
+  } else {
+    mma(c, a.v[0], a.v[1], a.v[2], a.v[3], b0, b1);
+  }
+}
 __device__ inline float quad_max(float x) {  // over the four lanes with this g
   x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 1));
   return fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 2));
@@ -891,14 +926,15 @@ struct Atom {
   __device__ size_t row(int s) const { return s == 0 ? size_t(n) : size_t(N + off[n] + s - 1); }
 };
 // Slots [0, R) of a head's slice at column col of a row-major token matrix into
-// dst, rounded to TF32, slots past the atom's tokens zero.
-template <int HD>
+// dst, rounded to TF32 (with X3, kept fp32), slots past the atom's tokens zero.
+template <int HD, bool X3 = false>
 __device__ void stage(float* dst, const float* src, int ld, int col, const Atom& at, int R) {
   for (int i = threadIdx.x; i < R * (HD / 4); i += blockDim.x) {
     const int r = i / (HD / 4), c = (i % (HD / 4)) * 4;
     float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
     if (r < at.cnt) x = *reinterpret_cast<const float4*>(src + at.row(r) * ld + col + c);
-    *reinterpret_cast<float4*>(dst + r * pitch<HD> + c) = make_float4(tf32(x.x), tf32(x.y), tf32(x.z), tf32(x.w));
+    if constexpr (!X3) x = make_float4(tf32(x.x), tf32(x.y), tf32(x.z), tf32(x.w));
+    *reinterpret_cast<float4*>(dst + r * pitch<HD> + c) = x;
   }
 }
 __device__ inline float log_cf(const float* cf, int j, int S) {
@@ -917,7 +953,7 @@ std::size_t backward_floats(int S) { return std::size_t((S + 15) / 16 * 16) * (2
 
 // The forward, online softmax over blocks of 8 keys. Warp w: queries 16w + g
 // (row 0 of its C tiles) and 16w + g + 8 (row 1).
-template <int HD>
+template <int HD, bool X3 = false>
 __global__ void forward(const float* qkv, int ldq, const int* off, int N, const float* cf_seq, int ldc, float* merged,
                         int ldm, float* ml, int ldml, int S, int H, float sc) {
   constexpr int P = pitch<HD>, DK = HD / 8;
@@ -927,8 +963,8 @@ __global__ void forward(const float* qkv, int ldq, const int* off, int N, const 
   const int R = (at.cnt + 15) / 16 * 16;
   float *sk = smem, *sv = sk + R * P, *slc = sv + R * P;
   const float* cf = cf_seq + (size_t) n * ldc;
-  stage<HD>(sk, qkv, ldq, D + h * HD, at, R);
-  stage<HD>(sv, qkv, ldq, 2 * D + h * HD, at, R);
+  stage<HD, X3>(sk, qkv, ldq, D + h * HD, at, R);
+  stage<HD, X3>(sv, qkv, ldq, 2 * D + h * HD, at, R);
   for (int r = threadIdx.x; r < R; r += blockDim.x) slc[r] = log_cf(cf, r, at.cnt);
   for (int q = at.cnt + threadIdx.x; ml && q < S; q += blockDim.x) {  // the slots past its tokens
     float* m = ml + (size_t) ((n * H + h) * S + q) * ldml;
@@ -936,11 +972,11 @@ __global__ void forward(const float* qkv, int ldq, const int* off, int N, const 
   }
   const int w = threadIdx.x / 32, l = threadIdx.x % 32, g = l / 4, t = l % 4;
   const int qr[2] = {16 * w + g, 16 * w + g + 8};
-  float qa[DK][4];
+  Frag<X3> qa[DK];
   for (int c = 0; c < DK; ++c)
     for (int j = 0; j < 4; ++j) {
       const int q = qr[j % 2], d = 8 * c + t + 4 * (j / 2);
-      qa[c][j] = q < at.cnt ? tf32(qkv[at.row(q) * ldq + h * HD + d]) : 0.0f;
+      qa[c].set(j, q < at.cnt ? qkv[at.row(q) * ldq + h * HD + d] : 0.0f);
     }
   __syncthreads();
   if (16 * w >= at.cnt) return;  // a warp past the atom's tokens
@@ -951,7 +987,7 @@ __global__ void forward(const float* qkv, int ldq, const int* off, int N, const 
     const int k0 = 8 * J + 2 * t;  // this lane's keys: k0 and k0 + 1
     float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int c = 0; c < DK; ++c)
-      mma(s, qa[c][0], qa[c][1], qa[c][2], qa[c][3], sk[(8 * J + g) * P + 8 * c + t], sk[(8 * J + g) * P + 8 * c + t + 4]);
+      mmaf<X3>(s, qa[c], sk[(8 * J + g) * P + 8 * c + t], sk[(8 * J + g) * P + 8 * c + t + 4]);
     const float lc[2] = {slc[k0], slc[k0 + 1]};
     float p[4];
     for (int i = 0; i < 2; ++i) {  // query row i: s[2i], s[2i+1] against k0, k0 + 1
@@ -964,9 +1000,9 @@ __global__ void forward(const float* qkv, int ldq, const int* off, int N, const 
       mx[i] = nm;
       for (int c = 0; c < DK; ++c) acc[c][2 * i] *= alpha, acc[c][2 * i + 1] *= alpha;
     }
-    const float a0 = tf32(p[0]), a1 = tf32(p[2]), a2 = tf32(p[1]), a3 = tf32(p[3]);
-    for (int c = 0; c < DK; ++c)
-      mma(acc[c], a0, a1, a2, a3, sv[k0 * P + 8 * c + g], sv[(k0 + 1) * P + 8 * c + g]);
+    Frag<X3> pa;
+    pa.set(0, p[0]), pa.set(1, p[2]), pa.set(2, p[1]), pa.set(3, p[3]);
+    for (int c = 0; c < DK; ++c) mmaf<X3>(acc[c], pa, sv[k0 * P + 8 * c + g], sv[(k0 + 1) * P + 8 * c + g]);
   }
   for (int i = 0; i < 2; ++i) {
     const int q = qr[i];
@@ -992,7 +1028,7 @@ __global__ void forward(const float* qkv, int ldq, const int* off, int N, const 
 // Each pass reads two slices from shared memory and the other two only as its
 // warp's own fragments, so one buffer holds K and V, then Q and dO: two blocks
 // fit an SM where four slices would leave one.
-template <int HD>
+template <int HD, bool X3 = false>
 __global__ void backward(const float* qkv, int ldq, const int* off, int N, const float* dmerged, const float* merged,
                          int ldm, const float* ml, int ldml, const float* cf_seq, int ldc, float* qkv_adj, int lda,
                          float* cfh, int S, int H, float sc) {
@@ -1004,8 +1040,8 @@ __global__ void backward(const float* qkv, int ldq, const int* off, int N, const
   float *sk = smem, *sv = sk + R * P, *sq = sk, *sg = sv;  // K, V, then Q, dO
   float *sm = sv + R * P, *sl = sm + R, *sd = sl + R, *slc = sd + R;
   const float* cf = cf_seq + (size_t) n * ldc;
-  stage<HD>(sk, qkv, ldq, D + h * HD, at, R);
-  stage<HD>(sv, qkv, ldq, 2 * D + h * HD, at, R);
+  stage<HD, X3>(sk, qkv, ldq, D + h * HD, at, R);
+  stage<HD, X3>(sv, qkv, ldq, 2 * D + h * HD, at, R);
   for (int q = at.cnt + threadIdx.x; q < S; q += blockDim.x) cfh[(size_t) (n * S + q) * H + h] = 0.0f;
   for (int r = threadIdx.x; r < R; r += blockDim.x) {
     float dq = 0.0f, m = -1e30f, li = 0.0f;
@@ -1025,21 +1061,22 @@ __global__ void backward(const float* qkv, int ldq, const int* off, int N, const
   const int r0 = 16 * w + g, rr[2] = {r0, r0 + 8};
   const bool busy = 16 * w < at.cnt;  // else a warp past the atom's tokens, there for the barriers
   // A fragments of rows r0, r0 + 8: of a staged slice, or from global memory.
-  auto frags = [&](const float* x, float (&f)[DK][4]) {
+  auto frags = [&](const float* x, Frag<X3> (&f)[DK]) {
     for (int c = 0; c < DK; ++c)
-      for (int j = 0; j < 4; ++j) f[c][j] = x[rr[j % 2] * P + 8 * c + t + 4 * (j / 2)];
+      for (int j = 0; j < 4; ++j) f[c].set(j, x[rr[j % 2] * P + 8 * c + t + 4 * (j / 2)]);
   };
-  auto global_frags = [&](const float* x, int ld, float (&f)[DK][4]) {
+  auto global_frags = [&](const float* x, int ld, Frag<X3> (&f)[DK]) {
     for (int c = 0; c < DK; ++c)
       for (int j = 0; j < 4; ++j) {
         const int r = rr[j % 2];
-        f[c][j] = r < at.cnt ? tf32(x[at.row(r) * ld + 8 * c + t + 4 * (j / 2)]) : 0.0f;
+        f[c].set(j, r < at.cnt ? x[at.row(r) * ld + 8 * c + t + 4 * (j / 2)] : 0.0f);
       }
   };
-  float ka[DK][4], va[DK][4];  // the keys pass's own rows, taken before Q and dO replace them
+  Frag<X3> ka[DK], va[DK];  // the keys pass's own rows, taken before Q and dO replace them
 
   if (busy) {  // Queries.
-    float qa[DK][4], ga[DK][4], dq[DK][4];
+    Frag<X3> qa[DK], ga[DK];
+    float dq[DK][4];
     global_frags(qkv + h * HD, ldq, qa), global_frags(dmerged + h * HD, ldm, ga);
     for (int c = 0; c < DK; ++c)
       for (int j = 0; j < 4; ++j) dq[c][j] = 0.0f;
@@ -1048,18 +1085,17 @@ __global__ void backward(const float* qkv, int ldq, const int* off, int N, const
       const int k0 = 8 * J + 2 * t, kb = 8 * J + g;
       float s[4] = {0.0f, 0.0f, 0.0f, 0.0f}, dp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
       for (int c = 0; c < DK; ++c) {
-        mma(s, qa[c][0], qa[c][1], qa[c][2], qa[c][3], sk[kb * P + 8 * c + t], sk[kb * P + 8 * c + t + 4]);
-        mma(dp, ga[c][0], ga[c][1], ga[c][2], ga[c][3], sv[kb * P + 8 * c + t], sv[kb * P + 8 * c + t + 4]);
+        mmaf<X3>(s, qa[c], sk[kb * P + 8 * c + t], sk[kb * P + 8 * c + t + 4]);
+        mmaf<X3>(dp, ga[c], sv[kb * P + 8 * c + t], sv[kb * P + 8 * c + t + 4]);
       }
-      float ds[4];
+      Frag<X3> dsa;
       for (int e = 0; e < 4; ++e) {  // query rr[e / 2], key k0 + e % 2
         const int i = e / 2;
         const float lc = slc[k0 + e % 2];
         const float a = li[i] > 0.0f && lc > -1e29f ? __expf(s[e] * sc + lc - mi[i]) * li[i] : 0.0f;
-        ds[e] = tf32(a * (dp[e] - di[i]));
+        dsa.set((e % 2) * 2 + e / 2, a * (dp[e] - di[i]));  // as A: (ds0, ds2, ds1, ds3)
       }
-      for (int c = 0; c < DK; ++c)
-        mma(dq[c], ds[0], ds[2], ds[1], ds[3], sk[k0 * P + 8 * c + g], sk[(k0 + 1) * P + 8 * c + g]);
+      for (int c = 0; c < DK; ++c) mmaf<X3>(dq[c], dsa, sk[k0 * P + 8 * c + g], sk[(k0 + 1) * P + 8 * c + g]);
     }
     for (int i = 0; i < 2; ++i) {
       if (rr[i] >= at.cnt) continue;
@@ -1070,8 +1106,8 @@ __global__ void backward(const float* qkv, int ldq, const int* off, int N, const
   }
   if (busy) frags(sk, ka), frags(sv, va);
   __syncthreads();
-  stage<HD>(sq, qkv, ldq, h * HD, at, R);
-  stage<HD>(sg, dmerged, ldm, h * HD, at, R);
+  stage<HD, X3>(sq, qkv, ldq, h * HD, at, R);
+  stage<HD, X3>(sg, dmerged, ldm, h * HD, at, R);
   __syncthreads();
 
   if (busy) {  // Keys.
@@ -1084,20 +1120,20 @@ __global__ void backward(const float* qkv, int ldq, const int* off, int N, const
       const int q0 = 8 * I + 2 * t, qb = 8 * I + g;
       float s[4] = {0.0f, 0.0f, 0.0f, 0.0f}, dp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
       for (int c = 0; c < DK; ++c) {
-        mma(s, ka[c][0], ka[c][1], ka[c][2], ka[c][3], sq[qb * P + 8 * c + t], sq[qb * P + 8 * c + t + 4]);
-        mma(dp, va[c][0], va[c][1], va[c][2], va[c][3], sg[qb * P + 8 * c + t], sg[qb * P + 8 * c + t + 4]);
+        mmaf<X3>(s, ka[c], sq[qb * P + 8 * c + t], sq[qb * P + 8 * c + t + 4]);
+        mmaf<X3>(dp, va[c], sg[qb * P + 8 * c + t], sg[qb * P + 8 * c + t + 4]);
       }
-      float a[4], ds[4];
+      Frag<X3> aa, dsa;  // as A: (x0, x2, x1, x3)
       for (int e = 0; e < 4; ++e) {  // key rr[e / 2], query q0 + e % 2
-        const int i = e / 2, q = q0 + e % 2;
-        a[e] = sl[q] > 0.0f && lc[i] > -1e29f ? __expf(s[e] * sc + lc[i] - sm[q]) * sl[q] : 0.0f;
-        ds[e] = a[e] * (dp[e] - sd[q]);
-        cfa[i] += ds[e];
-        a[e] = tf32(a[e]), ds[e] = tf32(ds[e]);
+        const int i = e / 2, q = q0 + e % 2, slot = (e % 2) * 2 + e / 2;
+        const float a = sl[q] > 0.0f && lc[i] > -1e29f ? __expf(s[e] * sc + lc[i] - sm[q]) * sl[q] : 0.0f;
+        const float ds = a * (dp[e] - sd[q]);
+        cfa[i] += ds;
+        aa.set(slot, a), dsa.set(slot, ds);
       }
       for (int c = 0; c < DK; ++c) {
-        mma(dk[c], ds[0], ds[2], ds[1], ds[3], sq[q0 * P + 8 * c + g], sq[(q0 + 1) * P + 8 * c + g]);
-        mma(dv[c], a[0], a[2], a[1], a[3], sg[q0 * P + 8 * c + g], sg[(q0 + 1) * P + 8 * c + g]);
+        mmaf<X3>(dk[c], dsa, sq[q0 * P + 8 * c + g], sq[(q0 + 1) * P + 8 * c + g]);
+        mmaf<X3>(dv[c], aa, sg[q0 * P + 8 * c + g], sg[(q0 + 1) * P + 8 * c + g]);
       }
     }
     for (int i = 0; i < 2; ++i) {
@@ -1364,8 +1400,9 @@ __global__ void tan_backward(const float* qkv, const float* qkv_t, int ldq, cons
 }
 
 // Whether the tensor-core kernels run here: the mode, the device, and shared
-// memory for `floats`.
-inline bool usable(std::size_t floats) {
+// memory for `floats`. The tangents have no 3xTF32 form: x3 says whether the
+// caller has.
+inline bool usable(std::size_t floats, bool x3 = false) {
   static const int smem_max = [] {
     int dev = 0, major = 0, b = 0;
     cudaGetDevice(&dev);
@@ -1373,13 +1410,16 @@ inline bool usable(std::size_t floats) {
     cudaDeviceGetAttribute(&b, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
     return major >= 8 ? b : 0;
   }();
-  return attention_mode() == AttentionMode::TF32 && sizeof(float) * floats <= std::size_t(smem_max);
+  const AttentionMode m = attention_mode();
+  return (m == AttentionMode::TF32 || (x3 && m == AttentionMode::TF32x3)) &&
+         sizeof(float) * floats <= std::size_t(smem_max);
 }
 // Launched on Kokkos's stream with `bytes` of shared memory, and reported to
 // Kokkos Tools as a kernel.
 template <class K, class... A>
 void run(const char* name, K kernel, int blocks, int threads, std::size_t bytes, A... args) {
-  static int set = 0;  // the largest opt-in so far, per kernel
+  static std::map<const void*, int> opted;  // the largest opt-in so far, per kernel
+  int& set = opted[reinterpret_cast<const void*>(kernel)];
   if (int(bytes) > set) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(bytes)), set = int(bytes);
   uint64_t id = 0;
   if (Kokkos::Tools::profileLibraryLoaded()) Kokkos::Tools::beginParallelFor(name, 0, &id);
@@ -1429,8 +1469,9 @@ void attention_impl(Workspace& ws, const std::string& key, View2D out, View2D qk
 #endif
 #if defined(PET_TC)
   if constexpr (HD > 0 && HD % 8 == 0)
-    if (tc::usable(tc::forward_floats<HD>(S))) {
-      tc::run("attention", tc::forward<HD>, N * H, (S + 15) / 16 * 32, sizeof(float) * tc::forward_floats<HD>(S),
+    if (tc::usable(tc::forward_floats<HD>(S), true)) {
+      const bool x3 = attention_mode() == AttentionMode::TF32x3;
+      tc::run("attention", x3 ? tc::forward<HD, true> : tc::forward<HD, false>, N * H, (S + 15) / 16 * 32, sizeof(float) * tc::forward_floats<HD>(S),
               (const float*) qkv.data(), int(qkv.stride(0)), (const int*) tk.off.data(), N,
               (const float*) cf_seq.data(), int(cf_seq.stride(0)), merged.data(), int(merged.stride(0)),
               save ? ml.data() : nullptr, save ? int(ml.stride(0)) : 0, S, H, float(sc));
@@ -1741,8 +1782,9 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
 #endif
 #if defined(PET_TC)
   if constexpr (HD > 0 && HD % 8 == 0)
-    if (tc::usable(tc::backward_floats<HD>(S))) {
-      tc::run("attn_bwd", tc::backward<HD>, N * H, (S + 15) / 16 * 32, sizeof(float) * tc::backward_floats<HD>(S),
+    if (tc::usable(tc::backward_floats<HD>(S), true)) {
+      const bool x3 = attention_mode() == AttentionMode::TF32x3;
+      tc::run("attn_bwd", x3 ? tc::backward<HD, true> : tc::backward<HD, false>, N * H, (S + 15) / 16 * 32, sizeof(float) * tc::backward_floats<HD>(S),
               (const float*) qkv.data(), int(qkv.stride(0)), (const int*) tk.off.data(), N,
               (const float*) dmerged.data(), (const float*) merged.data(), int(merged.stride(0)),
               (const float*) ml.data(), int(ml.stride(0)),
@@ -1910,6 +1952,25 @@ bool detail::tf32_attention_available() {
   cudaGetDevice(&dev);
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
   return major >= 8;
+#else
+  return false;
+#endif
+}
+
+bool detail::fast_tf32_device() {
+#if defined(PET_TC)
+  // The data-centre GPUs, whose TF32 tensor cores run several times their fp32
+  // CUDA cores' rate (A100 8x, H100/H200 7x, B200 more): there three TF32
+  // products for one fp32 one still win. On the others -- sm_86, sm_87, sm_89,
+  // sm_12x -- TF32 runs at about the fp32 rate and 3xTF32 would lose.
+  static const bool fast = [] {
+    int dev = 0, major = 0, minor = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+    return (major == 8 && minor == 0) || major == 9 || major == 10;
+  }();
+  return fast;
 #else
   return false;
 #endif
