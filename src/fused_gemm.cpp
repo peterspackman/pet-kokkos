@@ -109,7 +109,11 @@ __global__ void __launch_bounds__(Mma::WarpCount::kCount * 32)
   using Warp = typename Mma::Operator::Shape;
   using LayoutB = typename Mma::IteratorB::Layout;
   constexpr int L = kRun<Tensor>;
-  const int m0 = blockIdx.x * Tile::kM, n0 = blockIdx.y * Tile::kN;
+  // A 1-D grid, N's tiles fastest: the CTAs running together share a block of
+  // A's rows (the large operand, read once from DRAM) and between them the whole
+  // weight (small, L2-resident). M fastest reread A once per N tile.
+  const int nt = (N + Tile::kN - 1) / Tile::kN;
+  const int m0 = int(blockIdx.x / nt) * Tile::kM, n0 = int(blockIdx.x % nt) * Tile::kN;
   const int ldb = std::is_same_v<LayoutB, CM> ? K : N;
   typename Mma::IteratorA ia({RM(K)}, const_cast<float*>(A), {M, K}, threadIdx.x, {m0, 0});
   typename Mma::IteratorB ib({LayoutB(ldb)}, const_cast<float*>(B), {K, N}, threadIdx.x, {0, n0});
@@ -165,7 +169,7 @@ void launch_tile(const char* name, int M, int N, int K, const float* A, const fl
   constexpr auto kernel = gemm_kernel<G, Cfg::kTensor, Epi>;
   static const bool attr = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) == cudaSuccess;
   (void) attr;
-  const dim3 grid((M + G::Shape::kM - 1) / G::Shape::kM, (N + G::Shape::kN - 1) / G::Shape::kN);
+  const dim3 grid(unsigned((M + G::Shape::kM - 1) / G::Shape::kM) * unsigned((N + G::Shape::kN - 1) / G::Shape::kN));
   uint64_t id = 0;
   if (Kokkos::Tools::profileLibraryLoaded()) Kokkos::Tools::beginParallelFor(name, 0, &id);
   kernel<<<grid, G::WarpCount::kCount * 32, smem, ExecSpace().cuda_stream()>>>(M, N, K, A, B, epi);
