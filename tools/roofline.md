@@ -133,6 +133,29 @@ bound (56% with the CTA raster fixed), attention 55%, norms 91%, elementwise
 85%, gathers 71%, forces 53%, geometry 7% (latency- and, on this card,
 FP64-bound: the cell list's double distances and the solver's double divisions).
 
+## MI250X, measured (one GCD, rocprofv3 kernel trace)
+
+pet-mad-s, water 5184, forces, kernel time per evaluation by category against
+the bound (`--backend hip`), perf-integrate and after the perf-mi250x-2 branch:
+
+| category | bound ms | perf-integrate | now | now / bound |
+|---|---|---|---|---|
+| GEMM | 56.1 (62.6 at 42.7 TF/s) | 94.1 | 92.9 | 60% (67% of the practical) |
+| attention | 3.7 | 14.0 | 9.8 | 38% |
+| norms | 8.1 | 17.2 | 10.9 | 74% |
+| elementwise | 1.1 | 3.2 | 3.2 | 35% |
+| geometry | 0.13 | 3.6 | 3.6 | latency-bound |
+| gather, forces | 0.25 | 0.6 | 0.6 | |
+| total | 69.4 | 132.8 | 121.3 (121.7 wall) | 57% |
+
+The GEMM kernel alone reaches 30-37 TF/s at the network's shapes (70-87% of the
+practical peak); without its main loop's global loads it reaches 38-40, and
+without those and the epilogue's stores 40.5: the rest is load latency three
+waves a SIMD do not hide. Deeper register prefetch costs those waves and loses;
+double-buffered LDS halves the blocks a CU and loses. The attention kernels
+move near the minimum of DRAM bytes (0.94 GB a layer read against 0.82 unique)
+at a third of the bandwidth: latency-bound, one 16-token block a wave.
+
 ## Assumptions and limits
 
 - Peaks are vendor numbers; GEMM bounds take the matrix (MI250X) or SIMT (H200,
