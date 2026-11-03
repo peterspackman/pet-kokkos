@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -195,11 +196,28 @@ struct Calculator::Impl {
     void edges(View2D out, View2D in) override { rec->cut([r = real, out, in] { r->edges(out, in); }); }
   } cut;
   EdgeSession md;  // an engine's list (compute_edges, set_neighbors)
+  // response()'s last structure and its host list: a Krylov solver asks for
+  // product after product at one geometry, and the list is most of a small
+  // call's cost.
+  System resp_system;
+  EdgeData resp_edges;
+  bool resp_cached = false;
+  // Its tangents and slots on the device, kept so a recorded product's inputs
+  // stay where it recorded them.
+  RView1D resp_vdot;
+  IView1D resp_slot;
+  int resp_chunk_cap = 0;  // directions per pass after one ran out of memory; 0 = none yet
 
   std::vector<int> atomic_types;
 
+  static Checkpoint adjusted(Checkpoint c, const Options& o) {
+    if (o.smooth_cutoff && c.hypers.cutoff_function == CutoffFunction::Cosine)
+      c.hypers.cutoff_function = CutoffFunction::Smooth;
+    return c;
+  }
+
   Impl(const std::string& json_path, const std::string& weights_path, Options o)
-      : ckpt(json_path, weights_path), model(ckpt), opts(o) {
+      : ckpt(adjusted(Checkpoint(json_path, weights_path), o)), model(ckpt), opts(o) {
     for (int z = 0; z < (int) ckpt.species_to_index.size(); ++z)
       if (ckpt.species_to_index[z] >= 0) atomic_types.push_back(z);
     if (o.gemm != GemmMode::Native) gemm_mode() = o.gemm;
@@ -210,6 +228,8 @@ struct Calculator::Impl {
     // PET_GRAPHS=0 is for profilers that fence around every kernel.
     const char* g = std::getenv("PET_GRAPHS");
     model.set_graphs(o.graphs && !(g && g[0] == '0'));
+    model.set_non_conservative(o.non_conservative);
+    model.set_uncertainty(o.uncertainty);
     // PET_RECOMPUTE=never|wide|layers|auto overrides the option, to compare tiers.
     Recompute rc = o.recompute;
     if (const char* r = std::getenv("PET_RECOMPUTE"))
@@ -287,6 +307,10 @@ const std::vector<int>& Calculator::atomic_types() const { return impl_->atomic_
 const std::string& Calculator::length_unit() const { return impl_->ckpt.length_unit; }
 const std::string& Calculator::energy_unit() const { return impl_->ckpt.energy_unit; }
 double Calculator::energy_scale() const { return impl_->ckpt.energy_scale; }
+bool Calculator::has_non_conservative_forces() const { return impl_->model.has_nc_force(); }
+bool Calculator::has_non_conservative_stress() const { return impl_->model.has_nc_stress(); }
+bool Calculator::has_uncertainty() const { return impl_->model.has_uncertainty(); }
+int Calculator::n_ensemble() const { return impl_->model.n_ensemble(); }
 Options& Calculator::options() { return impl_->opts; }
 const Options& Calculator::options() const { return impl_->opts; }
 
@@ -299,6 +323,8 @@ DeviceGeom Calculator::stage(const std::vector<System>& systems) const {
   impl_->cache = NefCache{};
   return stage_systems(impl_->nbr_ws, systems, impl_->ckpt.species_to_index);
 }
+
+static void add_uncertainty(Results& out, const PetModel& model);
 
 Results Calculator::compute(const System& system, bool compute_forces) const {
   // Small structures stay on the host path, where the device build's fixed cost
@@ -320,7 +346,99 @@ Results Calculator::compute(const System& system, bool compute_forces) const {
   }
   out.energy = {r.total};
   out.per_atom_energy = std::move(r.per_atom);
+  add_uncertainty(out, impl_->model);
   return out;
+}
+
+Calculator::Response Calculator::response(const System& system, int K, const std::vector<double>& displacements,
+                                          const std::vector<double>& strains) const {
+  const int N = system.n_atoms;
+  if (K < 0 || (!displacements.empty() && (int) displacements.size() != K * N * 3) ||
+      (!strains.empty() && (int) strains.size() != K * 9))
+    throw std::invalid_argument("pet::Calculator::response: displacements must be [K][N*3] and strains [K][9]");
+  // The host list, which keeps each raw edge's slot: the tangents are the raw
+  // edges', v' = u_j - u_i + e v. Kept for the next call at the same structure.
+  Impl& I = *impl_;
+  const System& c = I.resp_system;
+  const bool same = I.resp_cached && c.n_atoms == N && c.atomic_numbers == system.atomic_numbers &&
+                    c.positions == system.positions && c.cell == system.cell && c.pbc == system.pbc &&
+                    c.charge == system.charge && c.spin_multiplicity == system.spin_multiplicity;
+  if (!same) {
+    I.resp_edges = build_edge_data(system, I.ckpt.hypers, I.ckpt.species_to_index);
+    I.resp_system = system;
+    I.resp_cached = true;
+  }
+  const EdgeData& ed = I.resp_edges;
+  const int R = ed.n_raw;
+  // Each direction keeps a copy of the network's activations: as many directions
+  // per pass as half the card holds, at about 1.5x the saves' estimate apiece.
+  std::size_t free_b = 0, total_b = 0;
+  device_memory(I.opts, free_b, total_b);
+  const double per_dir = 1.5 * double(I.model.bytes_per_slot()) * double(N) * double(std::max(1, ed.max_neighbors));
+  // The estimate can be short (a supercell's pool holds more than the saves): a
+  // pass that runs out of memory gives the pool back and runs again at half the
+  // directions, and later calls start from there.
+  int chunk = std::max(1, std::min(std::max(K, 1), int(0.5 * double(total_b) / per_dir)));
+  if (I.resp_chunk_cap > 0) chunk = std::min(chunk, I.resp_chunk_cap);
+
+  Response r;
+  r.K = K;
+  r.forces.assign(std::size_t(K) * N * 3, 0.0);
+  r.virial.assign(std::size_t(K) * 6, 0.0);
+  for (int k0 = 0; k0 < std::max(K, 1);) {
+    const int kc = std::min(chunk, K - k0);
+    DeviceEdgeData dev = I.model.upload_edge_data(ed, true);
+    const std::size_t nv = std::size_t(std::max(chunk, 1)) * R * 3;
+    if (I.resp_vdot.extent(0) < nv) I.resp_vdot = RView1D("pet:vdot", nv);
+    if ((int) I.resp_slot.extent(0) < R) I.resp_slot = IView1D("pet:raw_slot", R);
+    IView1D raw_slot(I.resp_slot.data(), R);
+    RView2D vdot(I.resp_vdot.data(), std::size_t(std::max(kc, 0)) * R, 3);
+    auto hs = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, raw_slot);  // every entry written
+    for (int e = 0; e < R; ++e) hs(e) = ed.raw_slot[e];
+    Kokkos::deep_copy(raw_slot, hs);
+    auto hv = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, vdot);
+    for (int k = 0; k < kc; ++k)
+      for (int e = 0; e < R; ++e) {
+        const int i = ed.raw_center[e], j = ed.raw_neigh[e];
+        const double* v = &ed.raw_vec[std::size_t(e) * 3];
+        const std::size_t kk = std::size_t(k0 + k);
+        for (int x = 0; x < 3; ++x) {
+          double t = 0.0;
+          if (!displacements.empty())
+            t += displacements[(kk * N + j) * 3 + x] - displacements[(kk * N + i) * 3 + x];
+          if (!strains.empty())
+            for (int y = 0; y < 3; ++y) t += strains[kk * 9 + x * 3 + y] * v[y];
+          hv(std::size_t(k) * R + e, x) = t;
+        }
+      }
+    Kokkos::deep_copy(vdot, hv);
+    dev.raw_slot = raw_slot;
+    HvpOut o;
+    try {
+      o = I.model.hvp(dev, std::max(kc, 0), vdot);
+    } catch (const std::exception& e) {
+      const bool oom = dynamic_cast<const std::bad_alloc*>(&e) || std::strstr(e.what(), "failed to allocate");
+      if (!oom || kc <= 1) throw;
+      I.model.release_workspace();
+      I.resp_chunk_cap = chunk = std::max(1, kc / 2);
+      continue;
+    }
+    if (k0 == 0) {
+      auto f = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.forces);
+      r.base.assign(f.data(), f.data() + std::size_t(N) * 3);
+    }
+    if (kc <= 0) break;
+    auto df = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.dforces);
+    auto w = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), o.dvir9);
+    std::copy(df.data(), df.data() + std::size_t(kc) * N * 3, r.forces.begin() + std::size_t(k0) * N * 3);
+    for (int k = 0; k < kc; ++k) {
+      const double v[6] = {w(k, 0), w(k, 4), w(k, 8), 0.5 * (w(k, 1) + w(k, 3)), 0.5 * (w(k, 2) + w(k, 6)),
+                           0.5 * (w(k, 5) + w(k, 7))};
+      std::copy(v, v + 6, r.virial.begin() + std::size_t(k0 + k) * 6);
+    }
+    k0 += kc;
+  }
+  return r;
 }
 
 Results Calculator::compute(const std::vector<System>& systems, bool compute_forces) const {
@@ -339,6 +457,10 @@ Results Calculator::compute(const std::vector<System>& systems, bool compute_for
     append(out.forces, r.forces);
     append(out.virial, r.virial);
     append(out.n_atoms, r.n_atoms);
+    append(out.energy_uncertainty, r.energy_uncertainty);
+    append(out.per_atom_energy_uncertainty, r.per_atom_energy_uncertainty);
+    append(out.energy_ensemble, r.energy_ensemble);
+    out.n_ensemble = r.n_ensemble;
     for (const int id : r.struct_id) out.struct_id.push_back(id + int(b));
   }
   return out;
@@ -355,6 +477,16 @@ static void to_host(std::vector<T>& out, const V& v) {
       if constexpr (V::rank == 1) out[i] = h(i);
       else out[i * n1 + c] = h(i, c);
     }
+}
+
+// The latest evaluation's uncertainty, when it was asked for.
+static void add_uncertainty(Results& out, const PetModel& model) {
+  if (!model.uncertainty()) return;
+  const Uncertainty& u = model.last_uncertainty();
+  to_host(out.energy_uncertainty, u.energy);
+  to_host(out.per_atom_energy_uncertainty, u.per_atom);
+  out.n_ensemble = model.n_ensemble();
+  if (out.n_ensemble) to_host(out.energy_ensemble, u.ensemble);
 }
 
 Results Calculator::compute_batch(const std::vector<System>& systems, bool compute_forces) const {
@@ -374,6 +506,7 @@ Results Calculator::compute_batch(const std::vector<System>& systems, bool compu
   for (const auto& s : systems) out.n_atoms.push_back(s.n_atoms);
   to_host(out.energy, br.energy);
   to_host(out.per_atom_energy, br.per_atom);
+  add_uncertainty(out, I.model);
   if (compute_forces) {
     to_host(out.forces, br.forces);
     to_host(out.struct_id, br.struct_id);
@@ -390,11 +523,14 @@ Results Calculator::session_results(const DeviceEdgeData& dev, bool compute_forc
   out.n_atoms = {dev.n_atoms};
   to_host(out.energy, br.energy);
   to_host(out.per_atom_energy, br.per_atom);
+  add_uncertainty(out, I.model);
   if (!compute_forces) return out;
   to_host(out.forces, br.forces);
   to_host(out.virial, br.virial);
   out.struct_id.assign(dev.n_atoms, 0);
   if (!edge_gradients) return out;
+  if (I.model.non_conservative())
+    throw std::runtime_error("pet::Calculator: edge gradients need the backward, which non_conservative skips");
   // A half list's pair gets both directions: g(i -> j) - g(j -> i).
   const EdgeSession& s = I.md;
   out.edge_gradient.assign(std::size_t(s.n_pairs) * 3, 0.0);
@@ -535,6 +671,8 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
   // Each directed edge's sym(v (x) g), half to each end, gathered per atom: its
   // own edges, their partners (the edges into it), and the partnerless edges
   // into it.
+  if (a.per_atom_virial && I.model.non_conservative())
+    throw std::runtime_error("pet::Calculator: per-atom virials need the backward, which non_conservative skips");
   if (a.per_atom_virial && br.edge_grad.extent(0) > 0) {
     auto g = br.edge_grad;
     auto v = dev.raw_vec;

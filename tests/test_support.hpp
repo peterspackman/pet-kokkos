@@ -73,6 +73,14 @@ struct Golden {
   std::vector<double> per_atom_energies;   // [N]
   std::vector<double> forces;              // [N*3]
   std::optional<std::array<double, 9>> stress;  // row-major 3x3, if periodic
+  // From the non-conservative heads, for a model that has them (empty / unset
+  // otherwise, or in an older golden).
+  std::vector<double> nc_forces;                   // [N*3]
+  std::optional<std::array<double, 9>> nc_stress;  // row-major 3x3, if periodic
+  // The LLPR energy uncertainty, for a model that has one: eV.
+  std::optional<double> energy_uncertainty;
+  std::vector<double> per_atom_energy_uncertainties;  // [N]
+  std::vector<double> energy_ensemble;                // [members], empty without one
 };
 
 inline Golden load_golden(const std::string& path) {
@@ -112,15 +120,25 @@ inline Golden load_golden(const std::string& path) {
   for (const auto& fv : g.at("forces"))
     for (int c = 0; c < 3; ++c) out.forces.push_back(fv[c].get<double>());
 
-  if (g.contains("stress") && !g.at("stress").is_null()) {
+  auto matrix = [&](const char* key) -> std::optional<std::array<double, 9>> {
+    if (!g.contains(key) || g.at(key).is_null()) return std::nullopt;
     std::array<double, 9> s{};
     int i = 0;
-    for (const auto& row : g.at("stress")) {
+    for (const auto& row : g.at(key)) {
       for (int c = 0; c < 3; ++c) s[i * 3 + c] = row[c].get<double>();
       ++i;
     }
-    out.stress = s;
-  }
+    return s;
+  };
+  out.stress = matrix("stress");
+  if (g.contains("nc_forces"))
+    for (const auto& fv : g.at("nc_forces"))
+      for (int c = 0; c < 3; ++c) out.nc_forces.push_back(fv[c].get<double>());
+  out.nc_stress = matrix("nc_stress");
+  if (g.contains("energy_uncertainty")) out.energy_uncertainty = g.at("energy_uncertainty").get<double>();
+  if (g.contains("per_atom_energy_uncertainties"))
+    out.per_atom_energy_uncertainties = g.at("per_atom_energy_uncertainties").get<std::vector<double>>();
+  if (g.contains("energy_ensemble")) out.energy_ensemble = g.at("energy_ensemble").get<std::vector<double>>();
   return out;
 }
 

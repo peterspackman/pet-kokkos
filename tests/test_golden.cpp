@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 
 #include "pet/calculator.hpp"
 #include "test_support.hpp"
@@ -81,6 +82,104 @@ TEST_CASE("goldens reproduce the reference energy, forces and stress", "[model][
           INFO("max|dStress| = " << max_ds << " eV/A^3");
           CHECK(max_ds <= kStressTolerance);
         }
+      }
+    }
+  }
+}
+
+TEST_CASE("non-conservative heads reproduce the reference forces and stress", "[model][golden]") {
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    std::vector<Golden> goldens;
+    for (const auto& path : golden_paths(model))
+      if (Golden g = load_golden(path); !g.nc_forces.empty()) goldens.push_back(std::move(g));
+    if (goldens.empty()) continue;
+    pet::Options opts;
+    opts.non_conservative = true;
+    std::unique_ptr<pet::Calculator> calcp;
+    try {
+      calcp = std::make_unique<pet::Calculator>(found->first, found->second, opts);
+    } catch (const std::exception& e) {
+      WARN("model '" << model << "' has goldens for its non-conservative heads, but the installed "
+                     << "conversion has none (convert it again); skipping: " << e.what());
+      continue;
+    }
+    pet::Calculator& calc = *calcp;
+
+    for (const Golden& g : goldens) {
+      DYNAMIC_SECTION(model << " / " << g.name) {
+        require_matching_model(g, calc);
+        const pet::Results r = calc.compute(g.system, /*compute_forces=*/true);
+        // The energy is the network's, heads or not.
+        CHECK(std::fabs(r.energy.at(0) - g.total_energy) <= energy_tolerance(g.total_energy));
+
+        REQUIRE(r.forces.size() == g.nc_forces.size());
+        double max_df = 0.0;
+        for (std::size_t i = 0; i < r.forces.size(); ++i)
+          max_df = worst(max_df, std::fabs(r.forces[i] - g.nc_forces[i]));
+        INFO("max|dF| = " << max_df << " eV/A");
+        CHECK(max_df <= kForceTolerance);
+
+        if (g.nc_stress && g.volume > 0.0) {
+          REQUIRE(r.virial.size() == 6);
+          constexpr int vi[6][2] = {{0, 0}, {1, 1}, {2, 2}, {0, 1}, {0, 2}, {1, 2}};
+          double max_ds = 0.0;
+          for (int t = 0; t < 6; ++t)
+            max_ds = worst(max_ds, std::fabs(r.virial[t] / g.volume - (*g.nc_stress)[vi[t][0] * 3 + vi[t][1]]));
+          INFO("max|dStress| = " << max_ds << " eV/A^3");
+          CHECK(max_ds <= kStressTolerance);
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("the LLPR uncertainty reproduces the reference", "[model][golden]") {
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    std::vector<Golden> goldens;
+    for (const auto& path : golden_paths(model))
+      if (Golden g = load_golden(path); g.energy_uncertainty) goldens.push_back(std::move(g));
+    if (goldens.empty()) continue;
+    pet::Options opts;
+    opts.uncertainty = true;
+    std::unique_ptr<pet::Calculator> calcp;
+    try {
+      calcp = std::make_unique<pet::Calculator>(found->first, found->second, opts);
+    } catch (const std::exception& e) {
+      WARN("model '" << model << "' has goldens for its uncertainty, but the installed conversion "
+                     << "has none (convert it again); skipping: " << e.what());
+      continue;
+    }
+    pet::Calculator& calc = *calcp;
+
+    // Relative: the references are metatrain's in fp32.
+    auto close = [](double got, double want) { return std::fabs(got - want) <= 1e-4 * std::fabs(want) + 1e-7; };
+    for (const Golden& g : goldens) {
+      DYNAMIC_SECTION(model << " / " << g.name) {
+        require_matching_model(g, calc);
+        // With forces as well: the uncertainty comes from the forward either way.
+        const pet::Results r = calc.compute(g.system, /*compute_forces=*/true);
+        REQUIRE(r.energy_uncertainty.size() == 1);
+        INFO("sigma = " << r.energy_uncertainty[0] << " eV, reference " << *g.energy_uncertainty);
+        CHECK(close(r.energy_uncertainty[0], *g.energy_uncertainty));
+
+        REQUIRE(r.per_atom_energy_uncertainty.size() == g.per_atom_energy_uncertainties.size());
+        for (std::size_t i = 0; i < g.per_atom_energy_uncertainties.size(); ++i)
+          CHECK(close(r.per_atom_energy_uncertainty[i], g.per_atom_energy_uncertainties[i]));
+
+        REQUIRE(r.n_ensemble == (int) g.energy_ensemble.size());
+        double max_de = 0.0, mean = 0.0;
+        for (std::size_t k = 0; k < g.energy_ensemble.size(); ++k) {
+          max_de = worst(max_de, std::fabs(r.energy_ensemble[k] - g.energy_ensemble[k]));
+          mean += r.energy_ensemble[k] / g.energy_ensemble.size();
+        }
+        INFO("max|dE_member| = " << max_de << " eV");
+        CHECK(max_de <= energy_tolerance(g.total_energy));
+        // The members average to the model's own energy.
+        if (r.n_ensemble) CHECK(std::fabs(mean - r.energy[0]) <= 1e-9 * std::max(1.0, std::fabs(r.energy[0])));
       }
     }
   }

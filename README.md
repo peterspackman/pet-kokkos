@@ -172,6 +172,146 @@ say what each needs); `python/wheels/` has CI's toolchains. `python/tests`
 checks the package (`uv run --with pytest --with ase pytest python/tests` with
 it installed).
 
+### Second derivatives
+
+`pet_kokkos.properties` computes Hessians, vibrational modes, phonons (via
+phonopy, `pip install pet-kokkos[phonons]`) and elastic tensors. A structure is
+a `(numbers, positions, cell, pbc)` tuple, a chmpy `System`, `Crystal` or
+`Molecule`, or anything else with those four attributes. None of it needs
+ASE.
+
+```python
+from pet_kokkos import properties
+vib = properties.vibrations(calc, molecule)              # cm^-1, rigid modes projected out
+el = properties.elastic_tensor(calc, crystal)            # relaxed-ion C, GPa, no relaxations
+ph = properties.phonons(calc, crystal, [2, 2, 2])        # a phonopy.Phonopy with force constants
+H = properties.hessian(calc, atoms, method="fd", points=4, step=0.005)
+```
+
+They are all built on the derivatives of the forces and virial along a set of
+directions (atomic displacements, strains), which come one of two ways:
+
+- `method="exact"`: a Hessian-vector product. The network's forward and its
+  hand-written backward are differentiated along every direction at once
+  (forward-over-reverse), so there is no step and no truncation error. The
+  K directions run as extra rows of the same GEMMs. `Calculator.response`
+  exposes it directly. It works for every published model: both featurizers
+  (pet-mad, pet-omol; pet-mols-s), and the solver, grid or no adaptive cutoff.
+- `method="fd"`: central differences of the forces, every displaced structure
+  of a property in one batched evaluation. The stencil can be set: `points`
+  (2, 4 or 6), `step` (Å), `strain_step`. It works with any model.
+
+`method="auto"`, the default, takes the exact product, and falls back to
+finite differences for a model it cannot differentiate.
+Measured against the exact product in an fp64 build:
+
+| | Hessian | frequencies | elastic constants |
+|---|---|---|---|
+| exact, fp32 | ~3e-5 eV/Å² | ~0.0005 cm⁻¹ | <0.0001 GPa |
+| `fd`, `points=2, step=0.0025` | ~5e-3 eV/Å² | ~0.1 cm⁻¹ | ~0.02 GPa |
+| `fd`, `points=4, step=0.005` | ~1e-3 eV/Å² | ~0.02 cm⁻¹ | ~0.01 GPa |
+| exact, TF32 GEMMs and attention | ~3e-2 eV/Å² | ~0.1–0.4 cm⁻¹ | ~0.02 GPa |
+| `fd`, TF32 GEMMs or attention | | 1–20 cm⁻¹ | 1.5–8 GPa |
+
+These were measured on benzene, the CO2 crystal and silicon with pet-mad-s.
+fp32's own noise is not what limits the finite differences; the stencil's
+truncation is. Near soft or unstable modes the relaxed-ion elastic tensor
+divides by small eigenvalues, and finite-difference errors grow there: on an
+unrelaxed acetic acid cell they reached 0.2–0.6 GPa, and moved with the step.
+With finite differences, TF32 is refused unless `allow_reduced_precision=True`.
+The exact product has no step to amplify TF32's noise, so it is allowed there.
+(For forces, TF32 is 1.6–2× faster on an H200; it hasn't been timed for the
+product.)
+
+The cosine cutoff (pet-mols-s) is smooth only to first order: its second
+derivative jumps at both ends of the taper (4.3 and 4.5 Å), so the Hessian
+itself jumps where a pair distance crosses one. A finite difference whose
+stencil straddles such a distance is off by up to ~0.04 eV/Å². Benzene's meta
+H–H distance, 4.2996 Å, is one such case. The exact product gives the Hessian
+at the geometry itself.
+
+`smooth_cutoff=True` (`pet::Options::smooth_cutoff`, `pet-eval
+--smooth-cutoff`) swaps the cosine taper for 1 − (35x⁴ − 84x⁵ + 70x⁶ − 20x⁷).
+It has the same ends, with its first three derivatives zero at both, so the
+Hessian and its strain derivative are continuous. That matters for
+quasi-harmonic free energies, which differentiate force constants with respect
+to strain: with the cosine, pet-mols-s's dF_vib/dε for naphthalene moved by up
+to 50% between steps of 3e-4 and 3e-3; with the smooth taper it holds to about
+0.5%. It does change the model, slightly. Over the X23 crystals, energies move
+by at most 0.05 meV/atom and forces by about 6e-4 eV/Å RMS. Stresses move by
+under 0.02 GPa, except oxalic acid α (0.05 GPa) and urea (0.14 GPa). The option
+does nothing for a bump-tapered model (pet-mad, pet-omol).
+
+The exact Hessian is symmetric, and the response to a translation is zero, to
+rounding. It also carries the solver adaptive cutoff's full second derivative.
+The forward treats that cutoff's root and slope as constants, as metatrain
+does, which is right for forces; a double backward through that graph, as torch
+would do it, leaves out terms that are 4% of the virial's response to a strain.
+
+With pet-mad-s on an RTX 4080 SUPER:
+
+| | exact | fd, 2-point | fd, 4-point |
+|---|---|---|---|
+| benzene crystal, 48 atoms: Hessian | 0.35 s | 0.51 s | 1.03 s |
+| anthracene, 48 atoms: Hessian | 0.39 s | 0.57 s | 1.19 s |
+| anthracene: elastic tensor | 0.42 s | 0.55 s | 1.11 s |
+| anthracene 2×2×2: phonons (36 displacements of 384 atoms) | 1.11 s | 1.19 s | |
+
+The same anthracene elastic tensor computed one structure per call takes
+1.96 s.
+
+How a direction of the exact product compares with a force evaluation, with
+pet-mad-s (`pet-eval STRUCTURE --hvp K` times it):
+
+| | RTX 4080 SUPER | MI250X (one GCD) |
+|---|---|---|
+| diamond, 64 atoms | 2.9 ms per direction (forces 4.9 ms) | 2.5 ms (forces 4.9 ms) |
+| water, 648 atoms | 41 ms (forces 21.7 ms) | 26 ms (forces 21 ms) |
+
+So a direction costs about one evaluation in small cells, and up to two at
+several hundred atoms. That is at most what a 2-point difference costs per
+direction, with none of its error. On AMD's CDNA GPUs the attention's tangents
+run on the matrix cores, as its forward and backward do.
+
+`properties.HessianOperator(calc, structure)` wraps the exact product as a
+matrix-free operator (a scipy `LinearOperator` via `as_linear_operator()`;
+mass-weighted and with rigid modes projected out if asked). One block of k
+vectors is one call with k directions, so Krylov methods such as `cg`,
+`eigsh` and Newton-CG pay only for the products they take.
+
+`elastic_tensor` uses it from 100 atoms up (`solver="auto"`). It solves for
+the internal relaxation by block CG, six products per iteration, preconditioned
+with a pair Hessian (Packwood et al.'s "Exp"). That took 25–40 iterations on
+molecular crystals from 12 to 384 atoms. For anthracene 2×2×2 (384 atoms) it
+is 6.6 s and 247 products, against 1,158 products to build the Hessian, and it
+reproduces the unit cell's tensor to <1e-4 GPa. If the atoms are not at a
+minimum, it falls back to building the Hessian.
+
+Finding the lowest few modes iteratively does not pay off for molecular
+crystals. LOBPCG needed 400–7,500 products for the six lowest modes, against
+3N for the whole Hessian: the spectrum spans a stiffness ratio of ~10⁴, and a
+pair preconditioner does not capture the soft intermolecular modes those six
+are made of. For those, take the full exact Hessian.
+
+PET is not exactly rotationally equivariant, and that shows up in second
+derivatives at a level well above the finite-difference error:
+
+- A molecule's rotations come out at 6–18 cm⁻¹ rather than zero, even in fp64,
+  so `vibrations` projects them out.
+- Silicon's cubic elastic constants differ from one another by ~0.5 GPa.
+- Silicon's triply degenerate optical mode is split by ~1.5 cm⁻¹.
+
+Translations are exact: the model sees only edge vectors.
+
+`symmetry=True` (in `hessian`, `vibrations` and `elastic_tensor`; needs
+spglib) averages the result over the crystal's space group, as phonopy does for
+its force constants. It is opt-in, because it changes the numbers. Silicon then
+comes out exactly cubic, with a degenerate optical mode. The same symmetry
+breaking moves atoms during an unconstrained relaxation: X23 crystals relaxed
+from their symmetric cells drifted 0.01–0.05 Å off their space groups. So relax
+with the space group held first if you want to symmetrise: chmpy's
+`relax(crystal, calc, symmetry=True)` varies only the asymmetric unit.
+
 ## metatomic plugin
 
 `-DPET_BUILD_METATOMIC=ON` builds `metatomic/pet-kokkos-metatomic.so`, a
@@ -332,6 +472,56 @@ The other GEMM modes:
 On AMD GPUs fp32 already runs on the matrix cores, so there is no `tf32`, and
 attention already uses them in fp32. A mode the device cannot run falls back
 to fp32.
+
+### Non-conservative forces
+
+Most published models also have heads that predict forces and stress
+directly. `pet::Options::non_conservative` (`non_conservative=True` in Python,
+`--non-conservative` for `pet-eval`) takes forces and virial from them instead
+of from the energy's gradient, as upet's `non_conservative=True` does. There is
+no backward pass, so an evaluation with forces costs about what the energy
+alone does. With pet-mad-s on an RTX 4080 SUPER:
+
+| | conservative | non-conservative |
+|---|---|---|
+| 624-atom Cu-BTC | 18.0 ms | 8.9 ms |
+| 384-atom anthracene supercell | 16.7 ms | 8.7 ms |
+
+Each structure's net force is removed, as metatomic does (except over several
+ranks, where no rank sees the whole structure). Edge gradients and per-atom
+virials need the backward pass, so they are not available in this mode.
+
+These forces are not the gradient of the energy. They differ from it by about
+0.1 eV/Å RMS on the structures above. They also aren't exactly rotationally
+equivariant, and they don't conserve energy in NVE; upet uses them with a
+conservative correction every few steps. Check the stress head before relying on
+it: pet-mad-s's gives about 0.15 GPa for an unrelaxed anthracene cell whose
+conservative stress is up to 20 GPa (metatomic gives the same), so it is no use
+for cell relaxations or NPT there. A model with a force head and no stress head
+(pet-omol) returns a zero virial in this mode.
+
+Models converted before the converter kept these heads don't have them:
+convert them again.
+
+### Uncertainty
+
+pet-mad (xs, s and m) and pet-mols-s come with metatrain's LLPR uncertainty.
+`pet::Options::uncertainty` (`uncertainty=True` in Python, `--uncertainty` for
+`pet-eval`) returns it alongside the energy:
+
+- `energy_uncertainty`: each structure's, a standard deviation in eV (upet's
+  `get_energy_uncertainty()`);
+- `per_atom_energy_uncertainty`: each atom's, the one upet's
+  `uncertainty_threshold` warns on;
+- `energy_ensemble`: the 128 members of the model's energy ensemble, which
+  average to the energy.
+
+It is computed from the last-layer features the forward pass already has, so
+it costs little: 0.5 ms on top of 18.9 ms for 624-atom Cu-BTC with pet-mad-s,
+forces included. The Cholesky factor it uses is badly conditioned (about 4e8
+for pet-mad-s), so pet-kokkos applies its inverse in double precision; the
+results match metatomic's float64 evaluation to about 1e-6. The force and
+stress uncertainties upet derives from ensembles are not implemented.
 
 ## Environment variables
 

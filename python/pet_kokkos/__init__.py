@@ -25,7 +25,7 @@ import numpy as np
 from ._backend import core as _core
 from .models import data_dir, download, resolve
 
-__all__ = ["Calculator", "backend", "download", "data_dir", "metatomic_plugin"]
+__all__ = ["Calculator", "backend", "precision_modes", "download", "data_dir", "metatomic_plugin"]
 
 _live: "weakref.WeakSet[Calculator]" = weakref.WeakSet()
 
@@ -34,6 +34,12 @@ def backend() -> str:
     """The Kokkos execution space this process computes on (Serial, OpenMP,
     Threads, Cuda, HIP): this build's."""
     return _core.backend()
+
+
+def precision_modes() -> tuple[str, str]:
+    """The process-wide (gemm, attention) modes: ("native", "native") unless a
+    Calculator or PET_GEMM / PET_ATTN asked for faster ones."""
+    return tuple(_core.precision_modes())
 
 
 def metatomic_plugin() -> str | None:
@@ -67,6 +73,21 @@ class Calculator:
         the current mode, fp32 unless set).
     cache_neighbors: keep a Verlet cache of the neighbour topology across calls,
         for MD and relaxations of the same atoms.
+    non_conservative: forces and virial from the model's direct heads (upet's
+        ``non_conservative=True``): no backward pass, about twice as fast, but
+        not the energy's gradient. Most published models have the heads; a
+        model without them raises. Without a stress head the virial is zero.
+    uncertainty: also return the model's LLPR energy uncertainty (upet's
+        ``energy_uncertainty``, a standard deviation in eV) as
+        ``energy_uncertainty`` and per atom as ``energies_uncertainty``, and,
+        for a model with one, the ``energy_ensemble``. A model without one
+        raises.
+    smooth_cutoff: for a model whose edges taper with the cosine (pet-mols-s),
+        a taper with the same ends whose first three derivatives vanish there.
+        The cosine's second derivative jumps at both ends of the taper, so its
+        Hessian jumps wherever a pair distance crosses one, which strain
+        derivatives of force constants (quasi-harmonic free energies) trip
+        over. It changes the model slightly; nothing for a bump-tapered model.
     """
 
     def __init__(
@@ -80,8 +101,12 @@ class Calculator:
         recompute: str | None = None,
         memory_budget_gib: float = 0.0,
         max_batch_atoms: int = 0,
+        non_conservative: bool = False,
+        uncertainty: bool = False,
+        smooth_cutoff: bool = False,
     ):
         self.model = resolve(model)
+        self.non_conservative = non_conservative
         self._calc = _core.Calculator(
             self.model,
             gemm=gemm,
@@ -91,6 +116,9 @@ class Calculator:
             recompute=recompute,
             memory_budget_gib=memory_budget_gib,
             max_batch_atoms=max_batch_atoms,
+            non_conservative=non_conservative,
+            uncertainty=uncertainty,
+            smooth_cutoff=smooth_cutoff,
         )
         _live.add(self)
 
@@ -98,7 +126,9 @@ class Calculator:
         """Energy (and forces and virial) of one structure.
 
         Returns a dict with ``energy`` (float), ``energies`` [N] and, with
-        forces, ``forces`` [N, 3] and ``virial`` [6] (periodic structures).
+        forces, ``forces`` [N, 3] and ``virial`` [6] (periodic structures);
+        with ``uncertainty``, ``energy_uncertainty``, ``energies_uncertainty``
+        [N] and ``energy_ensemble`` [members].
         """
         z, x, c, p = _arrays(numbers, positions, cell, pbc)
         return self._calc.compute(z, x, c, p, forces, charge, spin_multiplicity)
@@ -114,6 +144,33 @@ class Calculator:
             items.append((z, x, c, p, q, m))
         return self._calc.compute_batch(items, forces)
 
+    def response(self, numbers, positions, cell=None, pbc=None, *, displacements=None, strains=None, charge=0,
+                 spin_multiplicity=1) -> dict:
+        """The derivatives of the forces and virial along K directions, exactly:
+        a Hessian-vector product, with no finite step. Direction k moves the
+        atoms by ``displacements[k]`` ([N, 3], A per unit t) and strains the
+        structure by ``strains[k]`` ([3, 3]: positions and cell go to
+        x (I + t e)^T); either may be None. Returns ``forces`` [K, N, 3]
+        (d forces / dt), ``virial`` [K, 6] (d virial / dt, the virial's order)
+        and ``base_forces`` [N, 3].
+
+        One structure at a time; every published model. See
+        ``pet_kokkos.properties`` for Hessians, vibrations and elastic tensors
+        built on it.
+        """
+        z, x, c, p = _arrays(numbers, positions, cell, pbc)
+        n = len(z)
+        u = np.zeros((0, n, 3)) if displacements is None else np.ascontiguousarray(displacements, dtype=np.float64)
+        e = np.zeros((0, 3, 3)) if strains is None else np.ascontiguousarray(strains, dtype=np.float64)
+        u = u.reshape(-1, n, 3)
+        e = e.reshape(-1, 3, 3)
+        K = max(len(u), len(e))
+        if len(u) == 0:
+            u = np.zeros((K, n, 3))
+        if len(e) == 0:
+            e = np.zeros((K, 3, 3))
+        return self._calc.response(z, x, c, p, u, e, charge, spin_multiplicity)
+
     @property
     def cutoff(self) -> float:
         return self._calc.cutoff
@@ -121,6 +178,22 @@ class Calculator:
     @property
     def atomic_types(self) -> list[int]:
         return self._calc.atomic_types
+
+    @property
+    def has_non_conservative_forces(self) -> bool:
+        return self._calc.has_non_conservative_forces
+
+    @property
+    def has_non_conservative_stress(self) -> bool:
+        return self._calc.has_non_conservative_stress
+
+    @property
+    def has_uncertainty(self) -> bool:
+        return self._calc.has_uncertainty
+
+    @property
+    def n_ensemble(self) -> int:
+        return self._calc.n_ensemble
 
     def memory_report(self) -> str:
         return self._calc.memory_report()

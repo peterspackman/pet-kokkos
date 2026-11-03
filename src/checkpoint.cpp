@@ -119,6 +119,20 @@ Checkpoint::Checkpoint(const std::string& json_path, const std::string& safetens
   energy_unit = j.value("energy_unit", "eV");
   species_to_index = j.at("species_to_index").get<std::vector<int>>();
   composition_energies = j.at("composition_energies").get<std::vector<double>>();
+  if (j.contains("non_conservative")) {
+    const auto& nc = j.at("non_conservative");
+    if (nc.contains("force")) nc_force_scale = nc.at("force").at("scale").get<std::vector<double>>();
+    if (nc.contains("stress")) nc_stress_scale = nc.at("stress").at("scale").get<std::vector<double>>();
+    if (!nc_force_scale.empty() && nc_force_scale.size() != 1 && (int) nc_force_scale.size() != n_species)
+      throw std::runtime_error("checkpoint: non-conservative force scale is neither one number nor one per species");
+  }
+
+  if (j.contains("uncertainty") && j.at("uncertainty").contains("energy")) {
+    const auto& u = j.at("uncertainty").at("energy");
+    llpr_features = u.at("features").get<int>();
+    llpr_multiplier = u.at("multiplier").get<double>();
+    llpr_ensemble = u.value("ensemble", 0);
+  }
 
   if (p.long_range_enabled) throw std::runtime_error("checkpoint: long-range models not yet supported");
   if (p.zbl) throw std::runtime_error("checkpoint: ZBL term not yet supported");

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -35,6 +36,11 @@ void usage() {
       "\n"
       "options:\n"
       "  -f, --forces         compute forces (and, for periodic frames, the virial)\n"
+      "      --non-conservative  forces and virial from the model's direct heads,\n"
+      "                       without the backward pass (not the energy's gradient)\n"
+      "      --uncertainty    the model's LLPR energy uncertainty (and ensemble)\n"
+      "      --smooth-cutoff  a cosine-tapered model's taper made smooth to third order\n"
+      "                       (changes the model slightly; see Options::smooth_cutoff)\n"
       "  -b, --batch          evaluate all frames in one pass instead of one at a time\n"
       "  -o, --output FILE    write the frames back out as extxyz, with forces\n"
       "      --json           emit results as JSON on stdout (for scripts)\n"
@@ -44,6 +50,8 @@ void usage() {
       "      --host-neighbors build the neighbour list on the host\n"
       "      --builtin-neighbors  use the built-in O(N^2) search, not vesin\n"
       "      --repeat N       evaluate N times and report the best wall time\n"
+      "      --hvp K          time K exact Hessian-vector products (random\n"
+      "                       directions) on the first frame, instead\n"
       "      --memory         report the device scratch pool and its largest buffers\n"
       "      --info           print the model's properties and exit\n"
       "      --models         list the model search path and exit\n"
@@ -75,8 +83,9 @@ struct Args {
   std::string model_spec, structure_path, output_path;
   bool want_forces = false, batch = false, per_atom = false;
   bool host_neighbors = false, builtin_neighbors = false, info_only = false, json = false;
-  bool report_memory = false;
+  bool report_memory = false, non_conservative = false, uncertainty = false, smooth_cutoff = false;
   int repeat = 1;
+  int hvp = 0;  // directions for --hvp
   int charge = 0;
   int spin = 1;
 };
@@ -113,6 +122,13 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.host_neighbors = true;
     } else if (s == "--builtin-neighbors") {
       a.builtin_neighbors = true;
+    } else if (s == "--non-conservative") {
+      a.non_conservative = true;
+      a.want_forces = true;
+    } else if (s == "--uncertainty") {
+      a.uncertainty = true;
+    } else if (s == "--smooth-cutoff") {
+      a.smooth_cutoff = true;
     } else if (s == "--info") {
       a.info_only = true;
     } else if (s == "--json") {
@@ -126,6 +142,8 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.spin = std::atoi(next("--spin").c_str());
     } else if (s == "--memory") {
       a.report_memory = true;
+    } else if (s == "--hvp") {
+      a.hvp = std::max(1, std::atoi(next("--hvp").c_str()));
     } else if (s == "--repeat") {
       a.repeat = std::max(1, std::atoi(next("--repeat").c_str()));
     } else if (s.rfind("--kokkos-", 0) == 0) {
@@ -171,7 +189,9 @@ std::vector<std::pair<std::string, std::string>> model_fields(const Args& a, con
       {"transformer", str(h.transformer_type == TransformerType::PreLN ? "PreLN" : "PostLN")},
       {"normalization", str(h.normalization == Normalization::RMSNorm ? "RMSNorm" : "LayerNorm")},
       {"activation", str(h.activation == Activation::SwiGLU ? "SwiGLU" : "SiLU")},
-      {"cutoff_function", str(h.cutoff_function == pet::CutoffFunction::Bump ? "Bump" : "Cosine")},
+      {"cutoff_function", str(h.cutoff_function == pet::CutoffFunction::Bump     ? "Bump"
+                              : h.cutoff_function == pet::CutoffFunction::Cosine ? "Cosine"
+                                                                                 : "Smooth")},
       {"cutoff", num(h.cutoff)},
       {"cutoff_width", num(h.cutoff_width)},
       {"cutoff_width_adaptive", num(h.cutoff_width_adaptive)},
@@ -191,6 +211,10 @@ std::vector<std::pair<std::string, std::string>> model_fields(const Args& a, con
       {"max_charge", num(h.max_charge)},
       {"max_spin_multiplicity", num(h.max_spin_multiplicity)},
       {"n_species", num((double) calc.atomic_types().size())},
+      {"non_conservative_forces", flag(calc.has_non_conservative_forces())},
+      {"non_conservative_stress", flag(calc.has_non_conservative_stress())},
+      {"uncertainty", flag(calc.has_uncertainty())},
+      {"n_ensemble", num(calc.n_ensemble())},
   };
 }
 
@@ -233,6 +257,7 @@ void print_json(const Args& a, const pet::Calculator& calc,
   std::printf("  \"system_conditioning\": %s,\n",
               calc.hypers().system_conditioning ? "true" : "false");
   std::printf("  \"charge\": %d,\n  \"spin_multiplicity\": %d,\n", a.charge, a.spin);
+  std::printf("  \"non_conservative\": %s,\n", a.non_conservative ? "true" : "false");
   std::printf("  \"frames\": [\n");
 
   std::size_t foff = 0, eoff = 0;
@@ -245,6 +270,20 @@ void print_json(const Args& a, const pet::Calculator& calc,
       std::printf(",\n      \"per_atom_energy\": [");
       for (int i = 0; i < s.n_atoms; ++i)
         std::printf("%s%s", i ? ", " : "", num(r.per_atom_energy[eoff + i]).c_str());
+      std::printf("]");
+    }
+    if (b < r.energy_uncertainty.size())
+      std::printf(",\n      \"energy_uncertainty\": %s", num(r.energy_uncertainty[b]).c_str());
+    if (a.per_atom && r.per_atom_energy_uncertainty.size() >= eoff + static_cast<std::size_t>(s.n_atoms)) {
+      std::printf(",\n      \"per_atom_energy_uncertainty\": [");
+      for (int i = 0; i < s.n_atoms; ++i)
+        std::printf("%s%s", i ? ", " : "", num(r.per_atom_energy_uncertainty[eoff + i]).c_str());
+      std::printf("]");
+    }
+    if (r.n_ensemble > 0 && r.energy_ensemble.size() >= (b + 1) * r.n_ensemble) {
+      std::printf(",\n      \"energy_ensemble\": [");
+      for (int k = 0; k < r.n_ensemble; ++k)
+        std::printf("%s%s", k ? ", " : "", num(r.energy_ensemble[b * r.n_ensemble + k]).c_str());
       std::printf("]");
     }
     eoff += s.n_atoms;
@@ -288,6 +327,9 @@ int run(const Args& a) {
   opts.device_neighbors = !a.host_neighbors;
   opts.neighbors = a.builtin_neighbors ? pet::Options::Neighbors::Builtin
                                        : pet::Options::Neighbors::Vesin;
+  opts.non_conservative = a.non_conservative;
+  opts.uncertainty = a.uncertainty;
+  opts.smooth_cutoff = a.smooth_cutoff;
   pet::Calculator calc(a.model_spec, opts);
 
   if (a.info_only) {
@@ -322,6 +364,27 @@ int run(const Args& a) {
         return 1;
       }
 
+  if (a.hvp > 0) {  // K exact Hessian-vector products on the first frame
+    const pet::System& s = frames[0];
+    std::vector<double> u(std::size_t(a.hvp) * s.n_atoms * 3);
+    std::uint64_t x = 88172645463325252ull;  // a fixed xorshift: the same directions every run
+    for (auto& v : u) {
+      x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+      v = double(x % 2000001) / 1e6 - 1.0;
+    }
+    double best = 1e300, dmax = 0.0;
+    for (int k = 0; k < std::max(a.repeat, 1); ++k) {
+      const auto t0 = std::chrono::steady_clock::now();
+      const pet::Calculator::Response hv = calc.response(s, a.hvp, u, {});
+      const std::chrono::duration<double> dt = std::chrono::steady_clock::now() - t0;
+      best = std::min(best, dt.count());
+      for (double f : hv.forces) dmax = std::max(dmax, std::fabs(f));
+    }
+    std::printf("hvp: N=%d K=%d  max|dF/dt| = %.6e  best of %d: %.4f s (%.3f ms per direction)\n", s.n_atoms,
+                a.hvp, dmax, std::max(a.repeat, 1), best, 1e3 * best / a.hvp);
+    return 0;
+  }
+
   pet::Results r;
   double best_seconds = 1e300;
   for (int k = 0; k < a.repeat; ++k) {
@@ -338,6 +401,11 @@ int run(const Args& a) {
         all.per_atom_energy.insert(all.per_atom_energy.end(), one.per_atom_energy.begin(),
                                    one.per_atom_energy.end());
         all.virial.insert(all.virial.end(), one.virial.begin(), one.virial.end());
+        auto append = [](auto& to, const auto& from) { to.insert(to.end(), from.begin(), from.end()); };
+        append(all.energy_uncertainty, one.energy_uncertainty);
+        append(all.per_atom_energy_uncertainty, one.per_atom_energy_uncertainty);
+        append(all.energy_ensemble, one.energy_ensemble);
+        all.n_ensemble = one.n_ensemble;
       }
       r = std::move(all);
     }
@@ -364,6 +432,11 @@ int run(const Args& a) {
       for (int i = 0; i < s.n_atoms; ++i)
         std::printf("    %-3s % .10f eV\n", pet::element_symbol(s.atomic_numbers[i]),
                     r.per_atom_energy[eoff + i]);
+    if (b < r.energy_uncertainty.size()) {
+      std::printf("  energy uncertainty: %.6f eV", r.energy_uncertainty[b]);
+      if (r.n_ensemble > 0) std::printf("  (%d-member ensemble)", r.n_ensemble);
+      std::printf("\n");
+    }
     eoff += s.n_atoms;
 
     if (a.want_forces && r.forces.size() >= foff + static_cast<std::size_t>(s.n_atoms) * 3) {

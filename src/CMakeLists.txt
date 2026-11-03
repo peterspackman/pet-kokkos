@@ -6,6 +6,7 @@
 #   feedforward.cpp  the feedforward featurizer
 #   residual.cpp     the residual featurizer
 #   forces.cpp       edge gradients -> forces and virial, adaptive cutoff
+#   hvp.cpp          the exact Hessian-vector product (forward-over-reverse)
 #   model.cpp        loading, upload, packing, readout, compute()
 #   checkpoint.cpp   the model JSON and safetensors weights
 #   neighbors.cpp    the host neighbour list and adaptive cutoff
@@ -28,6 +29,7 @@ add_library(pet_kokkos STATIC
     feedforward.cpp
     residual.cpp
     forces.cpp
+    hvp.cpp
     device_geometry.cpp
     device_cell_list.cpp
     calculator.cpp

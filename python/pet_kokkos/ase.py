@@ -7,7 +7,9 @@
 For MD or a relaxation of the same atoms, ``cache_neighbors=True`` (the
 default here) keeps a Verlet cache of the neighbour topology between steps.
 A charge and spin multiplicity, for models conditioned on them, are read from
-``atoms.info["charge"]`` and ``atoms.info["spin"]``.
+``atoms.info["charge"]`` and ``atoms.info["spin"]``. With ``uncertainty=True``
+the LLPR energy uncertainty and ensemble land in ``calc.results`` as
+``energy_uncertainty``, ``energies_uncertainty`` and ``energy_ensemble``.
 """
 
 from __future__ import annotations
@@ -45,6 +47,9 @@ class PETCalculator(Calculator):
         )
         self.results["energy"] = self.results["free_energy"] = float(r["energy"])
         self.results["energies"] = np.array(r["energies"])
+        for key in ("energy_uncertainty", "energies_uncertainty", "energy_ensemble"):
+            if key in r:
+                self.results[key] = r[key]
         if want_forces:
             self.results["forces"] = np.array(r["forces"])
             if all(pbc) and "virial" in r:

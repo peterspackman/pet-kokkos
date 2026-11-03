@@ -13,13 +13,56 @@
 
 namespace pet {
 
+namespace {
+
+// Layer i's last-layer features into ll, as metatrain concatenates them: the
+// node head's output in columns [2i*Dh, (2i+1)*Dh), the edge heads' summed
+// over each atom's edges with the cutoff factor in the next Dh.
+void gather_ll_features(View2D ll, int i, View2D node_h, View2D edge_h, const PackedEdges& pk) {
+  const int N = node_h.extent(0), Dh = node_h.extent(1), c0 = 2 * i * Dh;
+  auto off = pk.off;
+  auto cut = pk.cut;
+  Kokkos::parallel_for(
+      "ll_features", RangePolicy(0, N * Dh), KOKKOS_LAMBDA(int x) {
+        const int n = x / Dh, d = x % Dh;
+        double s = 0.0;
+        for (int k = off(n); k < off(n + 1); ++k) s += (double) cut(k) * (double) edge_h(k, d);
+        ll(n, c0 + d) = node_h(n, d);
+        ll(n, c0 + Dh + d) = Net(s);
+      });
+}
+
+// out(r) = multiplier * |inv * x(r, :)|, inv lower triangular: metatrain's
+// LLPR sigma, its triangular solve done as a product with the inverse.
+void llpr_sigma(RView2D x, RView2D inv, double multiplier, RView1D out) {
+  const int F = inv.extent(0);
+  Kokkos::parallel_for(
+      "llpr_sigma", TeamPolicy(x.extent(0), Kokkos::AUTO), KOKKOS_LAMBDA(const Team& t) {
+        const int r = t.league_rank();
+        double q = 0.0;
+        Kokkos::parallel_reduce(
+            Kokkos::TeamThreadRange(t, F),
+            [&](int i, double& acc) {
+              double v = 0.0;
+              for (int j = 0; j <= i; ++j) v += inv(i, j) * x(r, j);
+              acc += v * v;
+            },
+            q);
+        Kokkos::single(Kokkos::PerTeam(t), [&] { out(r) = multiplier * Kokkos::sqrt(q); });
+      });
+}
+
+}  // namespace
+
 // ---- loading --------------------------------------------------------------------
 
 PetModel::PetModel(const Checkpoint& ckpt)
     : h_(ckpt.hypers),
       energy_scale_(ckpt.energy_scale),
       composition_(ckpt.composition_energies),
-      species_to_index_(ckpt.species_to_index) {
+      species_to_index_(ckpt.species_to_index),
+      nc_force_scale_(ckpt.nc_force_scale),
+      nc_stress_scale_(ckpt.nc_stress_scale) {
   load_all(ckpt);
 
   // The adaptive cutoff's probe grid, on the device.
@@ -34,6 +77,102 @@ PetModel::PetModel(const Checkpoint& ckpt)
   auto hc = Kokkos::create_mirror_view(comp_view_);
   for (std::size_t i = 0; i < composition_.size(); ++i) hc(i) = composition_[i];
   Kokkos::deep_copy(comp_view_, hc);
+
+  // The LLPR uncertainty's matrices, in double: its Cholesky factor is badly
+  // conditioned (~4e8 for pet-mad-s).
+  if (ckpt.llpr_features > 0) {
+    if (ckpt.llpr_features != 2 * h_.num_readout_layers * h_.d_head)
+      throw std::runtime_error("checkpoint: LLPR features (" + std::to_string(ckpt.llpr_features) +
+                               ") are not the model's last-layer features");
+    auto load = [&](const std::string& n) {
+      const Tensor& t = ckpt.weights.at(n);
+      RView2D v(n, t.dim(0), t.dim(1));
+      auto hv = Kokkos::create_mirror_view(v);
+      for (int a = 0; a < t.dim(0); ++a)
+        for (int b = 0; b < t.dim(1); ++b) hv(a, b) = t.data[std::size_t(a) * t.dim(1) + b];
+      Kokkos::deep_copy(v, hv);
+      return v;
+    };
+    llpr_inv_ = load("llpr.energy.inv_cholesky");
+    if (ckpt.llpr_ensemble > 0) llpr_ensemble_ = load("llpr.energy.ensemble");
+    llpr_features_ = ckpt.llpr_features;
+    llpr_multiplier_ = ckpt.llpr_multiplier;
+  }
+
+  // One force scale for every species, or one each.
+  if (has_nc_force()) {
+    nc_force_scale_view_ = RView1D("nc_force_scale", composition_.size());
+    auto hs = Kokkos::create_mirror_view(nc_force_scale_view_);
+    for (std::size_t i = 0; i < composition_.size(); ++i)
+      hs(i) = nc_force_scale_[nc_force_scale_.size() == 1 ? 0 : i];
+    Kokkos::deep_copy(nc_force_scale_view_, hs);
+  }
+}
+
+void PetModel::set_uncertainty(bool on) {
+  if (on && !has_uncertainty())
+    throw std::runtime_error(
+        "PetModel: this model has no LLPR uncertainty (or was converted before "
+        "tools/convert_pet.py kept it; convert it again)");
+  uq_ = on;
+}
+
+View2D PetModel::ll_features(int N, const std::string& key) {
+  return uq_ ? ws_.n2(key + "llpr_f", N, llpr_features_) : View2D();
+}
+
+Uncertainty PetModel::energy_uncertainty(const DeviceEdgeData& dev, const PackedEdges& pk, View2D ll,
+                                         RView1D per_atom, const std::string& key) {
+  const int N = dev.centres(), NA = dev.n_atoms, NS = dev.n_struct, nl = pk.n_local, F = llpr_features_;
+  const IView1D soff = structure_offsets(ws_, key + "uq", dev.struct_id, NA, NS);
+  // Each atom's features in double, 0 for atoms outside the energy, and each
+  // structure's sum: metatrain's per-atom and per-structure features.
+  RView2D fa = ws_.r2(key + "uq_fa", NA, F), fs = ws_.r2(key + "uq_fs", NS, F);
+  Kokkos::parallel_for(
+      "uq_features", RangePolicy(0, NA * F), KOKKOS_LAMBDA(int x) {
+        const int a = x / F, j = x % F;
+        fa(a, j) = a < N && a < nl ? (double) ll(a, j) : 0.0;
+      });
+  sum_by_structure(fa, soff, fs, false);
+  Uncertainty u{ws_.r1(key + "uq_e", NS), ws_.r1(key + "uq_ea", NA), {}};
+  llpr_sigma(fa, llpr_inv_, llpr_multiplier_, u.per_atom);
+  llpr_sigma(fs, llpr_inv_, llpr_multiplier_, u.energy);
+  if (llpr_ensemble_.extent(0) == 0) return u;
+
+  // Member k's energy is w_k . f, re-centred so the members average to the
+  // model's own energy, as metatrain does (which also restores what the last
+  // layer leaves out: composition, biases).
+  const int K = llpr_ensemble_.extent(0);
+  auto W = llpr_ensemble_;
+  RView2D e = ws_.r2(key + "uq_energy", NS, 1);
+  sum_by_structure(RView2D(per_atom.data(), NA, 1), soff, e, false);
+  u.ensemble = ws_.r2(key + "uq_ens", NS, K);
+  auto ens = u.ensemble;
+  Kokkos::parallel_for(
+      "uq_ensemble", TeamPolicy(NS, Kokkos::AUTO), KOKKOS_LAMBDA(const Team& t) {
+        const int b = t.league_rank();
+        double sum = 0.0;
+        Kokkos::parallel_reduce(
+            Kokkos::TeamThreadRange(t, K),
+            [&](int k, double& acc) {
+              double v = 0.0;
+              for (int j = 0; j < F; ++j) v += W(k, j) * fs(b, j);
+              ens(b, k) = v;
+              acc += v;
+            },
+            sum);
+        t.team_barrier();
+        Kokkos::parallel_for(Kokkos::TeamThreadRange(t, K), [&](int k) { ens(b, k) += e(b, 0) - sum / K; });
+      });
+  return u;
+}
+
+void PetModel::set_non_conservative(bool on) {
+  if (on && !has_nc_force())
+    throw std::runtime_error(
+        "PetModel: this model has no non-conservative force head (or was converted before "
+        "tools/convert_pet.py kept them; convert it again)");
+  nc_ = on;
 }
 
 void PetModel::load_all(const Checkpoint& ckpt) {
@@ -155,6 +294,19 @@ void PetModel::load_all(const Checkpoint& ckpt) {
     load_linear("edge_heads.energy." + si + ".2");
     load_linear("node_last_layers.energy." + si + ".energy___0");
     load_linear("edge_last_layers.energy." + si + ".energy___0");
+  }
+  // The non-conservative heads, when the checkpoint has them: the energy's
+  // layout, with 3 (force) or 9 (stress) outputs.
+  for (const std::string t : {"nc_force", "nc_stress"}) {
+    if (t == "nc_force" ? ckpt.nc_force_scale.empty() : ckpt.nc_stress_scale.empty()) continue;
+    for (int i = 0; i < R; ++i) {
+      const std::string si = std::to_string(i);
+      for (const std::string side : {"node", "edge"}) {
+        load_linear(side + "_heads." + t + "." + si + ".0");
+        load_linear(side + "_heads." + t + "." + si + ".2");
+        load_linear(side + "_last_layers." + t + "." + si + "." + t + "___0");
+      }
+    }
   }
 
   // The two families this implements; anything else is refused by name.
@@ -499,10 +651,10 @@ void PetModel::feedforward_bwd(View2D in_adj, View2D out_adj, const std::string&
   linear_bwd(in_adj, h_adj, w_in, beta);
 }
 
-void PetModel::readout(const std::vector<View2D>& node_feat, const std::vector<View2D>& edge_feat,
-                       View1D per_atom_net, const PackedEdges& pk, ReadoutSaves* sav,
-                       const std::string& key) {
-  const int R = node_feat.size(), N = per_atom_net.extent(0), E = pk.E, Dh = h_.d_head;
+void PetModel::readout(const std::vector<View2D>& node_feat, const std::vector<View2D>& edge_feat, View2D out,
+                       const PackedEdges& pk, ReadoutSaves* sav, const std::string& key,
+                       const std::string& target, View2D ll) {
+  const int R = node_feat.size(), N = out.extent(0), C = out.extent(1), E = pk.E, Dh = h_.d_head;
   if (sav)
     for (auto* v : {&sav->nh0, &sav->nh1, &sav->eh0, &sav->eh1, &sav->epred}) v->assign(R, View2D());
   // A buffer the backward reads is saved under a per-layer name, otherwise scratch.
@@ -510,28 +662,83 @@ void PetModel::readout(const std::vector<View2D>& node_feat, const std::vector<V
     return sav ? ((*s)[i] = ws_.n2(key + "s_" + name + "_" + std::to_string(i), rows, cols))
                : ws_.n2(key + name, rows, cols);
   };
+  const std::string w = std::to_string(C);  // the predictions' scratch, by width
   for (int i = 0; i < R; ++i) {
-    const std::string si = std::to_string(i), nh = "node_heads.energy." + si, eh = "edge_heads.energy." + si;
+    const std::string si = std::to_string(i), nh = "node_heads." + target + "." + si,
+                      eh = "edge_heads." + target + "." + si,
+                      last = "_last_layers." + target + "." + si + "." + target + "___0";
     View2D nh0 = ws_.n2(key + "nh0", N, Dh), nh1 = ws_.n2(key + "nh1", N, Dh);
     linear_silu(nh0, sav ? buf(&sav->nh0, "nh0", i, N, Dh) : View2D(), node_feat[i], mat(nh + ".0.weight"),
                 vec(nh + ".0.bias"));
     linear_silu(nh1, sav ? buf(&sav->nh1, "nh1", i, N, Dh) : View2D(), nh0, mat(nh + ".2.weight"),
                 vec(nh + ".2.bias"));
-    View2D node_pred = ws_.n2(key + "node_pred", N, 1);
-    linear(node_pred, nh1, mat("node_last_layers.energy." + si + ".energy___0.weight"),
-           vec("node_last_layers.energy." + si + ".energy___0.bias"));
+    View2D node_pred = ws_.n2(key + "node_pred" + w, N, C);
+    linear(node_pred, nh1, mat("node" + last + ".weight"), vec("node" + last + ".bias"));
 
     View2D eh0 = ws_.n2(key + "eh0", E, Dh), eh1 = ws_.n2(key + "eh1", E, Dh);
     linear_silu(eh0, sav ? buf(&sav->eh0, "eh0", i, E, Dh) : View2D(), edge_feat[i], mat(eh + ".0.weight"),
                 vec(eh + ".0.bias"));
     linear_silu(eh1, sav ? buf(&sav->eh1, "eh1", i, E, Dh) : View2D(), eh0, mat(eh + ".2.weight"),
                 vec(eh + ".2.bias"));
-    View2D edge_pred = sav ? buf(&sav->epred, "epred", i, E, 1) : ws_.n2(key + "edge_pred", E, 1);
-    linear(edge_pred, eh1, mat("edge_last_layers.energy." + si + ".energy___0.weight"),
-           vec("edge_last_layers.energy." + si + ".energy___0.bias"));
+    View2D edge_pred = sav ? buf(&sav->epred, "epred", i, E, C) : ws_.n2(key + "edge_pred" + w, E, C);
+    linear(edge_pred, eh1, mat("edge" + last + ".weight"), vec("edge" + last + ".bias"));
 
-    readout_accumulate(per_atom_net, node_pred, edge_pred, pk, i > 0);
+    readout_accumulate(out, node_pred, edge_pred, pk, i > 0);
+    if (ll.extent(0)) gather_ll_features(ll, i, nh1, eh1, pk);
   }
+}
+
+DeviceOut PetModel::nc_outputs(const DeviceEdgeData& dev, const PackedEdges& pk,
+                               const std::vector<View2D>& node_feat, const std::vector<View2D>& edge_feat,
+                               RView1D per_atom, const std::string& key) {
+  const int N = dev.centres(), NA = dev.n_atoms, NS = dev.n_struct, nl = pk.n_local;  // the model's rows, every atom
+  auto species = dev.species;
+  const IView1D soff = structure_offsets(ws_, key + "nc", dev.struct_id, NA, NS);
+
+  DeviceOut out{per_atom, ws_.r2(key + "nc_forces", NA, 3), ws_.r2(key + "nc_vir9", NS, 9), {}};
+  View2D f = ws_.n2(key + "nc_f", N, 3);
+  readout(node_feat, edge_feat, f, pk, nullptr, key + "nc_", "nc_force");
+  auto forces = out.forces;
+  auto fscale = nc_force_scale_view_;
+  Kokkos::parallel_for(
+      "nc_forces", RangePolicy(0, NA), KOKKOS_LAMBDA(int a) {
+        const bool own = a < N && a < nl;
+        for (int c = 0; c < 3; ++c) forces(a, c) = own ? fscale(species(a)) * (double) f(a, c) : 0.0;
+      });
+  // Each structure's net force taken out, as metatomic does: a predicted force
+  // need not sum to zero. Over several ranks a rank sees only its own atoms, so
+  // the correction would differ by rank; it is left out there.
+  if (!dev.exchange) {
+    RView2D net = ws_.r2(key + "nc_net", NS, 3);
+    sum_by_structure(forces, soff, net, false);
+    auto sid = dev.struct_id;
+    Kokkos::parallel_for(
+        "nc_net_force", RangePolicy(0, NA), KOKKOS_LAMBDA(int a) {
+          if (a >= nl) return;
+          const int b = NS == 1 ? 0 : sid(a), end = soff(b + 1);
+          const int n = (end < nl ? end : nl) - soff(b);  // the structure's owned atoms
+          for (int c = 0; c < 3; ++c) forces(a, c) -= net(b, c) / n;
+        });
+  }
+
+  auto vir9 = out.vir9;
+  if (!has_nc_stress()) {
+    Kokkos::deep_copy(ExecSpace(), vir9, 0.0);
+    return out;
+  }
+  // metatrain's stress is the atoms' predictions summed over the volume, so
+  // their sum is the virial W = V * stress.
+  View2D s = ws_.n2(key + "nc_s", N, 9);
+  readout(node_feat, edge_feat, s, pk, nullptr, key + "nc_", "nc_stress");
+  RView2D w = ws_.r2(key + "nc_w", NA, 9);
+  const double sscale = nc_stress_scale_[0];
+  Kokkos::parallel_for(
+      "nc_stress", RangePolicy(0, NA), KOKKOS_LAMBDA(int a) {
+        const bool own = a < N && a < nl;
+        for (int t = 0; t < 9; ++t) w(a, t) = own ? sscale * (double) s(a, t) : 0.0;
+      });
+  sum_by_structure(w, soff, vir9, false);
+  return out;
 }
 
 // The adjoint of per_atom_net is 1 per atom, so node_pred's is 1 and edge_pred's
@@ -713,6 +920,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
     }
   }
 
+  uq_last_ = out.uq;
   EnergyResult res;
   if (dev_per_atom) *dev_per_atom = out.per_atom;
   else {
@@ -752,7 +960,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
 // Everything recorded device work depends on besides the model: the shapes,
 // where each input lives, and the workspace's allocation generation.
 std::vector<std::uintptr_t> PetModel::graph_key(const DeviceEdgeData& d, bool grad) const {
-  std::vector<std::uintptr_t> k{(std::uintptr_t) grad,       (std::uintptr_t) d.n_atoms, (std::uintptr_t) d.n_centres,
+  std::vector<std::uintptr_t> k{(std::uintptr_t) grad,       (std::uintptr_t) nc_,       (std::uintptr_t) uq_,       (std::uintptr_t) d.n_atoms, (std::uintptr_t) d.n_centres,
                                 (std::uintptr_t) d.max_neighbors, (std::uintptr_t) d.n_raw,
                                 (std::uintptr_t) d.n_struct,  (std::uintptr_t) d.n_edges,
                                 (std::uintptr_t) d.n_local,   ws_.generation(),

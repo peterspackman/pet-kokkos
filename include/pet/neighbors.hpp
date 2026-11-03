@@ -52,6 +52,7 @@ struct EdgeData {
   std::vector<int> raw_center, raw_neigh;  // [E]
   std::vector<double> raw_dist;            // [E]
   std::vector<double> raw_vec;             // [E*3]
+  std::vector<int> raw_slot;               // [E] the kept edge's slot n*M + m, -1 if dropped
 };
 
 // An edge supplied to build_edge_data_from_raw. center and neigh_owner are local
@@ -94,6 +95,7 @@ namespace detail {
 // The smooth cutoff functions, and the bump's derivative in the cutoff radius.
 double bump_cutoff(double d, double rc, double width);
 double cosine_cutoff(double d, double rc, double width);
+double smooth_cutoff(double d, double rc, double width);
 double bump_dcutoff_dr(double d, double rc, double width);
 
 // A directed edge from the search.

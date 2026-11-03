@@ -140,7 +140,36 @@ def evaluate(calculator, atoms):
     }
 
 
-def make_golden(model_label, calculator, case_name, atoms, out_dir, variant, energy_scale):
+def evaluate_nc(calculator, atoms):
+    """Forces (and, periodic, the 3x3 stress) from the non-conservative heads."""
+    a = atoms.copy()
+    a.calc = calculator
+    out = {"nc_forces": np.asarray(a.get_forces(), dtype=float).tolist()}
+    if a.pbc.any() and calculator.parameters.get("non_conservative") is True:
+        out["nc_stress"] = np.asarray(a.get_stress(voigt=False), dtype=float).tolist()
+    return out
+
+
+def evaluate_uncertainty(calculator, atoms, ensemble):
+    """The LLPR energy uncertainty, per structure and per atom, and the
+    energy ensemble when the model has one."""
+    from metatomic.torch import ModelOutput
+
+    def run(key, kind):
+        o = calculator.run_model(atoms, {key: ModelOutput(unit="eV", sample_kind=kind)})
+        return np.asarray(o[key].block().values.detach().double().cpu().numpy()).reshape(-1)
+
+    out = {
+        "energy_uncertainty": float(run("energy_uncertainty", "system")[0]),
+        "per_atom_energy_uncertainties": run("energy_uncertainty", "atom").tolist(),
+    }
+    if ensemble:
+        out["energy_ensemble"] = run("energy_ensemble", "system").tolist()
+    return out
+
+
+def make_golden(model_label, calculator, case_name, atoms, out_dir, variant, energy_scale,
+                nc_calculator=None, uncertainty=None):
     ev = evaluate(calculator, atoms)
     pbc = [bool(p) for p in atoms.get_pbc()]
 
@@ -178,6 +207,13 @@ def make_golden(model_label, calculator, case_name, atoms, out_dir, variant, ene
         # a model of the same name with another.
         "model_metadata": {"energy_scale": energy_scale},
     }
+    # The non-conservative heads, from metatomic's non_conservative mode (a model
+    # with no stress head: its forces only).
+    if nc_calculator is not None:
+        golden.update(evaluate_nc(nc_calculator, atoms))
+    # The LLPR energy uncertainty (and ensemble), for a model with one.
+    if uncertainty is not None:
+        golden.update(evaluate_uncertainty(calculator, atoms, uncertainty["ensemble"]))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{model_label}_{case_name}.json"
@@ -231,6 +267,16 @@ def main():
 
     variants = {"energy": args.variant} if args.variant else {}
     calculator = MetatomicCalculator(atomistic, variants=variants, device="cpu")
+    outputs = atomistic.capabilities().outputs.keys()
+    nc_force = any(k.startswith("non_conservative_force") for k in outputs)
+    nc_stress = any(k.startswith("non_conservative_stress") for k in outputs)
+    uncertainty = None
+    if not args.variant and "energy_uncertainty" in outputs:
+        uncertainty = {"ensemble": "energy_ensemble" in outputs}
+    nc_calculator = None
+    if nc_force:
+        nc_calculator = MetatomicCalculator(atomistic, variants=variants, device="cpu",
+                                            non_conservative=True if nc_stress else "forces")
 
     structures = build_structures()
     if args.case != "all":
@@ -238,7 +284,8 @@ def main():
 
     print(f"Evaluating golden structures (variant={args.variant}):")
     written = [
-        make_golden(label, calculator, name, atoms, out_dir, args.variant, energy_scale)
+        make_golden(label, calculator, name, atoms, out_dir, args.variant, energy_scale, nc_calculator,
+                    uncertainty)
         for name, atoms in structures.items()
     ]
 

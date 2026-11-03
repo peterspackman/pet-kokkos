@@ -252,6 +252,9 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
 }
 
 DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
+  // The non-conservative heads read forces and virial off the forward alone.
+  const bool nc = grad && nc_;
+  grad = grad && !nc_;
   const int N = dev.centres(), S = dev.max_neighbors + 1;  // the model's rows
   const int D = h_.d_pet, Dn = h_.d_node, G = h_.num_gnn_layers;
   Workspace::Scope scope(ws_);
@@ -290,10 +293,17 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
 
   View1D net = ws_.n1("per_atom_net", N);
   ReadoutSaves rs;
-  readout({node}, {input_edge}, net, pk, grad ? &rs : nullptr, "");
+  const View2D ll = ll_features(N, "");
+  readout({node}, {input_edge}, View2D(net.data(), N, 1), pk, grad ? &rs : nullptr, "", "energy", ll);
   RView1D per_atom = ws_.r1("per_atom", dev.n_atoms);  // every atom's, 0 past n_local
   assemble_energy(per_atom, net, dev.species, comp_view_, energy_scale_, pk.n_local);
-  if (!grad) return {per_atom, {}, {}, {}};
+  const Uncertainty uq = uq_ ? energy_uncertainty(dev, pk, ll, per_atom, "") : Uncertainty{};
+  if (nc) {
+    DeviceOut o = nc_outputs(dev, pk, {node}, {input_edge}, per_atom, "");
+    o.uq = uq;
+    return o;
+  }
+  if (!grad) return {per_atom, {}, {}, {}, uq};
 
   View2D x4_adj = ws_.n2("x4_adj", E, 4), cf_seq_adj = ws_.n2("cf_seq_adj", N, S);
   Kokkos::deep_copy(ExecSpace(), x4_adj, Net(0));
@@ -314,7 +324,7 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
     ff_layer_bwd(dev, pk, L, ckpt ? one : sav[L], keep_wide, node_adj, input_edge_adj, x4_adj, cf_seq_adj);
   }
 
-  DeviceOut out{per_atom, {}, {}, {}};
+  DeviceOut out{per_atom, {}, {}, {}, uq};
   forces_and_virial(ws_, dev, pk, h_, probes_, n_probes_, energy_scale_, x4_adj, cutoff_adj, cf_seq_adj,
                     out.forces, out.vir9, out.edge_grad);
   return out;

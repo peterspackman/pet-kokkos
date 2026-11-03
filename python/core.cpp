@@ -81,6 +81,17 @@ nb::dict structure(const pet::Results& r, std::size_t b, std::size_t a0, std::si
   nb::dict d;
   d["energy"] = r.energy[b];
   d["energies"] = owned(std::vector<double>(r.per_atom_energy.begin() + a0, r.per_atom_energy.begin() + a0 + n), {n});
+  if (b < r.energy_uncertainty.size()) {
+    d["energy_uncertainty"] = r.energy_uncertainty[b];
+    d["energies_uncertainty"] = owned(
+        std::vector<double>(r.per_atom_energy_uncertainty.begin() + a0, r.per_atom_energy_uncertainty.begin() + a0 + n),
+        {n});
+    if (r.n_ensemble > 0) {
+      const std::size_t K = r.n_ensemble;
+      d["energy_ensemble"] = owned(
+          std::vector<double>(r.energy_ensemble.begin() + b * K, r.energy_ensemble.begin() + (b + 1) * K), {K});
+    }
+  }
   if (forces && !r.forces.empty()) {
     d["forces"] = owned(std::vector<double>(r.forces.begin() + 3 * a0, r.forces.begin() + 3 * (a0 + n)), {n, 3});
     if (r.virial.size() >= 6 * (b + 1))
@@ -93,9 +104,13 @@ class Calculator {
  public:
   Calculator(const std::string& model, std::optional<std::string> gemm, std::optional<std::string> attention,
              bool device_neighbors, bool cache_neighbors, std::optional<std::string> recompute,
-             double memory_budget_gib, int max_batch_atoms) {
+             double memory_budget_gib, int max_batch_atoms, bool non_conservative, bool uncertainty,
+             bool smooth_cutoff) {
     start_kokkos();
     pet::Options o;
+    o.non_conservative = non_conservative;
+    o.uncertainty = uncertainty;
+    o.smooth_cutoff = smooth_cutoff;
     o.device_neighbors = device_neighbors;
     o.cache_neighbors = cache_neighbors;
     o.memory_budget_bytes = std::size_t(memory_budget_gib * double(1ull << 30));
@@ -146,6 +161,32 @@ class Calculator {
     return out;
   }
 
+  // d(forces)/dt [K, N, 3] and d(virial)/dt [K, 6] along K directions, exactly
+  // (pet::Calculator::response): displacements [K, N, 3], strains [K, 3, 3].
+  nb::dict response(Numbers numbers, Positions positions, std::optional<Cell> cell, std::array<bool, 3> pbc,
+                    nb::ndarray<const double, nb::ndim<3>, nb::c_contig, nb::device::cpu> displacements,
+                    nb::ndarray<const double, nb::ndim<3>, nb::c_contig, nb::device::cpu> strains, int charge,
+                    int spin_multiplicity) const {
+    const pet::System s = make_system(numbers, positions, cell, pbc, charge, spin_multiplicity);
+    const std::size_t n = s.n_atoms, K = std::max(displacements.shape(0), strains.shape(0));
+    if ((displacements.size() && (displacements.shape(0) != K || displacements.shape(1) != n ||
+                                  displacements.shape(2) != 3)) ||
+        (strains.size() && (strains.shape(0) != K || strains.shape(1) != 3 || strains.shape(2) != 3)))
+      throw std::invalid_argument("pet_kokkos: displacements must be [K, N, 3] and strains [K, 3, 3]");
+    std::vector<double> u(displacements.data(), displacements.data() + displacements.size());
+    std::vector<double> e(strains.data(), strains.data() + strains.size());
+    pet::Calculator::Response r;
+    {
+      nb::gil_scoped_release release;
+      r = get().response(s, int(K), u, e);
+    }
+    nb::dict d;
+    d["forces"] = owned(std::move(r.forces), {K, n, 3});
+    d["virial"] = owned(std::move(r.virial), {K, 6});
+    d["base_forces"] = owned(std::move(r.base), {n, 3});
+    return d;
+  }
+
   void close() { calc_.reset(); }
   bool closed() const { return !calc_; }
   double cutoff() const { return get().cutoff(); }
@@ -153,6 +194,10 @@ class Calculator {
   std::string length_unit() const { return get().length_unit(); }
   std::string energy_unit() const { return get().energy_unit(); }
   double energy_scale() const { return get().energy_scale(); }
+  bool has_non_conservative_forces() const { return get().has_non_conservative_forces(); }
+  bool has_non_conservative_stress() const { return get().has_non_conservative_stress(); }
+  bool has_uncertainty() const { return get().has_uncertainty(); }
+  int n_ensemble() const { return get().n_ensemble(); }
   std::string memory_report() const { return get().memory_report(); }
 
  private:
@@ -172,6 +217,14 @@ NB_MODULE(_core, m) {
         "The Kokkos execution space this build computes on (Serial, OpenMP, Threads, Cuda, HIP).");
   m.def("model_search_dirs", &pet::model_search_dirs, "Where named models are looked for, in order.");
   m.def(
+      "precision_modes",
+      [] {
+        const char* gemm[] = {"native", "tf32", "bf16", "fp16", "fp8", "ozaki"};
+        return std::make_pair(std::string(gemm[int(pet::gemm_mode())]),
+                              std::string(pet::attention_mode() == pet::AttentionMode::TF32 ? "tf32" : "native"));
+      },
+      "The process-wide (gemm, attention) modes: native unless set by a Calculator or PET_GEMM / PET_ATTN.");
+  m.def(
       "find_model",
       [](const std::string& spec) -> std::optional<std::pair<std::string, std::string>> {
         try {
@@ -187,14 +240,17 @@ NB_MODULE(_core, m) {
 
   nb::class_<Calculator>(m, "Calculator")
       .def(nb::init<const std::string&, std::optional<std::string>, std::optional<std::string>, bool, bool,
-                    std::optional<std::string>, double, int>(),
+                    std::optional<std::string>, double, int, bool, bool, bool>(),
            "model"_a, "gemm"_a = nb::none(), "attention"_a = nb::none(), "device_neighbors"_a = true,
            "cache_neighbors"_a = false, "recompute"_a = nb::none(), "memory_budget_gib"_a = 0.0,
-           "max_batch_atoms"_a = 0)
+           "max_batch_atoms"_a = 0, "non_conservative"_a = false, "uncertainty"_a = false,
+           "smooth_cutoff"_a = false)
       .def("compute", &Calculator::compute, "numbers"_a, "positions"_a, "cell"_a = nb::none(),
            "pbc"_a = std::array<bool, 3>{false, false, false}, "forces"_a = true, "charge"_a = 0,
            "spin_multiplicity"_a = 1)
       .def("compute_batch", &Calculator::compute_batch, "items"_a, "forces"_a = true)
+      .def("response", &Calculator::response, "numbers"_a, "positions"_a, "cell"_a.none(), "pbc"_a,
+           "displacements"_a, "strains"_a, "charge"_a = 0, "spin_multiplicity"_a = 1)
       .def("close", &Calculator::close)
       .def_prop_ro("closed", &Calculator::closed)
       .def_prop_ro("cutoff", &Calculator::cutoff)
@@ -202,5 +258,9 @@ NB_MODULE(_core, m) {
       .def_prop_ro("length_unit", &Calculator::length_unit)
       .def_prop_ro("energy_unit", &Calculator::energy_unit)
       .def_prop_ro("energy_scale", &Calculator::energy_scale)
+      .def_prop_ro("has_non_conservative_forces", &Calculator::has_non_conservative_forces)
+      .def_prop_ro("has_non_conservative_stress", &Calculator::has_non_conservative_stress)
+      .def_prop_ro("has_uncertainty", &Calculator::has_uncertainty)
+      .def_prop_ro("n_ensemble", &Calculator::n_ensemble)
       .def("memory_report", &Calculator::memory_report);
 }

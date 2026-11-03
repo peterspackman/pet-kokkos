@@ -89,7 +89,7 @@ void compress_fwd(View2D out, View2D sav, const CompressFold& f, View2D input_ed
 void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, View2D ie_adj);
 
 // e(n) (+)= node_pred(n) + sum over n's edges of cutoff * edge_pred.
-void readout_accumulate(View1D e, View2D node_pred, View2D edge_pred, const PackedEdges& pk, bool acc);
+void readout_accumulate(View2D out, View2D node_pred, View2D edge_pred, const PackedEdges& pk, bool acc);
 // per_atom(n) = scale * net(n) + composition(species(n)), and 0 past n_local.
 void assemble_energy(RView1D per_atom, View1D net, IView1D species, RView1D composition,
                      double scale, int n_local);
@@ -108,6 +108,20 @@ void attention_bwd(Workspace& ws, const std::string& key, View2D in_adj, View2D 
                    View2D out_adj, View2D qkv, View2D cf_seq, const WeightRef& w_in,
                    const WeightRef& w_out, const Tokens& tk, int S, int heads, int head_dim,
                    double temperature, Net beta);
+
+// The tangents of the heads' attention for the Hessian-vector product (hvp.cpp)
+// on AMD's matrix cores (fp32), or on NVIDIA's tensor cores in the TF32
+// attention mode, K tangents stacked in rows; false when they cannot run here
+// (neither, or a head or token count the kernels do not hold), and then the
+// generic kernels must. merged and ml are the forward's saves; the
+// forward's tangent leaves merged_t and each query's pbar ([K N H S]) for the
+// backward's, which writes qkv_adj_t and adds onto cf_adj_t.
+bool attention_tan_fast(View2D merged_t, View2D pbar, View2D qkv, View2D qkv_t, View2D merged, View2D ml,
+                        View2D cf_seq, View2D cf_t, const Tokens& tk, int S, int heads, int head_dim,
+                        double temperature, int K);
+bool attention_bwd_tan_fast(Workspace& ws, View2D qkv_adj_t, View2D cf_adj_t, View2D dm, View2D dm_t, View2D qkv,
+                            View2D qkv_t, View2D merged, View2D merged_t, View2D ml, View2D pbar, View2D cf_seq,
+                            View2D cf_t, const Tokens& tk, int S, int heads, int head_dim, double temperature, int K);
 
 // ---- forces.cpp -------------------------------------------------------------
 

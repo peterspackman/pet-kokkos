@@ -289,15 +289,17 @@ void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, Vi
 // ---- energy -------------------------------------------------------------------
 
 // Accumulated in double: the sum runs over an atom's edges.
-void readout_accumulate(View1D e, View2D node_pred, View2D edge_pred, const PackedEdges& pk,
+void readout_accumulate(View2D out, View2D node_pred, View2D edge_pred, const PackedEdges& pk,
                         bool acc) {
   auto off = pk.off;
   auto cut = pk.cut;
+  const int C = out.extent(1);
   Kokkos::parallel_for(
-      "readout", RangePolicy(0, e.extent(0)), KOKKOS_LAMBDA(int n) {
-        double s = node_pred(n, 0);
-        for (int k = off(n); k < off(n + 1); ++k) s += (double) cut(k) * (double) edge_pred(k, 0);
-        e(n) = acc ? Net(e(n) + s) : Net(s);
+      "readout", RangePolicy(0, out.extent(0) * C), KOKKOS_LAMBDA(int i) {
+        const int n = i / C, c = i % C;
+        double s = node_pred(n, c);
+        for (int k = off(n); k < off(n + 1); ++k) s += (double) cut(k) * (double) edge_pred(k, c);
+        out(n, c) = acc ? Net(out(n, c) + s) : Net(s);
       });
 }
 
