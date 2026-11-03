@@ -140,9 +140,59 @@ void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln, 
 // The same arithmetic as norm_rows_bwd -- the same reductions in the same lane
 // order, the same expression per value -- so the adjoints come out bit for bit
 // as the norm pass and the gather after it gave them.
+#if defined(PET_HIP_NORMS)
+namespace {
+// concat_norm_bwd a wavefront an edge, as hip_rows::Bwd: lane l holds columns
+// l + 64 j of the concat row, the first V/2 of them oe's own, the rest its
+// reverse's (D a multiple of 64).
+struct ConcatBwd {
+  View2D edge_adj, out_adj, oe, ie_adj;
+  View1D weight;
+  IView1D rev;
+  bool ln;
+  template <int V>
+  __device__ void row(int k, int l) const {
+    constexpr int H = V / 2;
+    const int D = 64 * H, r = rev(k);
+    const bool pair = r >= 0 && r != k && rev(r) == k;
+    if (pair && r < k) return;  // the partner's wavefront has both
+    auto load = [&](int q, Net* x, Net* ga) {
+      const int p = rev(q);
+#pragma unroll
+      for (int j = 0; j < V; ++j) {
+        const int d = l + 64 * j;
+        x[j] = j < H ? oe(q, d) : p >= 0 ? oe(p, d - D) : Net(0);
+        ga[j] = out_adj(q, d);
+      }
+    };
+    Net xk[V], gk[V], xr[V], gr[V];
+    load(k, xk, gk);
+    const hip_rows::Stats sk = hip_rows::bwd_stats<V>(xk, gk, weight, l, 2 * D, ln);
+    hip_rows::Stats sr = sk;
+    if (r >= 0) {
+      load(r, xr, gr);
+      sr = hip_rows::bwd_stats<V>(xr, gr, weight, l, 2 * D, ln);
+    }
+#pragma unroll
+    for (int j = 0; j < H; ++j) {
+      const int d = l + 64 * j;
+      const Net back = r >= 0 ? hip_rows::grad(sr, xr[H + j], gr[H + j], weight(D + d)) : Net(0);
+      edge_adj(k, d) = ie_adj(k, d) + hip_rows::grad(sk, xk[j], gk[j], weight(d)) + back;
+      if (pair) edge_adj(r, d) = ie_adj(r, d) + hip_rows::grad(sr, xr[j], gr[j], weight(d)) +
+                                 hip_rows::grad(sk, xk[H + j], gk[H + j], weight(D + d));
+    }
+  }
+};
+}  // namespace
+#endif
+
 void concat_norm_bwd(View2D edge_adj, View2D out_adj, View2D oe, View1D weight, bool ln, View2D ie_adj,
                      IView1D rev) {
   const int E = oe.extent(0), D = oe.extent(1), W = 2 * D;
+#if defined(PET_HIP_NORMS)
+  if (D % 64 == 0 && hip_rows::launch("norm_cat_bwd", E, W, ConcatBwd{edge_adj, out_adj, oe, ie_adj, weight, rev, ln}))
+    return;
+#endif
   struct Stats {
     Net mu, inv, mg, mgx;
   };

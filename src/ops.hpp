@@ -204,6 +204,140 @@ KOKKOS_INLINE_FUNCTION Net norm_inv(Net sq, int D, bool ln) {
   return Net(1) / Kokkos::sqrt(sq / D + Net(ln ? kLayerNormEps : kRmsNormEps));
 }
 
+// On AMD a norm's row lives in a wavefront's registers: lane l holds columns
+// l + 64 j, read from memory once (coalesced), with the sums a butterfly over the
+// lanes, which leaves every lane the same bits. The Kokkos passes below read a
+// row three times, the later two from cache, which on an MI250X's 16 KiB L1 means
+// from L2: they ran at about half the HBM bandwidth (pet-mad-s, 5184 water, 18 ms
+// of norms an evaluation). Widths a multiple of 64 up to 2048 (every published
+// model's); others take the Kokkos passes.
+#if defined(KOKKOS_ENABLE_HIP) && defined(__HIPCC__)
+#define PET_HIP_NORMS 1
+namespace hip_rows {
+
+template <class T>
+__device__ inline T wave_sum(T x) {
+#pragma unroll
+  for (int o = 32; o > 0; o >>= 1) x += __shfl_xor(x, o);
+  return x;
+}
+
+// Calls f.template row<V>(r, lane) for every row, a wavefront a row, four a block.
+template <int V, class F>
+__global__ void __launch_bounds__(256) rows_kernel(int N, F f) {
+  const int r = blockIdx.x * 4 + int(threadIdx.x) / 64;
+  if (r < N) f.template row<V>(r, int(threadIdx.x) % 64);
+}
+
+// Launch with V = D / 64 a compile-time constant; false for a width not taken.
+template <class F>
+bool launch(const char* name, int N, int D, const F& f) {
+  if (D % 64 != 0) return false;
+  const int V = D / 64;
+  if (V != 2 && V != 4 && V != 6 && V != 8 && V != 12 && V != 16 && V != 24 && V != 32) return false;
+  if (N == 0) return true;
+  uint64_t id = 0;
+  if (Kokkos::Tools::profileLibraryLoaded()) Kokkos::Tools::beginParallelFor(name, 0, &id);
+  const hipStream_t st = ExecSpace().hip_stream();
+  const dim3 grid((N + 3) / 4), block(256);
+  switch (V) {
+    case 2: hipLaunchKernelGGL((rows_kernel<2, F>), grid, block, 0, st, N, f); break;
+    case 4: hipLaunchKernelGGL((rows_kernel<4, F>), grid, block, 0, st, N, f); break;
+    case 6: hipLaunchKernelGGL((rows_kernel<6, F>), grid, block, 0, st, N, f); break;
+    case 8: hipLaunchKernelGGL((rows_kernel<8, F>), grid, block, 0, st, N, f); break;
+    case 12: hipLaunchKernelGGL((rows_kernel<12, F>), grid, block, 0, st, N, f); break;
+    case 16: hipLaunchKernelGGL((rows_kernel<16, F>), grid, block, 0, st, N, f); break;
+    case 24: hipLaunchKernelGGL((rows_kernel<24, F>), grid, block, 0, st, N, f); break;
+    default: hipLaunchKernelGGL((rows_kernel<32, F>), grid, block, 0, st, N, f); break;
+  }
+  if (Kokkos::Tools::profileLibraryLoaded()) Kokkos::Tools::endParallelFor(id);
+  return true;
+}
+
+// A row's statistics from the lane's V values x (and, for the backward, the
+// output adjoint ga with the weight): the mean (LayerNorm), 1/rms, and the
+// backward's two gradient means.
+struct Stats {
+  Net mu, inv, mg, mgx;
+};
+template <int V>
+__device__ inline Net mean(const Net* x, int D, bool ln) {
+  if (!ln) return Net(0);
+  Net s = Net(0);
+#pragma unroll
+  for (int j = 0; j < V; ++j) s += x[j];
+  return wave_sum(s) / D;
+}
+template <int V, class W>
+__device__ inline Stats bwd_stats(const Net* x, const Net* ga, const W& weight, int l, int D, bool ln) {
+  const Net mu = mean<V>(x, D, ln);
+  Net sq = Net(0), sg = Net(0), sgx = Net(0);
+#pragma unroll
+  for (int j = 0; j < V; ++j) {
+    const Net xv = x[j] - mu, gw = ga[j] * weight(l + 64 * j);
+    sq += xv * xv;
+    sg += gw;
+    sgx += gw * xv;
+  }
+  sq = wave_sum(sq), sg = wave_sum(sg), sgx = wave_sum(sgx);
+  const Net inv = Net(1) / Kokkos::sqrt(sq / D + Net(ln ? 1e-5 : 1.1920928955078125e-07));
+  return {mu, inv, ln ? sg / D : Net(0), sgx * inv / D};
+}
+// The input adjoint of one value: inv (ga w - mg - xhat mgx), xhat = (x - mu) inv.
+__device__ inline Net grad(const Stats& s, Net x, Net ga, Net w) {
+  const Net a = Kokkos::fma(ga, w, -s.mg), b = mul_rn(x - s.mu, s.inv);
+  return mul_rn(s.inv, Kokkos::fma(-b, s.mgx, a));
+}
+
+template <class Pro>
+struct Fwd {
+  View2D out, in;
+  View1D weight, bias;
+  bool ln;
+  Pro pro;
+  template <int V>
+  __device__ void row(int r, int l) const {
+    const int D = 64 * V;
+    Net x[V];
+#pragma unroll
+    for (int j = 0; j < V; ++j) {
+      pro(r, l + 64 * j);
+      x[j] = in(r, l + 64 * j);
+    }
+    const Net mu = mean<V>(x, D, ln);
+    Net v = Net(0);
+#pragma unroll
+    for (int j = 0; j < V; ++j) v += (x[j] - mu) * (x[j] - mu);
+    v = wave_sum(v);
+    const Net inv = Net(1) / Kokkos::sqrt(v / D + Net(ln ? 1e-5 : 1.1920928955078125e-07));
+#pragma unroll
+    for (int j = 0; j < V; ++j) {
+      const int d = l + 64 * j;
+      out(r, d) = (x[j] - mu) * inv * weight(d) + (ln ? bias(d) : Net(0));
+    }
+  }
+};
+
+template <class Sink>
+struct Bwd {
+  View2D out_adj, in;
+  View1D weight;
+  bool ln;
+  Sink sink;
+  template <int V>
+  __device__ void row(int r, int l) const {
+    Net x[V], ga[V];
+#pragma unroll
+    for (int j = 0; j < V; ++j) x[j] = in(r, l + 64 * j), ga[j] = out_adj(r, l + 64 * j);
+    const Stats s = bwd_stats<V>(x, ga, weight, l, 64 * V, ln);
+#pragma unroll
+    for (int j = 0; j < V; ++j) sink(r, l + 64 * j, grad(s, x[j], ga[j], weight(l + 64 * j)));
+  }
+};
+
+}  // namespace hip_rows
+#endif
+
 KOKKOS_INLINE_FUNCTION Net row_mean(const Team& t, const View2D& x, int r) {
   Net s = Net(0);
   Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(t, int(x.extent(1))), [&](int d, Net& a) { a += x(r, d); }, s);
@@ -217,6 +351,9 @@ template <class Pro>
 void norm_rows(const char* name, View2D out, View2D in, View1D weight, View1D bias, Pro pro) {
   const bool ln = bias.extent(0) > 0;
   const int N = in.extent(0), D = in.extent(1);
+#if defined(PET_HIP_NORMS)
+  if (hip_rows::launch(name, N, D, hip_rows::Fwd<Pro>{out, in, weight, bias, ln, pro})) return;
+#endif
   Kokkos::parallel_for(
       name, norm_policy(N), KOKKOS_LAMBDA(const Team& t) {
         const int r = t.league_rank() * kNormRows + t.team_rank();
@@ -241,6 +378,9 @@ void norm_rows(const char* name, View2D out, View2D in, View1D weight, View1D bi
 template <class Sink>
 void norm_rows_bwd(const char* name, View2D out_adj, View2D in, View1D weight, bool ln, Sink sink) {
   const int N = in.extent(0), D = in.extent(1);
+#if defined(PET_HIP_NORMS)
+  if (hip_rows::launch(name, N, D, hip_rows::Bwd<Sink>{out_adj, in, weight, ln, sink})) return;
+#endif
   Kokkos::parallel_for(
       name, norm_policy(N), KOKKOS_LAMBDA(const Team& t) {
         const int r = t.league_rank() * kNormRows + t.team_rank();
