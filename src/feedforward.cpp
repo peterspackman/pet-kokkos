@@ -15,6 +15,22 @@
 
 namespace pet {
 
+namespace {
+
+// Rows [r0, r1) of a row-major view, as a view of their own.
+View2D rows(const View2D& v, int r0, int r1) {
+  return View2D(v.data() + std::size_t(r0) * v.extent(1), r1 - r0, v.extent(1));
+}
+
+// f(r0, r1) over [0, R) in runs of at most C rows (all at once for C = 0).
+template <class F>
+void by_rows(int R, int C, F&& f) {
+  if (C <= 0 || C >= R) return f(0, R);
+  for (int r0 = 0; r0 < R; r0 += C) f(r0, std::min(R, r0 + C));
+}
+
+}  // namespace
+
 void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L, View2D& node,
                         View2D input_edge, View2D cond, LayerSaves* sav, bool save_wide, View2D remote_in,
                         bool share) {
@@ -87,11 +103,23 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
         else
           norm_rows("norm_tok", attn_in, tokens, nweight(tl + ".norm_attention"), nbias(tl + ".norm_attention"),
                     KOKKOS_LAMBDA(int row, int d) { return row < N ? input_node(row, d) : edge_cur(row - N, d); });
-        View2D qkv = save && save_wide ? keep(sav->qkv[a], "qkv", a, T, 3 * D) : ws_.tmp(T, 3 * D);
-        linear(qkv, attn_in, mat(tl + ".attention.input_linear.weight"), vec(tl + ".attention.input_linear.bias"));
-        attention(ws_, key, attn_out, qkv, dev.cf_seq, mat(tl + ".attention.output_linear.weight"),
-                  vec(tl + ".attention.output_linear.bias"), tk, S, h_.num_heads, h_.head_dim,
-                  h_.attention_temperature, save);
+        const WeightRef w_in = mat(tl + ".attention.input_linear.weight");
+        const View1D b_in = vec(tl + ".attention.input_linear.bias");
+        // Not kept: under Wide and Layers, made a run of atoms at a time.
+        const bool chunked = !(save && save_wide) && chunk_rows_ > 0 &&
+                             attention_chunked(
+                                 ws_, key, attn_out,
+                                 [&](View2D q, int r0, int r1) { linear(q, rows(attn_in, r0, r1), w_in, b_in); },
+                                 dev.cf_seq, mat(tl + ".attention.output_linear.weight"),
+                                 vec(tl + ".attention.output_linear.bias"), tk, S, h_.num_heads, h_.head_dim,
+                                 h_.attention_temperature, save, chunk_rows_);
+        if (!chunked) {
+          View2D qkv = save && save_wide ? keep(sav->qkv[a], "qkv", a, T, 3 * D) : ws_.tmp(T, 3 * D);
+          linear(qkv, attn_in, w_in, b_in);
+          attention(ws_, key, attn_out, qkv, dev.cf_seq, mat(tl + ".attention.output_linear.weight"),
+                    vec(tl + ".attention.output_linear.bias"), tk, S, h_.num_heads, h_.head_dim,
+                    h_.attention_temperature, save);
+        }
       }
       linear(node_exp, View2D(attn_out.data(), N, D), mat(tl + ".center_expansion.weight"),
              vec(tl + ".center_expansion.bias"));
@@ -116,10 +144,14 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
               });
     View2D pre_center = save ? keep(sav->tmp_center[a], "tc", a, N, cw) : ws_.tmp(N, cw);
     feedforward(node_next, node_norm, tl + ".center_mlp", pre_center, save, 1);
-    {
+    if (save && save_wide) {
       Workspace::Scope mlp_scope(ws_);
-      View2D pre_edge = save && save_wide ? keep(sav->tmp_edge[a], "te", a, E, ew) : ws_.tmp(E, ew);
-      feedforward(edge_next, edge_norm, tl + ".mlp", pre_edge, save, 1);
+      feedforward(edge_next, edge_norm, tl + ".mlp", keep(sav->tmp_edge[a], "te", a, E, ew), save, 1);
+    } else {  // the pre-activation is scratch: a chunk of rows at a time under Wide and Layers
+      by_rows(E, chunk_rows_, [&](int r0, int r1) {
+        Workspace::Scope mlp_scope(ws_);
+        feedforward(rows(edge_next, r0, r1), rows(edge_norm, r0, r1), tl + ".mlp", ws_.tmp(r1 - r0, ew), save, 1);
+      });
     }
     node_cur = node_next;
     edge_cur = edge_next;
@@ -234,10 +266,19 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
     // The two MLPs: afterwards edge_adj and node_adj are eps's and node_res's.
     {
       Workspace::Scope scope(ws_);
-      View2D enorm_adj = ws_.tmp(E, D), cnorm_adj = ws_.tmp(N, Dn);
-      feedforward_bwd(enorm_adj, edge_adj, tl + ".mlp",
-                      kept_wide ? sav.tmp_edge[a] : rebuild(sav.eps[a], tl + ".norm_mlp", tl + ".mlp.w_in", true), 0);
-      norm_bwd(edge_adj, enorm_adj, sav.eps[a], tl + ".norm_mlp");
+      if (kept_wide) {
+        View2D enorm_adj = ws_.tmp(E, D);
+        feedforward_bwd(enorm_adj, edge_adj, tl + ".mlp", sav.tmp_edge[a], 0);
+        norm_bwd(edge_adj, enorm_adj, sav.eps[a], tl + ".norm_mlp");
+      } else {  // the pre-activation rebuilt, a chunk of rows at a time under Wide and Layers
+        by_rows(E, chunk_rows_, [&](int r0, int r1) {
+          Workspace::Scope chunk(ws_);
+          const View2D eps = rows(sav.eps[a], r0, r1), adj = rows(edge_adj, r0, r1), enorm_adj = ws_.tmp(r1 - r0, D);
+          feedforward_bwd(enorm_adj, adj, tl + ".mlp", rebuild(eps, tl + ".norm_mlp", tl + ".mlp.w_in", true), 0);
+          norm_bwd(adj, enorm_adj, eps, tl + ".norm_mlp");
+        });
+      }
+      View2D cnorm_adj = ws_.tmp(N, Dn);
       feedforward_bwd(cnorm_adj, node_adj, tl + ".center_mlp", sav.tmp_center[a], 0);
       norm_bwd(node_adj, cnorm_adj, sav.node_new[a], tl + ".norm_center_features");
     }
@@ -258,11 +299,27 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
               const int k = i / D, d = i % D;
               attn_out_adj(N + k, d) = k < off(N) ? edge_adj(k, d) : Net(0);
             });
-      attention_bwd(ws_, key, attn_in_adj, cf_seq_adj, attn_out_adj,
-                    kept_wide ? sav.qkv[a] : rebuild(sav.tokens[a], tl + ".norm_attention", tl + ".attention.input_linear", false),
-                    dev.cf_seq, mat(tl + ".attention.input_linear.weight"),
-                    mat(tl + ".attention.output_linear.weight"), tk, S, h_.num_heads, h_.head_dim,
-                    h_.attention_temperature, 0);
+      const WeightRef w_in = mat(tl + ".attention.input_linear.weight");
+      const View1D b_in = vec(tl + ".attention.input_linear.bias");
+      const View2D tokens = sav.tokens[a];
+      // Not kept: under Wide and Layers, rebuilt a run of atoms at a time.
+      const bool chunked = !kept_wide && chunk_rows_ > 0 &&
+                           attention_bwd_chunked(
+                               ws_, key, attn_in_adj, cf_seq_adj, attn_out_adj,
+                               [&](View2D q, int r0, int r1) {
+                                 Workspace::Scope s(ws_);
+                                 View2D x = ws_.tmp(r1 - r0, D);
+                                 norm(x, rows(tokens, r0, r1), tl + ".norm_attention");
+                                 linear(q, x, w_in, b_in);
+                               },
+                               dev.cf_seq, w_in, mat(tl + ".attention.output_linear.weight"), tk, S, h_.num_heads,
+                               h_.head_dim, h_.attention_temperature, 0, chunk_rows_);
+      if (!chunked)
+        attention_bwd(ws_, key, attn_in_adj, cf_seq_adj, attn_out_adj,
+                      kept_wide ? sav.qkv[a]
+                                : rebuild(sav.tokens[a], tl + ".norm_attention", tl + ".attention.input_linear", false),
+                      dev.cf_seq, w_in, mat(tl + ".attention.output_linear.weight"), tk, S, h_.num_heads, h_.head_dim,
+                      h_.attention_temperature, 0);
       norm_rows_bwd("norm_tok_bwd", attn_in_adj, sav.tokens[a], vec(tl + ".norm_attention.weight"),
                     h_.normalization == Normalization::LayerNorm, KOKKOS_LAMBDA(int row, int d, Net g) {
                       if (row < N) input_node_adj(row, d) = g;
@@ -300,6 +357,16 @@ DeviceOut PetModel::ff_pass(const DeviceEdgeData& dev, bool grad) {
   // re-running one layer's forward at a time.
   const Recompute rc = recompute_tier(N, S, E);
   const bool keep_wide = rc == Recompute::Never, ckpt = grad && rc == Recompute::Layers;
+  // Under Wide and Layers the edge MLP's pre-activation and the attention's qkv
+  // are scratch, made (and in the backward remade) a chunk of rows -- of atoms,
+  // for the attention -- at a time, so the widest of the temporaries are a
+  // chunk's. The GEMMs are batch invariant, so the bits are those of the whole
+  // at once (the tiers agree to the bit).
+  struct Reset {
+    int& v;
+    ~Reset() { v = 0; }
+  } reset{chunk_rows_};
+  chunk_rows_ = rc != Recompute::Never && batch_invariant_gemms() ? edge_chunk_rows(E) : 0;
   std::vector<LayerSaves> sav(grad && !ckpt ? G : 0);
   std::vector<std::pair<View2D, View2D>> inputs(ckpt ? G : 0);
   // Over several ranks, each layer's rows from the partners' ranks, kept so a

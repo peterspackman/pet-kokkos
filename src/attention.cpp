@@ -295,27 +295,35 @@ __device__ inline float sum16(float x) {
   return x + __shfl_xor(x, 32);
 }
 
-// A block's atom: its token count and each slot's row (Tokens).
+// A block's atom: its token count and each slot's row (Tokens) -- in the token
+// matrix (grow), or in a chunk's of the atoms from n0 on (row): their own rows
+// first, then their edges', so edge k is row eb + k (eb = n1 - n0 - off[n0]).
+// Unchunked, n0 = 0 and eb = N, and the two agree.
 struct Atom {
   const int* off;
-  int N, n, cnt;
-  __device__ Atom(const int* o, int N_, int n_) : off(o), N(N_), n(n_), cnt(o[n_ + 1] - o[n_] + 1) {}
-  __device__ size_t row(int s) const { return s == 0 ? size_t(n) : size_t(N + off[n] + s - 1); }
+  int N, n, cnt, n0, eb;
+  __device__ Atom(const int* o, int N_, int n_, int n0_, int eb_)  // eb is negative past the first run
+      : off(o), N(N_), n(n_), cnt(o[n_ + 1] - o[n_] + 1), n0(n0_), eb(eb_) {}
+  __device__ Atom(const int* o, int N_, int n_) : Atom(o, N_, n_, 0, N_) {}
+  __device__ size_t row(int s) const { return s == 0 ? size_t(n - n0) : size_t(eb + off[n] + s - 1); }
+  __device__ size_t grow(int s) const { return s == 0 ? size_t(n) : size_t(N + off[n] + s - 1); }
 };
-// A head's slice of an atom's tokens in a row-major token matrix, the slots
-// past its tokens reading zero.
+// A head's slice of an atom's tokens in a row-major token matrix (the chunk's,
+// or the whole's when `whole`), the slots past its tokens reading zero.
 struct Slice {
   const float* p;
   int ld;
   Atom a;
-  __device__ float at(int r, int d) const { return r < a.cnt ? p[a.row(r) * ld + d] : 0.0f; }
+  bool whole = false;
+  __device__ size_t row(int r) const { return whole ? a.grow(r) : a.row(r); }
+  __device__ float at(int r, int d) const { return r < a.cnt ? p[row(r) * ld + d] : 0.0f; }
   template <int W>
   __device__ void chunk(int r, int d0, float* out) const {
     if (r >= a.cnt) {
       for (int j = 0; j < W; ++j) out[j] = 0.0f;
       return;
     }
-    const float* q = p + a.row(r) * ld + d0;
+    const float* q = p + row(r) * ld + d0;
     for (int j = 0; j < W; j += 4) {
       const float4 x = *reinterpret_cast<const float4*>(q + j);
       out[j] = x.x, out[j + 1] = x.y, out[j + 2] = x.z, out[j + 3] = x.w;
@@ -371,14 +379,14 @@ struct Stage {
 // transposed operands, was slower here: 3.1 against 2.9 ms a pet-mad-s
 // evaluation at 5184 water.)
 template <int HD>
-__global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const int* off, int N, const float* cf_seq,
-                                              int ldc, float* merged, int ldm, float* ml, int S, int H, float sc,
-                                              int save) {
+__global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const int* off, int N, int n0, int eb,
+                                              const float* cf_seq, int ldc, float* merged, int ldm, float* ml, int S,
+                                              int H, float sc, int save) {
   constexpr int W = HD / 4, DT = HD / 16;
   const int NB = (S + 15) / 16;
   const Block bk(H, NB);
-  const int n = bk.n, h = bk.h, I = bk.I, l = threadIdx.x, c = l % 16, g = l / 16, D = H * HD;
-  const Atom at(off, N, n);
+  const int n = n0 + bk.n, h = bk.h, I = bk.I, l = threadIdx.x, c = l % 16, g = l / 16, D = H * HD;
+  const Atom at(off, N, n, n0, eb);
   const int nb = (at.cnt + 15) / 16, i = 16 * I + c;
   float* mlq = save ? ml + 2 * ((size_t) (n * H + h) * S + i) : nullptr;
   if (I >= nb) {  // slots past the atom's tokens: no rows
@@ -433,7 +441,7 @@ __global__ void __launch_bounds__(64) forward(const float* qkv, int ldq, const i
   }
   const bool live = i == 0 || cf[i] > 0.0f;  // else an edge at its cutoff: zero out
   const float invl = live && tot > 0.0f ? 1.0f / tot : 0.0f;
-  float* o = merged + at.row(i) * ldm + h * HD;
+  float* o = merged + at.grow(i) * ldm + h * HD;  // the whole's rows: the backward reads them
   for (int t = 0; t < DT; ++t)  // acc[t][r]: query i, dim 16t + 4g + r
     *reinterpret_cast<float4*>(o + 16 * t + 4 * g) =
         make_float4(acc[t][0] * invl, acc[t][1] * invl, acc[t][2] * invl, acc[t][3] * invl);
@@ -455,19 +463,21 @@ __device__ inline float dq_of(const float* go, const float* oo) {
 //     dQ^T += K^T dS^T;
 //   side 1, keys (lane c key 16B + c, query blocks streamed): S and dP,
 //     dK^T += Q^T dS, dV^T += dO^T A, and the key's dS summed over queries.
+// qkv, dmerged and qkv_adj are a chunk's rows (Atom::row), merged the whole's.
 template <int HD>
-__global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const int* off, int N, const float* dmerged,
-                                               const float* merged, int ldm, const float* ml, const float* cf_seq,
-                                               int ldc, float* qkv_adj, int lda, float* cfh, int S, int H, float sc) {
+__global__ void __launch_bounds__(64) backward(const float* qkv, int ldq, const int* off, int N, int n0, int eb,
+                                               const float* dmerged, const float* merged, int ldm, const float* ml,
+                                               const float* cf_seq, int ldc, float* qkv_adj, int lda, float* cfh,
+                                               int S, int H, float sc) {
   constexpr int W = HD / 4, DT = HD / 16, RS = Stage<HD>::RS;
   __shared__ float lds[2 * 16 * RS];
   const int NB = (S + 15) / 16, side = blockIdx.x % 2;
-  const int B = (blockIdx.x / 2) % NB, h = (blockIdx.x / 2 / NB) % H, n = blockIdx.x / 2 / NB / H;
+  const int B = (blockIdx.x / 2) % NB, h = (blockIdx.x / 2 / NB) % H, n = n0 + blockIdx.x / 2 / NB / H;
   const int l = threadIdx.x, c = l % 16, g = l / 16, D = H * HD;
-  const Atom at(off, N, n);
+  const Atom at(off, N, n, n0, eb);
   const int nb = (at.cnt + 15) / 16;
   const Slice Q{qkv + h * HD, ldq, at}, K{qkv + D + h * HD, ldq, at}, V{qkv + 2 * D + h * HD, ldq, at};
-  const Slice G{dmerged + h * HD, ldm, at}, O{merged + h * HD, ldm, at};
+  const Slice G{dmerged + h * HD, ldm, at}, O{merged + h * HD, ldm, at, true};
   const float* cf = cf_seq + (size_t) n * ldc;
   const float* mls = ml + 2 * (size_t) (n * H + h) * S;
 
@@ -1520,7 +1530,7 @@ void attention_impl(Workspace& ws, const std::string& key, View2D out, View2D qk
     if (N > 0) {
       mfma::run("attention", [&](hipStream_t st) {
         hipLaunchKernelGGL((mfma::forward<HD>), dim3(N * H * ((S + 15) / 16)), dim3(64), 0, st, qkv.data(),
-                           int(qkv.stride(0)), tk.off.data(), N, cf_seq.data(), int(cf_seq.stride(0)), merged.data(),
+                           int(qkv.stride(0)), tk.off.data(), N, 0, N, cf_seq.data(), int(cf_seq.stride(0)), merged.data(),
                            int(merged.stride(0)), save ? ml.data() : nullptr, S, H, float(sc), int(save));
       });
       return finish();
@@ -1830,7 +1840,7 @@ void attention_bwd_impl(Workspace& ws, const std::string& key, View2D in_adj, Vi
     if (N > 0) {
       mfma::run("attn_bwd", [&](hipStream_t st) {
         hipLaunchKernelGGL((mfma::backward<HD>), dim3(2 * N * H * ((S + 15) / 16)), dim3(64), 0, st, qkv.data(),
-                           int(qkv.stride(0)), tk.off.data(), N, dmerged.data(), merged.data(), int(merged.stride(0)),
+                           int(qkv.stride(0)), tk.off.data(), N, 0, N, dmerged.data(), merged.data(), int(merged.stride(0)),
                            ml.data(), cf_seq.data(), int(cf_seq.stride(0)), qkv_adj.data(), int(qkv_adj.stride(0)),
                            cfh.data(), S, H, float(sc));
       });
@@ -2030,6 +2040,135 @@ bool detail::fast_tf32_device() {
   }();
   return fast;
 #else
+  return false;
+#endif
+}
+
+#if defined(PET_MFMA)
+namespace {
+
+// Runs of consecutive atoms, each of at most about `chunk` tokens (at least one
+// atom), with their first edge: [n0, n1) and off(n0), off(n1).
+struct Run {
+  int n0, n1, e0, e1;
+};
+std::vector<Run> atom_runs(const Tokens& tk, int chunk) {
+  auto off = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), IView1D(tk.off.data(), tk.N + 1));
+  std::vector<Run> runs;
+  for (int n0 = 0; n0 < tk.N;) {
+    int n1 = n0 + 1;
+    while (n1 < tk.N && (n1 + 1 - n0) + (off(n1 + 1) - off(n0)) <= chunk) ++n1;
+    runs.push_back({n0, n1, off(n0), off(n1)});
+    n0 = n1;
+  }
+  return runs;
+}
+View2D rows(const View2D& v, int r0, int r1) {
+  return View2D(v.data() + std::size_t(r0) * v.extent(1), r1 - r0, v.extent(1));
+}
+// A run's qkv: its atoms' own rows, then their edges'.
+void run_qkv(const QkvRows& make_qkv, View2D q, const Run& r, int N) {
+  const int Nc = r.n1 - r.n0;
+  make_qkv(rows(q, 0, Nc), r.n0, r.n1);
+  if (r.e1 > r.e0) make_qkv(rows(q, Nc, Nc + r.e1 - r.e0), N + r.e0, N + r.e1);
+}
+
+}  // namespace
+#endif
+
+bool attention_chunked(Workspace& ws, const std::string& key, View2D out, const QkvRows& make_qkv, View2D cf_seq,
+                       const WeightRef& w_out, View1D b_out, const Tokens& tk, int S, int H, int hd,
+                       double temperature, bool save, int chunk) {
+#if defined(PET_MFMA)
+  if (hd % 16 != 0 || tk.N == 0) return false;
+  bool done = false;
+  with_head_dim(hd, [&](auto hdc) {
+    constexpr int HD = decltype(hdc)::value;
+    if constexpr (HD > 0 && HD % 16 == 0) {
+      const int D = H * hd, N = tk.N, T = out.extent(0);
+      const float sc = float(Net(1.0 / (Kokkos::sqrt((double) hd) * temperature)));
+      Workspace::Scope scope(ws);
+      View2D merged = save ? ws.n2(key + ":merged", T, D) : ws.tmp(T, D);
+      View2D ml = save ? ws.n2(key + ":ml", N * H * S, 2) : View2D();
+      for (const Run& r : atom_runs(tk, chunk)) {
+        Workspace::Scope run(ws);
+        const int Nc = r.n1 - r.n0;
+        View2D q = ws.tmp(Nc + r.e1 - r.e0, 3 * D);
+        run_qkv(make_qkv, q, r, N);
+        mfma::run("attention", [&](hipStream_t st) {
+          hipLaunchKernelGGL((mfma::forward<HD>), dim3(Nc * H * ((S + 15) / 16)), dim3(64), 0, st, q.data(),
+                             int(q.stride(0)), tk.off.data(), N, r.n0, Nc - r.e0, cf_seq.data(),
+                             int(cf_seq.stride(0)), merged.data(), int(merged.stride(0)),
+                             save ? ml.data() : nullptr, S, H, sc, int(save));
+        });
+      }
+      zero_dead(merged, tk);
+      linear(out, merged, w_out, b_out);
+      done = true;
+    }
+  });
+  return done;
+#else
+  (void) ws, (void) key, (void) out, (void) make_qkv, (void) cf_seq, (void) w_out, (void) b_out, (void) tk, (void) S,
+      (void) H, (void) hd, (void) temperature, (void) save, (void) chunk;
+  return false;
+#endif
+}
+
+bool attention_bwd_chunked(Workspace& ws, const std::string& key, View2D in_adj, View2D cf_seq_adj, View2D out_adj,
+                           const QkvRows& make_qkv, View2D cf_seq, const WeightRef& w_in, const WeightRef& w_out,
+                           const Tokens& tk, int S, int H, int hd, double temperature, Net beta, int chunk) {
+#if defined(PET_MFMA)
+  if (hd % 16 != 0 || tk.N == 0) return false;
+  bool done = false;
+  with_head_dim(hd, [&](auto hdc) {
+    constexpr int HD = decltype(hdc)::value;
+    if constexpr (HD > 0 && HD % 16 == 0) {
+      const int D = H * hd, N = tk.N, T = in_adj.extent(0);
+      const float sc = float(Net(1.0 / (Kokkos::sqrt((double) hd) * temperature)));
+      Workspace::Scope scope(ws);
+      View2D cfh = ws.tmp(N * S, H);  // per key and head: the cf adjoint's share
+      View2D merged = ws.peek2(key + ":merged"), ml = ws.peek2(key + ":ml");
+      for (const Run& r : atom_runs(tk, chunk)) {
+        Workspace::Scope run(ws);
+        const int Nc = r.n1 - r.n0, Tc = Nc + r.e1 - r.e0;
+        View2D q = ws.tmp(Tc, 3 * D), dm = ws.tmp(Tc, D), qa = ws.tmp(Tc, 3 * D);
+        run_qkv(make_qkv, q, r, N);
+        linear_bwd(rows(dm, 0, Nc), rows(out_adj, r.n0, r.n1), w_out, 0);
+        if (Tc > Nc) linear_bwd(rows(dm, Nc, Tc), rows(out_adj, N + r.e0, N + r.e1), w_out, 0);
+        mfma::run("attn_bwd", [&](hipStream_t st) {
+          hipLaunchKernelGGL((mfma::backward<HD>), dim3(2 * Nc * H * ((S + 15) / 16)), dim3(64), 0, st, q.data(),
+                             int(q.stride(0)), tk.off.data(), N, r.n0, Nc - r.e0, dm.data(), merged.data(),
+                             int(merged.stride(0)), ml.data(), cf_seq.data(), int(cf_seq.stride(0)), qa.data(),
+                             int(qa.stride(0)), cfh.data(), S, H, sc);
+        });
+        linear_bwd(rows(in_adj, r.n0, r.n1), rows(qa, 0, Nc), w_in, beta);
+        if (Tc > Nc) linear_bwd(rows(in_adj, N + r.e0, N + r.e1), rows(qa, Nc, Tc), w_in, beta);
+      }
+      Kokkos::parallel_for(
+          "attn_bwd_cf", RangePolicy(0, N * S), KOKKOS_LAMBDA(int i) {
+            const int sk = i % S, n = i / S;
+            const Net cf = cf_seq(n, sk);
+            if (cf <= Net(0)) return;
+            Net total = Net(0);
+            for (int h = 0; h < H; ++h) total += cfh(n * S + sk, h);
+            cf_seq_adj(n, sk) += total / cf;
+          });
+      // A capacity's dead rows: what the whole's zeroed qkv adjoint gives them.
+      auto off = tk.off;
+      const int W = in_adj.extent(1);
+      if (tk.dead)
+        Kokkos::parallel_for(
+            "attn_bwd_dead", RangePolicy(0, (T - N) * W), KOKKOS_LAMBDA(int i) {
+              if (i / W >= off(N)) in_adj(N + i / W, i % W) = beta == Net(0) ? Net(0) : beta * in_adj(N + i / W, i % W);
+            });
+      done = true;
+    }
+  });
+  return done;
+#else
+  (void) ws, (void) key, (void) in_adj, (void) cf_seq_adj, (void) out_adj, (void) make_qkv, (void) cf_seq, (void) w_in,
+      (void) w_out, (void) tk, (void) S, (void) H, (void) hd, (void) temperature, (void) beta, (void) chunk;
   return false;
 #endif
 }

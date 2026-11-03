@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <stdexcept>
@@ -805,6 +806,15 @@ BatchResult PetModel::energy_forces_batch(const DeviceEdgeData& dev, bool comput
   return out;
 }
 
+// The rows of a chunk under Wide and Layers (chunk_rows_): an eighth of the
+// edges, and at least 64k, where the GEMMs still run at full speed.
+// PET_EDGE_CHUNK=rows overrides it, to test the chunking on small structures.
+int PetModel::edge_chunk_rows(int E) const {
+  if (const char* c = std::getenv("PET_EDGE_CHUNK"))
+    if (std::atoi(c) > 0) return std::atoi(c);
+  return std::max(65536, (E + 7) / 8);
+}
+
 Recompute PetModel::recompute_tier(int N, int S, int E) const {
   // Estimated from the shapes: what one layer saves, how much of that is the two
   // widest activations (qkv and the edge MLP's pre-activation), and the working
@@ -825,10 +835,19 @@ Recompute PetModel::recompute_tier(int N, int S, int E) const {
   // the tmp pool's slack; measured on pet-mad-xs and -s), so they are scaled to
   // predict it.
   const std::size_t inputs = sizeof(Net) * G * ((res ? 0 : std::size_t(N) * h_.d_node) + NE * D);
+  // Under Wide and Layers the edge MLP's two wide temporaries are a chunk's (and
+  // on AMD's matrix cores so are the attention's qkv and its adjoint, which the
+  // terms below never counted separately: they share the work term's room).
+  const std::size_t chunk = res || !batch_invariant_gemms() ? NE : std::min<std::size_t>(NE, edge_chunk_rows(E));
+  const std::size_t work_chunked = work - sizeof(Net) * (NE - chunk) * 2 * ew;
+  // The pool came out at 0.86-0.96 of these for Wide and 0.99-1.07 for Layers
+  // with the edge MLP and attention chunked (MI250X GCD, pet-mad-s, -xs,
+  // pet-omat-s, 8k-166k atoms), so Layers takes a little more.
   auto need = [&](Recompute r) {
-    const std::size_t terms =
-        work + (r == Recompute::Never ? G * layer : r == Recompute::Wide ? G * (layer - wide) : inputs + layer - wide);
-    return terms + terms / 3;
+    const std::size_t terms = r == Recompute::Never ? work + G * layer
+                              : r == Recompute::Wide ? work_chunked + G * (layer - wide)
+                                                     : work_chunked + inputs + layer - wide;
+    return terms + (r == Recompute::Layers ? terms / 100 * 45 : terms / 3);
   };
   auto fits = [&](Recompute r) { return mem_budget_ == 0 || need(r) <= mem_budget_; };
   const Recompute r = recompute_ != Recompute::Auto                    ? recompute_

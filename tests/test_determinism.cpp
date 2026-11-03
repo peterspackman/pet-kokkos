@@ -3,6 +3,7 @@
 // energy: neighbour slots follow the edge list, force gradients are gathered per
 // atom, and per-structure sums are ordered. The model is compared against
 // itself, with TF32 off.
+#include <cstdlib>
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -221,6 +222,14 @@ TEST_CASE("recomputing activations in the backward changes nothing", "[model][de
         const pet::Results ref = keep->compute(g.system, true);
         require_bit_identical(ref, wide->compute(g.system, true), "Recompute::Wide");
         require_bit_identical(ref, layers->compute(g.system, true), "Recompute::Layers");
+        // Wide and Layers run the edge MLP a chunk of rows at a time where the
+        // GEMMs are batch invariant; chunks of a few rows here, the same bits.
+        if (pet::batch_invariant_gemms()) {
+          setenv("PET_EDGE_CHUNK", "37", 1);
+          require_bit_identical(ref, wide->compute(g.system, true), "Recompute::Wide, chunked");
+          require_bit_identical(ref, layers->compute(g.system, true), "Recompute::Layers, chunked");
+          unsetenv("PET_EDGE_CHUNK");
+        }
       }
     }
   }

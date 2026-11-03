@@ -407,6 +407,7 @@ class PetModel {
   View2D ll_features(int N, const std::string& key);
   // How much of the forward the backward keeps (see Recompute), from the shapes.
   Recompute recompute_tier(int N, int S, int E) const;
+  int edge_chunk_rows(int E) const;
   std::vector<std::uintptr_t> graph_key(const DeviceEdgeData& dev, bool grad) const;
   void load_all(const Checkpoint& ckpt);
 
@@ -444,6 +445,9 @@ class PetModel {
   // Under Recompute::Auto, the cheapest tier allowed: raised when a pass runs
   // out of memory, so the evaluations after it do not try the same again.
   Recompute tier_floor_ = Recompute::Never;
+  // Under Wide and Layers, the edge rows a row-local section (the edge MLP and
+  // its rebuild) runs at once; 0 all of them. Set for one ff_pass.
+  int chunk_rows_ = 0;
 };
 
 }  // namespace pet
