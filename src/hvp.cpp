@@ -953,6 +953,9 @@ HvpOut PetModel::hvp_pass(const DeviceEdgeData& dev, int K, RView2D vdot_raw) {
         "pet: the Hessian-vector product needs the raw list grouped by centre, and the solver's roots");
 
   const int N = dev.n_atoms, S = dev.max_neighbors + 1, D = h_.d_pet, Dn = h_.d_node, G = h_.num_gnn_layers;
+  if (K > max_index_directions(N, dev.max_neighbors, R))
+    throw std::runtime_error("pet: " + std::to_string(K) + " tangent directions over " + std::to_string(N) +
+                             " atoms make tensors past the 2^31 elements the kernels index");
   Workspace::Scope scope(ws_);
   ws_.set_zero(false);
   const PackedEdges pk = pack_edges(dev);
