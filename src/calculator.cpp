@@ -389,6 +389,13 @@ Calculator::Response Calculator::response(const System& system, int K, const std
   // directions, and later calls start from there.
   int chunk = std::max(1, std::min(std::max(K, 1), int(0.5 * double(total_b) / per_dir)));
   if (I.resp_chunk_cap > 0) chunk = std::min(chunk, I.resp_chunk_cap);
+  // and as many as the kernels' 32-bit element indices reach
+  const int by_index = I.model.max_index_directions(N, ed.max_neighbors, R);
+  if (by_index < 1 && K > 0)
+    throw std::runtime_error("pet: " + std::to_string(N) +
+                             " atoms are too many for a Hessian-vector product on one device (tensors past 2^31 "
+                             "elements)");
+  chunk = std::max(1, std::min(chunk, by_index));
 
   Response r;
   r.K = K;

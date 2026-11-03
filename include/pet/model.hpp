@@ -315,6 +315,13 @@ class PetModel {
   // Device bytes per edge slot with every save kept, from the shapes (as
   // recompute_tier estimates them), for sizing a batch before any is measured.
   std::size_t bytes_per_slot() const;
+  // The kernels index a tensor's elements with 32-bit ints. The most elements one
+  // copy of a pass's tensors holds for `centres` centres with up to `max_neighbors`
+  // neighbours and `edges` kept edges (edge and token rows times the widest row,
+  // and attention's per-head tables), over-estimated, never under; and how many
+  // tangent directions (each a copy, plus the primal) stay within int range.
+  std::size_t pass_elements(long centres, int max_neighbors, long edges) const;
+  int max_index_directions(long centres, int max_neighbors, long edges) const;
   int peak_max_neighbors() const { return peak_max_neighbors_; }
 
   // Internal, and public only because nvcc refuses a KOKKOS_LAMBDA inside a
