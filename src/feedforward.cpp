@@ -86,7 +86,7 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
                     KOKKOS_LAMBDA(int, int){});
         else
           norm_rows("norm_tok", attn_in, tokens, nweight(tl + ".norm_attention"), nbias(tl + ".norm_attention"),
-                    KOKKOS_LAMBDA(int row, int d) { tokens(row, d) = row < N ? input_node(row, d) : edge_cur(row - N, d); });
+                    KOKKOS_LAMBDA(int row, int d) { return row < N ? input_node(row, d) : edge_cur(row - N, d); });
         View2D qkv = save && save_wide ? keep(sav->qkv[a], "qkv", a, T, 3 * D) : ws_.tmp(T, 3 * D);
         linear(qkv, attn_in, mat(tl + ".attention.input_linear.weight"), vec(tl + ".attention.input_linear.bias"));
         attention(ws_, key, attn_out, qkv, dev.cf_seq, mat(tl + ".attention.output_linear.weight"),
@@ -97,8 +97,9 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
              vec(tl + ".center_expansion.bias"));
       norm_rows("norm_eps", edge_norm, eps, nweight(tl + ".norm_mlp"), nbias(tl + ".norm_mlp"),
                 KOKKOS_LAMBDA(int k, int d) {  // a capacity's dead rows: no atom's, no attention
-                  eps(k, d) = (k < off(N) ? attn_out(N + k, d) : Net(0)) + edge_cur(k, d);
-                  if (save) edge_next(k, d) = eps(k, d);
+                  const Net v = (k < off(N) ? attn_out(N + k, d) : Net(0)) + edge_cur(k, d);
+                  if (save) edge_next(k, d) = v;
+                  return v;
                 });
     }
 
@@ -109,8 +110,9 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
     View2D node_norm = ws_.tmp(N, Dn);
     norm_rows("norm_nres", node_norm, node_res, nweight(tl + ".norm_center_features"),
               nbias(tl + ".norm_center_features"), KOKKOS_LAMBDA(int n, int d) {
-                node_res(n, d) = node_cur(n, d) + node_exp(n, d);
-                if (save) node_next(n, d) = node_res(n, d);
+                const Net v = node_cur(n, d) + node_exp(n, d);
+                if (save) node_next(n, d) = v;
+                return v;
               });
     View2D pre_center = save ? keep(sav->tmp_center[a], "tc", a, N, cw) : ws_.tmp(N, cw);
     feedforward(node_next, node_norm, tl + ".center_mlp", pre_center, save, 1);
@@ -149,12 +151,12 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
   norm_rows("norm_cat", comb_norm, concat, vec("combination_norms." + ls + ".weight"),
             vec("combination_norms." + ls + ".bias"), KOKKOS_LAMBDA(int k, int d) {
               if (d < D) {
-                concat(k, d) = out_edge(k, d);
-                input_edge(k, d) += out_edge(k, d);
-                return;
+                const Net v = out_edge(k, d);
+                input_edge(k, d) += v;
+                return v;
               }
               const int r = rev(k), c = d - D;
-              concat(k, d) = r >= 0 ? out_edge(r, c) : remote && ro(k) >= 0 ? remote_in(ro(k), c) : Net(0);
+              return r >= 0 ? out_edge(r, c) : remote && ro(k) >= 0 ? remote_in(ro(k), c) : Net(0);
             });
   linear_silu(cph, save ? keep(sav->cph, "cph", -1, E, 2 * D) : View2D(), comb_norm,
               mat("combination_mlps." + ls + ".0.weight"), vec("combination_mlps." + ls + ".0.bias"));

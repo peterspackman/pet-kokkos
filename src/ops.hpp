@@ -10,6 +10,7 @@
 #include "pet/model.hpp"
 
 #include <string>
+#include <type_traits>
 
 namespace pet {
 
@@ -301,8 +302,14 @@ struct Fwd {
     Net x[V];
 #pragma unroll
     for (int j = 0; j < V; ++j) {
-      pro(r, l + 64 * j);
-      x[j] = in(r, l + 64 * j);
+      const int d = l + 64 * j;
+      if constexpr (std::is_void_v<decltype(pro(r, d))>) {
+        pro(r, d);
+        x[j] = in(r, d);
+      } else {  // the value itself: stored only where in is not the output too
+        x[j] = pro(r, d);
+        if (in.data() != out.data()) in(r, d) = x[j];
+      }
     }
     const Net mu = mean<V>(x, D, ln);
     Net v = Net(0);
@@ -344,9 +351,18 @@ KOKKOS_INLINE_FUNCTION Net row_mean(const Team& t, const View2D& x, int r) {
   return s / x.extent(1);
 }
 
+// A norm's prologue at (r, d): it writes in(r, d), or returns what goes there.
+template <class Pro>
+KOKKOS_INLINE_FUNCTION void run_pro(const Pro& pro, const View2D& in, int r, int d) {
+  if constexpr (std::is_void_v<decltype(pro(r, d))>) pro(r, d);
+  else in(r, d) = pro(r, d);
+}
+
 // out = norm(in), row by row, after pro(r, d) has written in(r, d) for every d
-// of row r. Each lane rereads only what it (or pro) wrote, so the passes need no
-// barrier, and out may be in itself.
+// of row r -- or, a pro that returns a Net, after in(r, d) = pro(r, d), which on
+// HIP is not stored where in is out too (the row is in registers). Each lane
+// rereads only what it (or pro) wrote, so the passes need no barrier, and out
+// may be in itself.
 template <class Pro>
 void norm_rows(const char* name, View2D out, View2D in, View1D weight, View1D bias, Pro pro) {
   const bool ln = bias.extent(0) > 0;
@@ -358,7 +374,7 @@ void norm_rows(const char* name, View2D out, View2D in, View1D weight, View1D bi
       name, norm_policy(N), KOKKOS_LAMBDA(const Team& t) {
         const int r = t.league_rank() * kNormRows + t.team_rank();
         if (r >= N) return;
-        Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, D), [&](int d) { pro(r, d); });
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, D), [&](int d) { run_pro(pro, in, r, d); });
         const Net mu = ln ? row_mean(t, in, r) : Net(0);
         Net v = Net(0);
         Kokkos::parallel_reduce(
