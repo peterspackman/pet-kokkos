@@ -4,7 +4,7 @@
 //
 // MODEL is a model name to look up on the search path (pet-eval --models lists
 // where it looks), or a path prefix naming <prefix>.json and
-// <prefix>.safetensors.
+// <prefix>.safetensors; "none" with --d3 evaluates the D3 correction alone.
 #include <Kokkos_Core.hpp>
 
 #include <algorithm>
@@ -14,12 +14,16 @@
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <utility>
 #include <string>
 #include <vector>
 
 #include "pet/calculator.hpp"
+#include "pet/d3.hpp"
 #include "pet/io.hpp"
+
+#include <memory>
 
 namespace {
 
@@ -31,7 +35,7 @@ void usage() {
       "       pet-eval --models\n"
       "\n"
       "  MODEL          model name (searched for) or path prefix naming\n"
-      "                 <prefix>.json and <prefix>.safetensors\n"
+      "                 <prefix>.json and <prefix>.safetensors; none: D3 alone\n"
       "  STRUCTURE.xyz  extended XYZ; every frame in the file is evaluated\n"
       "\n"
       "options:\n"
@@ -53,6 +57,23 @@ void usage() {
       "      --hvp K          time K exact Hessian-vector products (random\n"
       "                       directions) on the first frame, instead\n"
       "      --memory         report the device scratch pool and its largest buffers\n"
+      "\n"
+      "D3 dispersion (off unless --d3 is given; see README \"D3 dispersion\"):\n"
+      "      --d3 FUNCTIONAL  add Grimme's D3 with FUNCTIONAL's parameters (pbe,\n"
+      "                       pbesol, r2scan, b3lyp, ...; --d3-list names them)\n"
+      "      --d3-damping D   bj (rational, the default) or zero\n"
+      "      --d3-atm         add the three-body (ATM) term, s9 = 1\n"
+      "      --d3-params P    override parameters: comma-separated s6=,s8=,a1=,a2=\n"
+      "                       (a2 in bohr, as published), rs6=,rs8=,alpha=,s9=\n"
+      "      --d3-cutoff R    pair cutoff in Angstrom (default 12)\n"
+      "      --d3-cn-cutoff R coordination-number cutoff (default 8)\n"
+      "      --d3-atm-cutoff R  three-body cutoff (default 8)\n"
+      "      --d3-taper W     width of the smooth taper ending at each cutoff\n"
+      "                       (default 2; 0 is a hard cutoff)\n"
+      "      --d3-no-tail     no long-range tail correction for periodic frames\n"
+      "      --d3-reference   s-dftd3's cutoffs: 95 bohr pairs, 40 bohr CN and\n"
+      "                       ATM, no taper, no tail (slow; for checking)\n"
+      "      --d3-list        list the functionals with D3 parameters and exit\n"
       "      --info           print the model's properties and exit\n"
       "      --models         list the model search path and exit\n"
       "  -h, --help           this message\n"
@@ -88,7 +109,47 @@ struct Args {
   int hvp = 0;  // directions for --hvp
   int charge = 0;
   int spin = 1;
+  // D3
+  std::string d3_functional, d3_damping = "bj", d3_params;
+  bool d3_atm = false, d3_reference = false, d3_list = false, d3_no_tail = false;
+  double d3_cutoff = -1, d3_cn_cutoff = -1, d3_atm_cutoff = -1, d3_taper = -1;
+  bool d3_only() const { return model_spec == "none"; }
 };
+
+// The D3 settings the flags ask for; nullopt without --d3.
+std::optional<pet::D3Settings> d3_settings(const Args& a) {
+  if (a.d3_functional.empty()) return std::nullopt;
+  const pet::D3Damping damping = pet::d3_damping(a.d3_damping);
+  pet::D3Settings s;
+  if (a.d3_functional == "none") s.params.damping = damping;
+  else s = pet::D3Settings::functional(a.d3_functional, damping, a.d3_atm);
+  if (a.d3_atm) s.params.s9 = 1.0;
+  for (std::size_t p = 0, q; p < a.d3_params.size(); p = q + 1) {
+    q = std::min(a.d3_params.find(',', p), a.d3_params.size());
+    const std::string kv = a.d3_params.substr(p, q - p);
+    const auto eq = kv.find('=');
+    if (eq == std::string::npos) throw std::invalid_argument("--d3-params: expected key=value, got '" + kv + "'");
+    const std::string k = kv.substr(0, eq);
+    const double v = std::stod(kv.substr(eq + 1));
+    pet::D3Params& P = s.params;
+    if (k == "s6") P.s6 = v;
+    else if (k == "s8") P.s8 = v;
+    else if (k == "a1") P.a1 = v;
+    else if (k == "a2") P.a2 = v * 0.529177210903;
+    else if (k == "rs6") P.rs6 = v;
+    else if (k == "rs8") P.rs8 = v;
+    else if (k == "alpha" || k == "alp") P.alpha = v;
+    else if (k == "s9") P.s9 = v;
+    else throw std::invalid_argument("--d3-params: unknown parameter '" + k + "'");
+  }
+  if (a.d3_reference) s.cutoffs = pet::D3Cutoffs::reference();
+  if (a.d3_cutoff > 0) s.cutoffs.pair = a.d3_cutoff;
+  if (a.d3_cn_cutoff > 0) s.cutoffs.cn = a.d3_cn_cutoff;
+  if (a.d3_atm_cutoff > 0) s.cutoffs.atm = a.d3_atm_cutoff;
+  if (a.d3_taper >= 0) s.cutoffs.pair_taper = s.cutoffs.cn_taper = s.cutoffs.atm_taper = a.d3_taper;
+  if (a.d3_no_tail) s.cutoffs.tail = false;
+  return s;
+}
 
 // Parse argv. Returns false when the program should stop; `rc` is the exit code
 // and is 0 for the cases that legitimately end here (--help, --models).
@@ -144,6 +205,33 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.report_memory = true;
     } else if (s == "--hvp") {
       a.hvp = std::max(1, std::atoi(next("--hvp").c_str()));
+    } else if (s == "--d3") {
+      a.d3_functional = next("--d3");
+    } else if (s == "--d3-damping") {
+      a.d3_damping = next("--d3-damping");
+    } else if (s == "--d3-atm") {
+      a.d3_atm = true;
+    } else if (s == "--d3-params") {
+      a.d3_params = next("--d3-params");
+    } else if (s == "--d3-cutoff") {
+      a.d3_cutoff = std::atof(next("--d3-cutoff").c_str());
+    } else if (s == "--d3-cn-cutoff") {
+      a.d3_cn_cutoff = std::atof(next("--d3-cn-cutoff").c_str());
+    } else if (s == "--d3-atm-cutoff") {
+      a.d3_atm_cutoff = std::atof(next("--d3-atm-cutoff").c_str());
+    } else if (s == "--d3-taper") {
+      a.d3_taper = std::atof(next("--d3-taper").c_str());
+    } else if (s == "--d3-no-tail") {
+      a.d3_no_tail = true;
+    } else if (s == "--d3-reference") {
+      a.d3_reference = true;
+    } else if (s == "--d3-list") {
+      for (auto d : {pet::D3Damping::BJ, pet::D3Damping::Zero}) {
+        std::printf("%s:", d == pet::D3Damping::BJ ? "bj" : "zero");
+        for (const auto& f : pet::d3_functionals(d)) std::printf(" %s", f.c_str());
+        std::printf("\n");
+      }
+      return false;
     } else if (s == "--repeat") {
       a.repeat = std::max(1, std::atoi(next("--repeat").c_str()));
     } else if (s.rfind("--kokkos-", 0) == 0) {
@@ -164,6 +252,11 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
   }
   a.model_spec = positional[0];
   if (positional.size() > 1) a.structure_path = positional[1];
+  if (a.d3_only() && a.d3_functional.empty()) {
+    std::fputs("pet-eval: MODEL none evaluates D3 alone: give --d3 FUNCTIONAL\n", stderr);
+    rc = 2;
+    return false;
+  }
   if (a.structure_path.empty() && !a.info_only) {
     std::fputs("pet-eval: need a structure file (or --info)\n", stderr);
     rc = 2;
@@ -239,7 +332,7 @@ void print_model_info(const Args& a, const pet::Calculator& calc) {
 
 // Results as JSON, at full precision: this is what gets diffed against a
 // reference.
-void print_json(const Args& a, const pet::Calculator& calc,
+void print_json(const Args& a, const pet::Calculator* calc, const std::optional<pet::D3Settings>& d3,
                 const std::vector<pet::System>& frames, const pet::Results& r,
                 double best_seconds) {
   auto num = [](double v) {
@@ -249,13 +342,27 @@ void print_json(const Args& a, const pet::Calculator& calc,
   };
 
   std::printf("{\n  \"model\": \"%s\",\n", a.model_spec.c_str());
-  std::printf("  \"cutoff\": %s,\n", num(calc.cutoff()).c_str());
-  std::printf("  \"energy_unit\": \"%s\",\n", calc.energy_unit().c_str());
-  std::printf("  \"length_unit\": \"%s\",\n", calc.length_unit().c_str());
+  if (calc) {
+    std::printf("  \"cutoff\": %s,\n", num(calc->cutoff()).c_str());
+    std::printf("  \"energy_unit\": \"%s\",\n", calc->energy_unit().c_str());
+    std::printf("  \"length_unit\": \"%s\",\n", calc->length_unit().c_str());
+  }
+  if (d3) {
+    const pet::D3Params& p = d3->params;
+    const pet::D3Cutoffs& c = d3->cutoffs;
+    std::printf("  \"d3\": {\"functional\": \"%s\", \"damping\": \"%s\", \"s6\": %s, \"s8\": %s, \"a1\": %s, "
+                "\"a2\": %s, \"rs6\": %s, \"rs8\": %s, \"alpha\": %s, \"s9\": %s, \"cutoff\": %s, \"taper\": %s, "
+                "\"cn_cutoff\": %s, \"cn_taper\": %s, \"atm_cutoff\": %s, \"atm_taper\": %s, \"tail\": %s},\n",
+                a.d3_functional.c_str(), p.damping == pet::D3Damping::BJ ? "bj" : "zero", num(p.s6).c_str(),
+                num(p.s8).c_str(), num(p.a1).c_str(), num(p.a2).c_str(), num(p.rs6).c_str(), num(p.rs8).c_str(),
+                num(p.alpha).c_str(), num(p.s9).c_str(), num(c.pair).c_str(), num(c.pair_taper).c_str(),
+                num(c.cn).c_str(), num(c.cn_taper).c_str(), num(c.atm).c_str(), num(c.atm_taper).c_str(),
+                c.tail ? "true" : "false");
+  }
   std::printf("  \"seconds\": %s,\n", num(best_seconds).c_str());
   std::printf("  \"vesin\": %s,\n", pet::vesin_available() ? "true" : "false");
   std::printf("  \"system_conditioning\": %s,\n",
-              calc.hypers().system_conditioning ? "true" : "false");
+              calc && calc->hypers().system_conditioning ? "true" : "false");
   std::printf("  \"charge\": %d,\n  \"spin_multiplicity\": %d,\n", a.charge, a.spin);
   std::printf("  \"non_conservative\": %s,\n", a.non_conservative ? "true" : "false");
   std::printf("  \"frames\": [\n");
@@ -320,6 +427,52 @@ void print_json(const Args& a, const pet::Calculator& calc,
   std::printf("  ]\n}\n");
 }
 
+// MODEL none: the D3 correction alone.
+int run_d3(const Args& a, const pet::D3& d3, const std::vector<pet::System>& frames, const pet::D3Settings& set) {
+  pet::Results r;
+  double best = 1e300;
+  for (int k = 0; k < a.repeat; ++k) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (a.batch) {
+      r = d3.compute(frames, a.want_forces);
+    } else {
+      pet::Results all;
+      for (const auto& s : frames) {
+        pet::Results one = d3.compute(s, a.want_forces);
+        auto append = [](auto& to, const auto& from) { to.insert(to.end(), from.begin(), from.end()); };
+        append(all.energy, one.energy), append(all.forces, one.forces), append(all.virial, one.virial);
+        append(all.per_atom_energy, one.per_atom_energy);
+      }
+      r = std::move(all);
+    }
+    Kokkos::fence();
+    const std::chrono::duration<double> dt = std::chrono::steady_clock::now() - t0;
+    best = std::min(best, dt.count());
+  }
+  if (a.json) {
+    print_json(a, nullptr, set, frames, r, best);
+    return 0;
+  }
+  std::size_t foff = 0;
+  int atoms = 0;
+  for (std::size_t b = 0; b < frames.size(); ++b) {
+    const pet::System& s = frames[b];
+    atoms += s.n_atoms;
+    std::printf("frame %zu: N=%d  E(D3) = %.10f eV  (%.10f eV/atom)\n", b, s.n_atoms, r.energy[b],
+                r.energy[b] / std::max(1, s.n_atoms));
+    if (a.want_forces) {
+      double m = 0.0;
+      for (int i = 0; i < 3 * s.n_atoms; ++i) m = std::max(m, std::fabs(r.forces[foff + i]));
+      std::printf("  max|F| = %.8e eV/A\n", m);
+      if (s.pbc[0] || s.pbc[1] || s.pbc[2]) print_stress(r.virial, int(b), cell_volume(s));
+    }
+    foff += 3 * std::size_t(s.n_atoms);
+  }
+  if (a.repeat > 1)
+    std::printf("\nbest of %d: %.4f s for %zu frames / %d atoms\n", a.repeat, best, frames.size(), atoms);
+  return 0;
+}
+
 // Everything owning a View is destroyed when this returns, before
 // Kokkos::finalize.
 int run(const Args& a) {
@@ -330,17 +483,25 @@ int run(const Args& a) {
   opts.non_conservative = a.non_conservative;
   opts.uncertainty = a.uncertainty;
   opts.smooth_cutoff = a.smooth_cutoff;
-  pet::Calculator calc(a.model_spec, opts);
+  opts.d3 = d3_settings(a);
+  std::unique_ptr<pet::Calculator> calc_owner;
+  std::unique_ptr<pet::D3> d3_alone;
+  if (a.d3_only()) d3_alone = std::make_unique<pet::D3>(*opts.d3);
+  else calc_owner = std::make_unique<pet::Calculator>(a.model_spec, opts);
 
   if (a.info_only) {
-    print_model_info(a, calc);
+    if (!calc_owner) {
+      std::fputs("pet-eval: --info needs a model\n", stderr);
+      return 2;
+    }
+    print_model_info(a, *calc_owner);
     return 0;
   }
 
   std::vector<pet::System> frames = pet::read_extxyz(a.structure_path);
   // A model without system_conditioning ignores them: warn, don't fail.
-  if (a.charge != 0 || a.spin != 1) {
-    if (!calc.hypers().system_conditioning)
+  if (calc_owner && (a.charge != 0 || a.spin != 1)) {
+    if (!calc_owner->hypers().system_conditioning)
       std::fprintf(stderr,
                    "pet-eval: warning: --charge/--spin given, but this model was not "
                    "trained with system_conditioning; they have no effect.\n");
@@ -353,6 +514,9 @@ int run(const Args& a) {
     std::fputs("pet-eval: no frames in the structure file\n", stderr);
     return 2;
   }
+
+  if (!calc_owner) return run_d3(a, *d3_alone, frames, *opts.d3);
+  const pet::Calculator& calc = *calc_owner;
 
   // Here, where the message can name the element.
   for (std::size_t f = 0; f < frames.size(); ++f)
@@ -415,7 +579,7 @@ int run(const Args& a) {
   }
 
   if (a.json) {
-    print_json(a, calc, frames, r, best_seconds);
+    print_json(a, &calc, opts.d3, frames, r, best_seconds);
     return 0;
   }
 

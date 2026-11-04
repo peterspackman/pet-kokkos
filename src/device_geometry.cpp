@@ -714,7 +714,7 @@ const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device,
   if (!valid) throw std::runtime_error("pet: no neighbour list set");
   if (shifted && !cell) throw std::runtime_error("pet: an edge list with shifts needs the cell");
   const int N = dev.n_atoms, E = dev.n_raw;
-  RView2D pos = ws.r2("md:pos", N, 3);
+  RView2D pos = this->pos = ws.r2("md:pos", N, 3);
   if (renumber.extent(0) > 0 && !on_device) throw std::runtime_error("pet: a renumbered list takes device positions");
   if (N && on_device) {
     const Kokkos::View<const double**, Kokkos::LayoutRight, MemSpace, Kokkos::MemoryUnmanaged> x(positions, N, 3);

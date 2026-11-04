@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -240,6 +241,7 @@ TEST_CASE("D3 with ghosts matches the periodic structure", "[d3]") {
   pet::D3Settings set = pet::D3Settings::functional("pbe", pet::D3Damping::BJ, true);
   set.cutoffs.pair = 6.0, set.cutoffs.pair_taper = 1.5, set.cutoffs.cn = 4.0, set.cutoffs.cn_taper = 1.0;
   set.cutoffs.atm = 4.0, set.cutoffs.atm_taper = 1.0;
+  set.cutoffs.tail = false;  // an engine's ghosts have no cell, so no tail
   const pet::D3 d3(set);
   const pet::Results ref = d3.compute(s);
   // Ghosts: every image within ghost_cutoff (no exchange) of the cell.
@@ -283,4 +285,21 @@ TEST_CASE("D3 with ghosts matches the periodic structure", "[d3]") {
   INFO("force error " << err << " of " << scale);
   CHECK(err < 1e-10 * scale + 1e-12);
   for (int k = 0; k < 6; ++k) CHECK(std::fabs(w(0, k) - ref.virial[k]) < 1e-9 * std::fabs(ref.virial[k]) + 1e-11);
+}
+
+// An atom with more ATM neighbours than its list holds walks the grid instead:
+// the same answer.
+TEST_CASE("D3 ATM past the neighbour list's capacity", "[d3]") {
+  const pet::System s = water_box(2, 21);
+  pet::D3Settings set = pet::D3Settings::functional("pbe", pet::D3Damping::BJ, true);
+  set.cutoffs.atm = 5.0, set.cutoffs.atm_taper = 1.0;
+  const pet::D3 a(set);
+  const pet::Results ra = a.compute(s);
+  setenv("PET_D3_ATM_CAP", "8", 1);
+  const pet::D3 b(set);
+  const pet::Results rb = b.compute(s);
+  unsetenv("PET_D3_ATM_CAP");
+  CHECK(std::fabs(ra.energy[0] - rb.energy[0]) < 1e-12 * std::fabs(ra.energy[0]));
+  for (std::size_t k = 0; k < ra.forces.size(); ++k) CHECK(std::fabs(ra.forces[k] - rb.forces[k]) < 1e-12);
+  for (int k = 0; k < 6; ++k) CHECK(std::fabs(ra.virial[k] - rb.virial[k]) < 1e-11);
 }

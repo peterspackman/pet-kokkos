@@ -103,6 +103,10 @@ struct EdgeListView {
   // Over several ranks: only the owned atoms have pairs, ghosts are one cutoff
   // deep, and the engine carries what crosses (exchange.hpp). A full list.
   Exchange* exchange = nullptr;
+  // For D3 (Options::d3), which searches the atoms itself: the periodic axes
+  // (bit d for lattice vector d) of `cell`, over the owned atoms; -1: all three
+  // when the list has shifts, else none (the ghosts are the images).
+  int periodic = -1;
 };
 
 // The same, for an engine whose full list is already on the device (LAMMPS's
@@ -128,6 +132,7 @@ struct DeviceEdgeListView {
   const double* cell = nullptr;         // [9] lattice vectors as rows (host); with image_of
   int charge = 0, spin_multiplicity = 1;
   Exchange* exchange = nullptr;         // as EdgeListView's
+  int periodic = -1;                    // as EdgeListView's; -1: all three with image_of
 };
 
 // The pairs as a flat list on the device, in any order, as metatomic hands them
@@ -145,6 +150,7 @@ struct DevicePairListView {
   const int* atomic_numbers = nullptr;
   const int* renumber = nullptr;
   int charge = 0, spin_multiplicity = 1;
+  int periodic = -1;  // as EdgeListView's; -1: all three when a cell is given
 };
 
 // An engine's list on the device between its rebuilds: the topology once (set),
@@ -169,6 +175,7 @@ struct EdgeSession {
   }
   bool shifted = false, valid = false;
   IView1D renumber;  // [N] a DevicePairListView's renumbering; empty: none
+  RView2D pos;       // [N, 3] the last step's positions, in this list's numbering
 
   void set(const EdgeListView& v, const std::vector<int>& species_to_index);
   void set(const DeviceEdgeListView& v, const std::vector<int>& species_to_index);

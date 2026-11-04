@@ -210,6 +210,14 @@ struct Calculator::Impl {
 
   std::vector<int> atomic_types;
 
+  // D3 (Options::d3): the correction, each PET species' atomic number for it,
+  // and an engine session's one structure as D3 reads it.
+  std::unique_ptr<D3> d3;
+  IView1D d3_ztab;
+  IView1D d3_soff{"pet:d3_soff", 1}, d3_scnt{"pet:d3_scnt", 1}, d3_sper{"pet:d3_sper", 1};
+  int d3_periodic = 0, d3_atoms = 0;  // the session's periodic axes, and the atoms D3 sees
+  D3::Out d3_out;                     // compute_step's, for its per-atom virial
+
   static Checkpoint adjusted(Checkpoint c, const Options& o) {
     if (o.smooth_cutoff && c.hypers.cutoff_function == CutoffFunction::Cosine)
       c.hypers.cutoff_function = CutoffFunction::Smooth;
@@ -251,6 +259,50 @@ struct Calculator::Impl {
     const char* nb = std::getenv("PET_NEIGHBORS");
     const bool builtin = o.neighbors == Options::Neighbors::Builtin || (nb && std::string(nb) == "builtin");
     neighbor_backend() = builtin ? NeighborBackend::Builtin : NeighborBackend::Vesin;
+    if (o.d3) {
+      d3 = std::make_unique<D3>(*o.d3);
+      std::vector<int> z(std::max<std::size_t>(1, atomic_types.size()), 0);
+      for (int t : atomic_types) {
+        if (t > 103) throw std::invalid_argument("pet: D3 covers elements 1-103; the model has Z = " + std::to_string(t));
+        z[ckpt.species_to_index[t]] = t;
+      }
+      d3_ztab = IView1D("pet:d3_ztab", z.size());
+      Kokkos::deep_copy(d3_ztab, Kokkos::View<const int*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(z.data(), z.size()));
+    }
+  }
+
+  // D3's view of staged structures.
+  D3::Atoms d3_staged(const DeviceGeom& g) const {
+    D3::Atoms a;
+    a.pos = g.pos, a.type = g.spec, a.ztab = d3_ztab, a.sid = g.sid, a.soff = g.soff, a.scnt = g.scnt;
+    a.sper = g.sper, a.scell = g.scell, a.N = g.Ntot, a.B = g.B;
+    return a;
+  }
+
+  // After an engine's list is set: how D3 sees its atoms. With an exchange, the
+  // owned atoms and their ghosts; periodic (the list has shifts or images, or
+  // says so), the owned atoms alone in the cell, the ghosts being their images;
+  // else every atom, the owned ones' energy.
+  void d3_session(int periodic, bool shifted) {
+    if (!d3) return;
+    const int N = md.dev.n_atoms, nl = md.dev.n_local < 0 ? N : md.dev.n_local;
+    int per = periodic >= 0 ? (periodic & 7) : (shifted ? 7 : 0);
+    if (md.dev.exchange) per = 0;
+    d3_periodic = per;
+    d3_atoms = per ? nl : N;
+    Kokkos::deep_copy(d3_soff, 0), Kokkos::deep_copy(d3_scnt, d3_atoms), Kokkos::deep_copy(d3_sper, per);
+    d3->reset_grid();
+  }
+  D3::Atoms d3_session_atoms() const {
+    D3::Atoms a;
+    const int N = md.dev.n_atoms, nl = md.dev.n_local < 0 ? N : md.dev.n_local;
+    a.pos = md.pos, a.type = md.dev.species, a.ztab = d3_ztab, a.sid = md.dev.struct_id;
+    a.soff = d3_soff, a.scnt = d3_scnt, a.sper = d3_sper;
+    a.scell = RView2D(const_cast<Real*>(md.d_cell.data()), 1, 9);
+    a.N = d3_atoms, a.B = 1;
+    a.n_local = (!d3_periodic && nl < N) ? nl : -1;
+    a.exchange = md.dev.exchange;
+    return a;
   }
 
   // The edge slots (atoms x neighbours) a batch may take in memory: the budget
@@ -335,6 +387,40 @@ DeviceGeom Calculator::stage(const std::vector<System>& systems) const {
 
 static void add_uncertainty(Results& out, const PetModel& model);
 
+// D3's results added to PET's, on the host.
+static void add_results(Results& out, const Results& d, bool forces) {
+  auto add = [](std::vector<double>& to, const std::vector<double>& from) {
+    if (to.size() != from.size()) throw std::logic_error("pet: D3 and PET results differ in shape");
+    for (std::size_t k = 0; k < to.size(); ++k) to[k] += from[k];
+  };
+  add(out.energy, d.energy);
+  add(out.per_atom_energy, d.per_atom_energy);
+  if (forces) add(out.forces, d.forces), add(out.virial, d.virial);
+}
+
+// D3's results added to PET's in place, on the device: the first rows (D3 may
+// see fewer atoms than PET, the owned ones of a periodic engine).
+static void add_device(BatchResult& br, const D3::Out& o, bool forces) {
+  auto e = br.energy, pa = br.per_atom;
+  auto de = o.energy, dpa = o.per_atom;
+  const int B = std::min<int>(e.extent(0), de.extent(0)), N = std::min<int>(pa.extent(0), dpa.extent(0));
+  const bool f = forces && br.forces.extent(0) > 0 && o.forces.extent(0) > 0;
+  auto F = br.forces, W = br.virial;
+  auto dF = o.forces, dW = o.virial;
+  const int NF = f ? std::min<int>(F.extent(0), dF.extent(0)) : 0;
+  Kokkos::parallel_for(
+      "pet_add_d3", RangePolicy(0, std::max(B, N)), KOKKOS_LAMBDA(int i) {
+        if (i < B) {
+          e(i) += de(i);
+          if (f)
+            for (int k = 0; k < 6; ++k) W(i, k) += dW(i, k);
+        }
+        if (i < N) pa(i) += dpa(i);
+        if (i < NF)
+          for (int c = 0; c < 3; ++c) F(i, c) += dF(i, c);
+      });
+}
+
 Results Calculator::compute(const System& system, bool compute_forces) const {
   // Small structures stay on the host path, where the device build's fixed cost
   // would dominate; it is also the path the goldens pin to 1e-9.
@@ -356,6 +442,7 @@ Results Calculator::compute(const System& system, bool compute_forces) const {
   out.energy = {r.total};
   out.per_atom_energy = std::move(r.per_atom);
   add_uncertainty(out, impl_->model);
+  if (impl_->d3) add_results(out, impl_->d3->compute(system, compute_forces), compute_forces);
   return out;
 }
 
@@ -509,11 +596,11 @@ Results Calculator::compute_batch(const std::vector<System>& systems, bool compu
   auto& I = *impl_;
   BatchResult br;
   if (I.opts.device_neighbors) {
-    DeviceEdgeData dev =
-        build_device_batch(systems, I.ckpt.hypers, I.ckpt.species_to_index, I.model.probes(),
-                           I.model.n_probes(), I.nbr_ws, I.nbr_edge_map, I.nbr_m_high,
-                           I.opts.cache_neighbors ? &I.cache : nullptr);
+    const DeviceGeom g = stage_systems(I.nbr_ws, systems, I.ckpt.species_to_index);
+    DeviceEdgeData dev = build_nef_device(g, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), I.nbr_ws,
+                                          I.nbr_edge_map, I.nbr_m_high, I.opts.cache_neighbors ? &I.cache : nullptr);
     br = I.model.energy_forces_batch(dev, compute_forces);
+    if (I.d3) add_device(br, I.d3->evaluate(I.d3_staged(g), compute_forces), compute_forces);
   } else {
     br = I.model.energy_forces_batch(systems, compute_forces);
   }
@@ -528,13 +615,16 @@ Results Calculator::compute_batch(const std::vector<System>& systems, bool compu
     to_host(out.struct_id, br.struct_id);
     to_host(out.virial, br.virial);
   }
+  if (I.d3 && !I.opts.device_neighbors) add_results(out, I.d3->compute(systems, compute_forces), compute_forces);
   return out;
 }
 
 // An evaluation on the session's list, back in the engine's order.
-Results Calculator::session_results(const DeviceEdgeData& dev, bool compute_forces, bool edge_gradients) const {
+Results Calculator::session_results(const DeviceEdgeData& dev, bool compute_forces, bool edge_gradients,
+                                    bool keep_grid) const {
   auto& I = *impl_;
-  const BatchResult br = I.model.energy_forces_batch(dev, compute_forces);
+  BatchResult br = I.model.energy_forces_batch(dev, compute_forces);
+  if (I.d3) add_device(br, I.d3->evaluate(I.d3_session_atoms(), compute_forces, keep_grid), compute_forces);
   Results out;
   out.n_atoms = {dev.n_atoms};
   to_host(out.energy, br.energy);
@@ -564,22 +654,32 @@ Results Calculator::session_results(const DeviceEdgeData& dev, bool compute_forc
 Results Calculator::compute_edges(const EdgeListView& edges, bool compute_forces, bool edge_gradients) const {
   auto& I = *impl_;
   I.md.set(edges, I.ckpt.species_to_index);
+  I.d3_session(edges.periodic, edges.shifts && edges.cell);
   const DeviceEdgeData& dev =
       I.md.step(edges.positions, false, edges.cell, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), false);
-  return session_results(dev, compute_forces, edge_gradients);
+  return session_results(dev, compute_forces, edge_gradients, false);
 }
 
 BatchResult Calculator::compute_pairs(const DevicePairListView& pairs, const double* positions, const double* cell,
                                       bool compute_forces) const {
   auto& I = *impl_;
   I.md.set(pairs, I.ckpt.species_to_index);
+  I.d3_session(pairs.periodic, cell != nullptr);
   const DeviceEdgeData& dev =
       I.md.step(positions, true, cell, I.ckpt.hypers, I.model.probes(), I.model.n_probes(), false);
-  return I.model.energy_forces_batch(dev, compute_forces);
+  BatchResult br = I.model.energy_forces_batch(dev, compute_forces);
+  if (I.d3) add_device(br, I.d3->evaluate(I.d3_session_atoms(), compute_forces), compute_forces);
+  return br;
 }
 
-void Calculator::set_neighbors(const EdgeListView& list) { impl_->md.set(list, impl_->ckpt.species_to_index); }
-void Calculator::set_neighbors(const DeviceEdgeListView& list) { impl_->md.set(list, impl_->ckpt.species_to_index); }
+void Calculator::set_neighbors(const EdgeListView& list) {
+  impl_->md.set(list, impl_->ckpt.species_to_index);
+  impl_->d3_session(list.periodic, list.shifts && list.cell);
+}
+void Calculator::set_neighbors(const DeviceEdgeListView& list) {
+  impl_->md.set(list, impl_->ckpt.species_to_index);
+  impl_->d3_session(list.periodic, list.image_of && list.cell);
+}
 
 Results Calculator::compute_step(const double* positions, const double* cell, bool compute_forces,
                                  bool edge_gradients) const {
@@ -587,9 +687,11 @@ Results Calculator::compute_step(const double* positions, const double* cell, bo
   for (;;) {
     const DeviceEdgeData& dev = I.md.step(positions, false, cell, I.ckpt.hypers, I.model.probes(),
                                           I.model.n_probes(), I.opts.md_fixed_shapes);
-    Results r = session_results(dev, compute_forces, edge_gradients);
-    if (!I.md.overflowed()) return r;
-    I.md.grow();  // the capacities did not hold: again, with more room
+    Results r = session_results(dev, compute_forces, edge_gradients, true);
+    const bool d3_over = I.d3 && I.d3->overflowed();
+    if (!I.md.overflowed() && !d3_over) return r;
+    if (d3_over) I.d3->reset_grid();  // an atom left D3's box: again, around where they are now
+    else I.md.grow();                 // the capacities did not hold: again, with more room
   }
 }
 
@@ -604,15 +706,21 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
     const DeviceEdgeData& dev = I.md.step(a.positions, true, cell, I.ckpt.hypers, I.model.probes(),
                                           I.model.n_probes(), I.opts.md_fixed_shapes);
     BatchResult r = I.model.energy_forces_batch(dev, forces);
+    if (I.d3) {
+      I.d3_out = I.d3->evaluate(I.d3_session_atoms(), forces, true);
+      add_device(r, I.d3_out, forces);
+    }
     auto tot = I.totals, energy = r.energy;
     auto virial = r.virial;
     auto over = dev.overflow;
+    IView1D d3_over = I.d3 ? I.d3->overflow_flag() : IView1D();
     const bool has_virial = forces && virial.extent(0) > 0, has_over = over.extent(0) > 0;
+    const bool has_d3_over = d3_over.extent(0) > 0;
     Kokkos::parallel_for(
         "md_totals", RangePolicy(0, 1), KOKKOS_LAMBDA(int) {
           tot(0) = energy(0);
           for (int k = 0; k < 6; ++k) tot(1 + k) = has_virial ? virial(0, k) : 0.0;
-          tot(7) = has_over ? over(0) : 0;
+          tot(7) = (has_over ? over(0) : 0) + (has_d3_over && d3_over(0) ? 2 : 0);
         });
     Kokkos::deep_copy(ExecSpace(), I.h_totals, tot);
     return r;
@@ -632,7 +740,7 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
           (std::uintptr_t) forces, (std::uintptr_t) a.positions, (std::uintptr_t) I.md.dev.n_atoms,
           (std::uintptr_t) I.md.dev.n_raw, (std::uintptr_t) I.md.M, (std::uintptr_t) I.md.E_cap,
           (std::uintptr_t) I.md.L_cap, (std::uintptr_t) engine, I.md.ws.generation(), I.model.ws_generation(),
-          lowp_generation(), numerics_key()};
+          lowp_generation(), numerics_key(), I.d3 ? I.d3->generation() : 0};
       const bool just_sized = I.md.sized;  // the last step ran these shapes: nothing left to allocate
       I.md.sized = false;
       I.model.set_graphs(false);  // one recording: the model's own graph is inside it
@@ -664,7 +772,9 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
     }
     ExecSpace().fence("pet: compute_step totals");
     if (I.h_totals(7) == 0.0) break;
-    I.md.grow();  // the capacities did not hold: again, with more room
+    const int over = int(I.h_totals(7));
+    if (over & 2) I.d3->reset_grid();  // an atom left D3's box: again, around where they are now
+    if (over & 1) I.md.grow();         // the capacities did not hold: again, with more room
   }
   t.energy = I.h_totals(0);
   const DeviceEdgeData& dev = I.md.dev;
@@ -714,6 +824,15 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
           for (int k = 0; k < 6; ++k) w(i, k) += scale * s[k];
         });
   }
+  if (a.per_atom_virial && I.d3 && a.forces) {
+    auto dw = I.d3_out.atom_virial;
+    const Out w(a.per_atom_virial, N, 6);
+    const double scale = a.virial_scale;
+    Kokkos::parallel_for(
+        "md_atom_virial_d3", RangePolicy(0, dw.extent(0)), KOKKOS_LAMBDA(int i) {
+          for (int k = 0; k < 6; ++k) w(i, k) += scale * dw(i, k);
+        });
+  }
   if (!a.forces) return t;
   for (int k = 0; k < 6; ++k) t.virial[k] = I.h_totals(1 + k);
   return t;
@@ -721,15 +840,24 @@ Calculator::Totals Calculator::compute_step(const DeviceArrays& a, const double*
 
 double Calculator::ghost_cutoff() const {
   const Hypers& h = impl_->ckpt.hypers;
-  return (h.num_gnn_layers + (h.adaptive() ? 1 : 0)) * h.cutoff;
+  const double pet = (h.num_gnn_layers + (h.adaptive() ? 1 : 0)) * h.cutoff;
+  return impl_->d3 ? std::max(pet, impl_->d3->ghost_cutoff(false)) : pet;
 }
+
+double Calculator::exchange_ghost_cutoff() const {
+  return impl_->d3 ? std::max(cutoff(), impl_->d3->ghost_cutoff(true)) : cutoff();
+}
+
+const D3* Calculator::d3() const { return impl_->d3.get(); }
 
 BatchResult Calculator::compute_device(const DeviceGeom& geom, bool compute_forces) const {
   DeviceEdgeData dev = build_nef_device(
       geom, impl_->ckpt.hypers, impl_->model.probes(), impl_->model.n_probes(), impl_->nbr_ws,
       impl_->nbr_edge_map, impl_->nbr_m_high,
       impl_->opts.cache_neighbors ? &impl_->cache : nullptr);
-  return impl_->model.energy_forces_batch(dev, compute_forces);
+  BatchResult br = impl_->model.energy_forces_batch(dev, compute_forces);
+  if (impl_->d3) add_device(br, impl_->d3->evaluate(impl_->d3_staged(geom), compute_forces), compute_forces);
+  return br;
 }
 
 std::size_t Calculator::workspace_bytes() const { return impl_->model.workspace_bytes(); }

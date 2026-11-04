@@ -60,14 +60,20 @@ D3Damping d3_damping(const std::string& name);  // "bj" | "rational" | "zero"
 // Where each sum stops, in Angstrom: a term is multiplied by a smooth step from 1
 // at cutoff - taper to 0 at cutoff (taper 0: a hard cutoff, as s-dftd3's).
 //
-// The defaults keep the truncation error against s-dftd3's cutoffs below
-// 0.03 meV/atom in energy on dense solids and liquids (water, Cu, W, a molecular
-// crystal; see README "D3 dispersion"), at a few percent of the cost.
+// The pair sum's tail falls off only as 1/r^3 in the energy: past 12 A it is
+// still ~0.5 meV/atom in water and ~15-30 meV/atom in a transition metal,
+// with a matching error in the pressure. With `tail`, a 3D-periodic structure
+// gets it back as a uniform continuum past the taper (g(r) = 1, as an MD
+// code's tail correction): its energy, its pressure, and its forces through
+// the CNs. Not for molecules, slabs, or an engine's ghost atoms (see README
+// "D3 dispersion" for the measured errors either way).
 struct D3Cutoffs {
   double pair = 12.0, pair_taper = 2.0;
   double cn = 8.0, cn_taper = 2.0;
   double atm = 8.0, atm_taper = 2.0;
-  // s-dftd3's and Grimme's dftd3's: pairs to 95 bohr, CN and ATM to 40, hard.
+  bool tail = true;
+  // s-dftd3's and Grimme's dftd3's: pairs to 95 bohr, CN and ATM to 40, hard,
+  // no tail.
   static D3Cutoffs reference();
 };
 
@@ -96,9 +102,8 @@ class D3 {
   Results compute(const System& system, bool compute_forces = true) const;
   Results compute(const std::vector<System>& systems, bool compute_forces = true) const;
 
-  // Structures staged on the device, their species the atomic numbers (unless
-  // set_types says otherwise); results stay there, in this D3's pool, valid
-  // until its next evaluation.
+  // Structures staged on the device, their species the atomic numbers; results
+  // stay there, in this D3's pool, valid until its next evaluation.
   DeviceGeom stage(const std::vector<System>& systems) const;
   BatchResult compute_device(const DeviceGeom& geom, bool compute_forces = true) const;
 
@@ -114,7 +119,8 @@ class D3 {
   // the force of that energy, ghosts included (the engine sums those home).
   struct Atoms {
     RView2D pos;                     // [N, 3], unwrapped
-    IView1D type;                    // [N] an index into set_types' table
+    IView1D type;                    // [N] each atom's type: its atomic number, or with ztab an index
+    IView1D ztab;                    // [types] each type's atomic number; empty: types are atomic numbers
     IView1D sid, soff, scnt, sper;   // [N], [B], [B], [B]: as DeviceGeom
     RView2D scell;                   // [B, 9]
     int N = 0, B = 0;
@@ -128,8 +134,6 @@ class D3 {
     Kokkos::View<double**, LR, MemSpace> virial;      // [B, 6] Voigt; with forces
     Kokkos::View<double**, LR, MemSpace> atom_virial; // [N, 6] each atom's share; with forces
   };
-  // Atomic number of each type index (default: the identity, types are Z).
-  void set_types(const std::vector<int>& type_to_z);
   // keep_grid: an engine stepping one list keeps the grid's shape (its bins,
   // a molecule's box with room to move) from one call to the next, so a step
   // records as a graph; overflowed() says when an atom left the box, and the
@@ -138,7 +142,8 @@ class D3 {
   bool overflowed() const;
   IView1D overflow_flag() const;  // [1] on the device, nonzero once an atom left the box
   void reset_grid() const;
-  // Pool generation (bumped when a buffer moves), for a recorded graph's key.
+  // Bumped whenever a buffer moves or the grid is sized afresh: for a recorded
+  // graph's key.
   std::size_t generation() const;
 
  private:

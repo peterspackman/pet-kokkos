@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "pet/config.hpp"
+#include "pet/d3.hpp"
 #include "pet/device_geometry.hpp"
 #include "pet/gemm.hpp"
 #include "pet/kokkos.hpp"
@@ -98,6 +99,14 @@ struct Options {
   // changes the model (slightly: the factors differ by at most a few hundredths
   // within the taper); off by default, and nothing for a bump-tapered model.
   bool smooth_cutoff = false;
+
+  // Add Grimme's D3 dispersion (pet/d3.hpp) to the energy, per-atom energy,
+  // forces and virial of every evaluation: D3Settings::functional("pbesol"),
+  // say, for a model trained on PBEsol. Off by default, and read once, when
+  // the Calculator is made. D3 is not in edge gradients (compute_edges'
+  // edge_gradient is PET's own; D3's forces and virial are in the totals), and
+  // response() takes D3's part by central differences of its forces.
+  std::optional<D3Settings> d3;
 
   // compute_step: give every step between neighbour-list rebuilds the same
   // shapes -- capacities for the kept edges and the neighbour count, sized with
@@ -254,8 +263,14 @@ class Calculator {
                             bool compute_forces = true) const;
   // How far past its owned atoms an engine must supply ghosts: one cutoff per
   // message-passing layer, and one more for an adaptive cutoff, which needs each
-  // of those atoms' complete neighbourhoods.
+  // of those atoms' complete neighbourhoods; with D3, at least its reach
+  // (D3::ghost_cutoff without an exchange).
   double ghost_cutoff() const;
+  // The same for an engine with an Exchange (ghosts one cutoff deep): PET's
+  // cutoff, or with D3 its pair cutoff if longer.
+  double exchange_ghost_cutoff() const;
+  // The D3 correction Options::d3 asked for, or null.
+  const D3* d3() const;
 
   const Hypers& hypers() const;
   double cutoff() const;
@@ -293,7 +308,7 @@ class Calculator {
 
  private:
   Results compute_batch(const std::vector<System>& systems, bool compute_forces) const;
-  Results session_results(const DeviceEdgeData& dev, bool compute_forces, bool edge_gradients) const;
+  Results session_results(const DeviceEdgeData& dev, bool compute_forces, bool edge_gradients, bool keep_grid) const;
 
   struct Impl;
   std::unique_ptr<Impl> impl_;
