@@ -26,6 +26,7 @@ add_executable(pet_tests
     test_edges.cpp
     test_hvp.cpp
     test_d3.cpp
+    test_d3_calc.cpp
 )
 
 target_link_libraries(pet_tests PRIVATE

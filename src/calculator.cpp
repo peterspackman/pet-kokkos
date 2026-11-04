@@ -446,6 +446,47 @@ Results Calculator::compute(const System& system, bool compute_forces) const {
   return out;
 }
 
+// D3's part of response(): its forces and virial differentiated along each
+// direction by central differences, all 2K displaced structures as one batch.
+// D3 is double and smooth (C3 tapers), so a step of 1e-4 A per unit t leaves
+// ~1e-8 relative of truncation and roundoff.
+static void add_d3_response(const D3& d3, const System& s, int K, const std::vector<double>& u,
+                            const std::vector<double>& e, Calculator::Response& r) {
+  const int N = s.n_atoms;
+  const double h = 1e-4;
+  const Results base = d3.compute(s, true);
+  if (r.base.size() == base.forces.size())
+    for (std::size_t k = 0; k < base.forces.size(); ++k) r.base[k] += base.forces[k];
+  if (K <= 0) return;
+  std::vector<System> moved;
+  moved.reserve(2 * std::size_t(K));
+  for (int k = 0; k < K; ++k)
+    for (const double sg : {h, -h}) {
+      System m = s;
+      auto strain = [&](double* x) {
+        double y[3] = {x[0], x[1], x[2]};
+        if (!e.empty())
+          for (int a = 0; a < 3; ++a)
+            for (int b = 0; b < 3; ++b) y[a] += sg * e[std::size_t(k) * 9 + 3 * a + b] * x[b];
+        for (int a = 0; a < 3; ++a) x[a] = y[a];
+      };
+      for (int i = 0; i < N; ++i) {
+        strain(&m.positions[3 * i]);
+        if (!u.empty())
+          for (int c = 0; c < 3; ++c) m.positions[3 * i + c] += sg * u[(std::size_t(k) * N + i) * 3 + c];
+      }
+      for (int row = 0; row < 3; ++row) strain(&m.cell[3 * row]);
+      moved.push_back(std::move(m));
+    }
+  const Results d = d3.compute(moved, true);
+  for (int k = 0; k < K; ++k) {
+    const std::size_t p = std::size_t(2 * k) * N * 3, m = std::size_t(2 * k + 1) * N * 3;
+    for (int q = 0; q < 3 * N; ++q) r.forces[std::size_t(k) * N * 3 + q] += (d.forces[p + q] - d.forces[m + q]) / (2 * h);
+    for (int q = 0; q < 6; ++q)
+      r.virial[std::size_t(k) * 6 + q] += (d.virial[12 * k + q] - d.virial[12 * k + 6 + q]) / (2 * h);
+  }
+}
+
 Calculator::Response Calculator::response(const System& system, int K, const std::vector<double>& displacements,
                                           const std::vector<double>& strains) const {
   const int N = system.n_atoms;
@@ -541,6 +582,7 @@ Calculator::Response Calculator::response(const System& system, int K, const std
     }
     k0 += kc;
   }
+  if (I.d3) add_d3_response(*I.d3, system, K, displacements, strains, r);
   return r;
 }
 
