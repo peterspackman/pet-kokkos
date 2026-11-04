@@ -891,16 +891,17 @@ std::string PetModel::memory_report() const {
 std::size_t PetModel::pass_elements(long centres, int max_neighbors, long edges, int chunk) const {
   const std::size_t C = std::max(0L, centres), S = std::size_t(std::max(0, max_neighbors)) + 1;
   const std::size_t rows = std::max(std::size_t(std::max(0L, edges)), C * (S - 1)) + C;
-  // Whole: the token and edge rows at the concat's, the nodes' and the heads'
-  // widths, and attention's per-(token, head) statistics.
-  const std::size_t narrow = std::max({2 * h_.d_pet, h_.d_node, h_.d_head});
+  // Whole: the token and edge rows at the concat's and the readout heads'
+  // widths, the atoms' at the node width (doubled where conditioning concats),
+  // and attention's per-(token, head) statistics.
+  const std::size_t narrow = std::max(2 * h_.d_pet, h_.d_head);
   // The widest two -- the edge MLP's pre-activation, attention's qkv -- are a
   // chunk's under Wide and Layers (a run of whole atoms: up to S rows over), the
   // qkv only where attention_chunks().
   const std::size_t part = chunk > 0 ? std::min(rows, std::size_t(chunk) + S) : rows;
   const std::size_t qkv_rows = attention_chunks(h_.head_dim) ? part : rows;
   const std::size_t ffw = std::max<std::size_t>(2 * h_.d_feedforward, ffn_pre_width("gnn_layers.0.trans.layers.0.mlp"));
-  return std::max({rows * narrow, part * ffw, qkv_rows * 3 * h_.d_pet, C * h_.num_heads * S * 2});
+  return std::max({rows * narrow, C * 2 * h_.d_node, part * ffw, qkv_rows * 3 * h_.d_pet, C * h_.num_heads * S * 2});
 }
 
 int PetModel::max_index_directions(long centres, int max_neighbors, long edges, int chunk) const {
