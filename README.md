@@ -42,6 +42,9 @@ to provide `pair_style pet` and `pet/kk`. Engines that load
 [metatomic](https://github.com/metatensor/metatomic) plugins can use the plugin
 in [`metatomic/`](#metatomic-plugin).
 
+Grimme's D3 dispersion correction can be added to any model's results, or
+evaluated on its own, on the device ([D3 dispersion](#d3-dispersion)).
+
 ## Performance
 
 One evaluation with forces, neighbour list included, in fp32 (the default; see
@@ -676,7 +679,29 @@ triangles grow as r^6). Against 21 Å, with the 2 Å taper:
 | 12 Å | −0.03 meV | −0.07 meV | −0.6 meV | −4.5 meV |
 | 16 Å | −0.006 meV | −0.016 meV | −0.15 meV | −1.1 meV |
 
-**Cost** (RTX 4080 SUPER, fp64 throughout, forces included; @D3TIMINGS@)
+**Cost.** On an RTX 4080 SUPER (whose double precision is 1/64 of its single),
+the 5184-atom water box (`water_648` replicated 2x2x2), forces included:
+
+| | pet-eval, one evaluation | LAMMPS `pet/kk`, per MD step |
+|---|---|---|
+| pet-mad-xs | 21.7 ms | 20.4 ms |
+| pet-mad-xs + D3 | 25.8 ms | 24.4 ms |
+| pet-mad-xs + D3, `mixed_precision` | 24.5 ms | 23.1 ms |
+| pet-mad-s | 143.7 ms | 154.2 ms |
+| pet-mad-s + D3 | 148.4 ms | 158.6 ms |
+| D3 alone (default cutoffs) | 5.6 ms | |
+| D3 alone, + three-body (8 Å) | 112 ms (44 ms mixed) | |
+| D3 alone, s-dftd3's cutoffs | 157 ms | |
+| pet-mad-xs + D3, s-dftd3's cutoffs | 180 ms | |
+
+So D3 at the default cutoffs adds about a fifth to a pet-mad-xs step and 3% to
+a pet-mad-s one on this card; on GPUs with full-rate double precision (A100,
+H100/H200, MI250X) its share is smaller. The three-body term is the expensive
+part: each atom sums its ~(n^2)/2 neighbour pairs, so it is opt-in and keeps
+a short cutoff. `mixed_precision` (`--d3-mixed`, `d3_mixed yes`) does each
+pair's and triangle's arithmetic in float and keeps the sums in double: within
+~1e-7 relative of the default, and 2.5x faster for the three-body term; off by
+default.
 
 **How it runs.** No pair list is stored. Each structure is binned once per
 call (the PET search's counting sort, `sort_into_bins`, at a bin width chosen
