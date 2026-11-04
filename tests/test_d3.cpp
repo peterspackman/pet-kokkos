@@ -30,7 +30,7 @@ struct Case {
 };
 
 std::vector<Case> load_cases() {
-  std::ifstream f(std::string(golden_dir()) + "/d3_reference.json");
+  std::ifstream f(std::string(golden_dir()) + "/d3/reference.json");
   REQUIRE(f.good());
   nlohmann::json j;
   f >> j;

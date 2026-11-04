@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "pet/calculator.hpp"
+#include "pet/d3.hpp"
 #include "pet/gemm.hpp"
 
 namespace nb = nanobind;
@@ -100,14 +101,111 @@ nb::dict structure(const pet::Results& r, std::size_t b, std::size_t a0, std::si
   return d;
 }
 
+// pet::D3: settings at construction, the correction made on first use.
+class D3 {
+ public:
+  D3(std::optional<std::string> functional, const std::string& damping, bool atm, std::optional<double> s6,
+     std::optional<double> s8, std::optional<double> a1, std::optional<double> a2_bohr, std::optional<double> rs6,
+     std::optional<double> rs8, std::optional<double> alpha, std::optional<double> s9, std::optional<double> cutoff,
+     std::optional<double> cutoff_taper, std::optional<double> cn_cutoff, std::optional<double> cn_taper,
+     std::optional<double> atm_cutoff, std::optional<double> atm_taper, bool tail, bool reference) {
+    const pet::D3Damping d = pet::d3_damping(damping);
+    if (functional) s_ = pet::D3Settings::functional(*functional, d, atm);
+    else s_.params.damping = d, s_.params.s9 = atm ? 1.0 : 0.0;
+    pet::D3Params& p = s_.params;
+    if (s6) p.s6 = *s6;
+    if (s8) p.s8 = *s8;
+    if (a1) p.a1 = *a1;
+    if (a2_bohr) p.a2 = *a2_bohr * 0.529177210903;
+    if (rs6) p.rs6 = *rs6;
+    if (rs8) p.rs8 = *rs8;
+    if (alpha) p.alpha = *alpha;
+    if (s9) p.s9 = *s9;
+    pet::D3Cutoffs& c = s_.cutoffs;
+    if (reference) c = pet::D3Cutoffs::reference();
+    if (cutoff) c.pair = *cutoff;
+    if (cutoff_taper) c.pair_taper = *cutoff_taper;
+    if (cn_cutoff) c.cn = *cn_cutoff;
+    if (cn_taper) c.cn_taper = *cn_taper;
+    if (atm_cutoff) c.atm = *atm_cutoff;
+    if (atm_taper) c.atm_taper = *atm_taper;
+    c.tail = tail && !reference;
+    if (!functional && !(a1 || rs6))
+      throw std::invalid_argument("pet_kokkos.D3: give a functional, or its parameters (s8 and a1, a2 or rs6)");
+  }
+  const pet::D3Settings& settings() const { return s_; }
+
+  nb::dict compute(Numbers numbers, Positions positions, std::optional<Cell> cell, std::array<bool, 3> pbc,
+                   bool forces) {
+    const pet::System s = make_system(numbers, positions, cell, pbc, 0, 1);
+    pet::Results r;
+    {
+      nb::gil_scoped_release release;
+      r = get().compute(s, forces);
+    }
+    return structure(r, 0, 0, std::size_t(s.n_atoms), forces);
+  }
+  nb::list compute_batch(
+      const std::vector<std::tuple<Numbers, Positions, std::optional<Cell>, std::array<bool, 3>>>& items,
+      bool forces) {
+    std::vector<pet::System> systems;
+    for (const auto& [z, x, c, p] : items) systems.push_back(make_system(z, x, c, p, 0, 1));
+    pet::Results r;
+    {
+      nb::gil_scoped_release release;
+      r = get().compute(systems, forces);
+    }
+    nb::list out;
+    std::size_t a0 = 0;
+    for (std::size_t b = 0; b < systems.size(); ++b) {
+      out.append(structure(r, b, a0, std::size_t(systems[b].n_atoms), forces));
+      a0 += systems[b].n_atoms;
+    }
+    return out;
+  }
+  nb::dict params() const {
+    const pet::D3Params& p = s_.params;
+    nb::dict d;
+    d["damping"] = p.damping == pet::D3Damping::BJ ? "bj" : "zero";
+    d["s6"] = p.s6, d["s8"] = p.s8, d["a1"] = p.a1, d["a2"] = p.a2 / 0.529177210903;
+    d["rs6"] = p.rs6, d["rs8"] = p.rs8, d["alpha"] = p.alpha, d["s9"] = p.s9;
+    return d;
+  }
+  nb::dict cutoffs() const {
+    const pet::D3Cutoffs& c = s_.cutoffs;
+    nb::dict d;
+    d["cutoff"] = c.pair, d["cutoff_taper"] = c.pair_taper, d["cn_cutoff"] = c.cn, d["cn_taper"] = c.cn_taper;
+    d["atm_cutoff"] = c.atm, d["atm_taper"] = c.atm_taper, d["tail"] = c.tail;
+    return d;
+  }
+  double ghost_cutoff(bool exchange) {
+    const pet::D3Cutoffs& c = s_.cutoffs;
+    const double reach = std::max(c.pair, s_.params.s9 != 0.0 ? c.atm : 0.0);
+    return exchange ? reach : reach + c.cn;
+  }
+  void close() { d3_.reset(); }
+
+ private:
+  pet::D3& get() {
+    if (!d3_) {
+      start_kokkos();
+      d3_ = std::make_unique<pet::D3>(s_);
+    }
+    return *d3_;
+  }
+  pet::D3Settings s_;
+  std::unique_ptr<pet::D3> d3_;
+};
+
 class Calculator {
  public:
   Calculator(const std::string& model, std::optional<std::string> gemm, std::optional<std::string> attention,
              bool device_neighbors, bool cache_neighbors, std::optional<std::string> recompute,
              double memory_budget_gib, int max_batch_atoms, bool non_conservative, bool uncertainty,
-             bool smooth_cutoff) {
+             bool smooth_cutoff, const D3* d3) {
     start_kokkos();
     pet::Options o;
+    if (d3) o.d3 = d3->settings();
     o.non_conservative = non_conservative;
     o.uncertainty = uncertainty;
     o.smooth_cutoff = smooth_cutoff;
@@ -237,14 +335,37 @@ NB_MODULE(_core, m) {
       },
       "spec"_a, "A model's (json, safetensors) paths, or None when it is not found.");
   m.def("_finalize", &finalize_kokkos);
+  m.def(
+      "d3_functionals",
+      [](const std::string& damping) { return pet::d3_functionals(pet::d3_damping(damping)); }, "damping"_a = "bj",
+      "The functionals with D3 parameters for a damping (bj or zero).");
+
+  nb::class_<D3>(m, "D3")
+      .def(nb::init<std::optional<std::string>, const std::string&, bool, std::optional<double>, std::optional<double>,
+                    std::optional<double>, std::optional<double>, std::optional<double>, std::optional<double>,
+                    std::optional<double>, std::optional<double>, std::optional<double>, std::optional<double>,
+                    std::optional<double>, std::optional<double>, std::optional<double>, std::optional<double>, bool,
+                    bool>(),
+           "functional"_a.none(), "damping"_a = "bj", "atm"_a = false, "s6"_a = nb::none(), "s8"_a = nb::none(),
+           "a1"_a = nb::none(), "a2"_a = nb::none(), "rs6"_a = nb::none(), "rs8"_a = nb::none(),
+           "alpha"_a = nb::none(), "s9"_a = nb::none(), "cutoff"_a = nb::none(), "cutoff_taper"_a = nb::none(),
+           "cn_cutoff"_a = nb::none(), "cn_taper"_a = nb::none(), "atm_cutoff"_a = nb::none(),
+           "atm_taper"_a = nb::none(), "tail"_a = true, "reference"_a = false)
+      .def("compute", &D3::compute, "numbers"_a, "positions"_a, "cell"_a = nb::none(),
+           "pbc"_a = std::array<bool, 3>{false, false, false}, "forces"_a = true)
+      .def("compute_batch", &D3::compute_batch, "items"_a, "forces"_a = true)
+      .def("ghost_cutoff", &D3::ghost_cutoff, "exchange"_a = false)
+      .def("close", &D3::close)
+      .def_prop_ro("params", &D3::params)
+      .def_prop_ro("cutoffs", &D3::cutoffs);
 
   nb::class_<Calculator>(m, "Calculator")
       .def(nb::init<const std::string&, std::optional<std::string>, std::optional<std::string>, bool, bool,
-                    std::optional<std::string>, double, int, bool, bool, bool>(),
+                    std::optional<std::string>, double, int, bool, bool, bool, const D3*>(),
            "model"_a, "gemm"_a = nb::none(), "attention"_a = nb::none(), "device_neighbors"_a = true,
            "cache_neighbors"_a = false, "recompute"_a = nb::none(), "memory_budget_gib"_a = 0.0,
            "max_batch_atoms"_a = 0, "non_conservative"_a = false, "uncertainty"_a = false,
-           "smooth_cutoff"_a = false)
+           "smooth_cutoff"_a = false, "d3"_a = nb::none())
       .def("compute", &Calculator::compute, "numbers"_a, "positions"_a, "cell"_a = nb::none(),
            "pbc"_a = std::array<bool, 3>{false, false, false}, "forces"_a = true, "charge"_a = 0,
            "spin_multiplicity"_a = 1)

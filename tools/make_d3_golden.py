@@ -4,13 +4,13 @@
 # dependencies = ["dftd3==1.7.0", "numpy"]
 # ///
 """Reference DFT-D3 energies, forces and virials from s-dftd3 (the dftd3 package,
-its Fortran library) for tests/test_d3.cpp: tests/golden/d3_reference.json.
+its Fortran library) for tests/test_d3.cpp: tests/golden/d3/reference.json.
 
 Units in the file are pet-kokkos's (Angstrom, eV, eV/A; the virial is
 W = sum v (x) dE/dv in Voigt order xx yy zz xy xz yz); cutoffs and a2 stay in
 bohr, as s-dftd3 takes them. Conversions are CODATA 2018, as d3.cpp's.
 
-Run:  uv run tools/make_d3_golden.py > tests/golden/d3_reference.json
+Run:  uv run tools/make_d3_golden.py > tests/golden/d3/reference.json
 """
 
 import json
