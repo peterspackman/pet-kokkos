@@ -40,13 +40,17 @@ jobs:
           name: wheels-cpu-${{ matrix.os }}
           path: wheelhouse/*.whl
 
+  # One job per variant, runner and Python: each compiles the whole library
+  # for every GPU target, so the Pythons build side by side, not in turn.
+  # cp312 is the stable-ABI wheel (3.12 and later).
   gpu:
-    name: ${{ matrix.variant }} ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.cfg.variant }} ${{ matrix.cfg.os }} ${{ matrix.python }}
+    runs-on: ${{ matrix.cfg.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        python: [cp311, cp312]
+        cfg:
           - { variant: cu12, os: ubuntu-24.04, cuda: "12-8" }
           - { variant: cu12, os: ubuntu-24.04-arm, cuda: "12-8" }
           - { variant: cu13, os: ubuntu-24.04, cuda: "13-0" }
@@ -54,10 +58,11 @@ jobs:
           - { variant: rocm6, os: ubuntu-24.04, rocm: "6.3.2", archs: "--offload-arch=gfx942" }
           - { variant: rocm7, os: ubuntu-24.04, rocm: "7.0.3", archs: "--offload-arch=gfx942 --offload-arch=gfx950" }
     env:
-      PET_KOKKOS_VARIANT: ${{ matrix.variant }}
-      PET_CUDA: ${{ matrix.cuda }}
-      PET_ROCM: ${{ matrix.rocm }}
-      PET_ROCM_ARCHS: ${{ matrix.archs }}
+      PET_KOKKOS_VARIANT: ${{ matrix.cfg.variant }}
+      PET_CUDA: ${{ matrix.cfg.cuda }}
+      PET_ROCM: ${{ matrix.cfg.rocm }}
+      PET_ROCM_ARCHS: ${{ matrix.cfg.archs }}
+      CIBW_BUILD: ${{ matrix.python }}-*
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -65,11 +70,11 @@ jobs:
       - run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: pypa/cibuildwheel@v3.2
         with:
-          config-file: python/wheels/${{ startsWith(matrix.variant, 'cu') && 'cuda' || 'rocm' }}.toml
+          config-file: python/wheels/${{ startsWith(matrix.cfg.variant, 'cu') && 'cuda' || 'rocm' }}.toml
           output-dir: wheelhouse
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.variant }}-${{ matrix.os }}
+          name: wheels-${{ matrix.cfg.variant }}-${{ matrix.cfg.os }}-${{ matrix.python }}
           path: wheelhouse/*.whl
 
   sdist:

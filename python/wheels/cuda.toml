@@ -8,7 +8,7 @@
 # test only looks for the module, the runners having no GPU.
 [tool.cibuildwheel]
 build-frontend = "build[uv]"
-build = ["cp310-*", "cp311-*", "cp312-*"]
+build = ["cp311-*", "cp312-*"]
 skip = ["*-musllinux_*", "*_i686"]
 test-command = "python -c \"import importlib.metadata as m; assert any(f.name.startswith('_core') for f in m.files('pet-kokkos'))\""
 
