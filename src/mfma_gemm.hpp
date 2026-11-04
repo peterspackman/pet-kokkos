@@ -8,8 +8,8 @@
 // all row-major, rows contiguous, K a multiple of 4 and (NN) N a multiple of 4.
 //
 // The epilogue: col(c, Col&) loads what columns c..c+3 need whatever the row
-// (before the main loop), row(r, c, Row&) what output row r's columns c..c+3
-// need, and run(r, c, v, Col, Row) gets the accumulators v[4] and writes.
+// (once a lane), row(r, c, Row&) what output row r's columns c..c+3 need, and
+// run(r, c, v, Col, Row) gets the accumulators v[4] and writes.
 //
 // The product is formed transposed, out^T = B^T A^T: the weight is the
 // instruction's A operand and the activation its B, so a lane ends with four
@@ -82,8 +82,12 @@ __global__ void __launch_bounds__(T::kThreads, (min_waves<T, Epi>())) gemm(int M
                                                                          const float* __restrict__ W, Epi epi) {
   constexpr int BM = T::BM, BN = T::BN, FM = T::FM, FN = T::FN, NT = T::kThreads, PB = BN + 4;
   constexpr int AQ = BM * 4 / NT, BQ = BN * 4 / NT;  // 16-byte loads a thread per k tile
-  __shared__ float As[BM * 16];
-  __shared__ float Bs[NN ? 16 * PB : BN * 16];
+  // The operand tiles, and after the main loop each wave's 16 x WN slice of the
+  // output on its way to global memory (rows padded by 4 floats).
+  constexpr int AS = BM * 16, BS = NN ? 16 * PB : BN * 16, WS = 16 * (T::WN + 4);
+  __shared__ float smem[AS + BS > T::kWaves * WS ? AS + BS : T::kWaves * WS];
+  float* const As = smem;
+  float* const Bs = smem + AS;
   const int tid = threadIdx.x, lane = tid % 64, wave = tid / 64, c = lane % 16, g = lane / 16;
   const int ntiles = (N + BN - 1) / BN;
   const int m0 = (blockIdx.x / ntiles) * BM, n0 = (blockIdx.x % ntiles) * BN;
@@ -164,29 +168,41 @@ __global__ void __launch_bounds__(T::kThreads, (min_waves<T, Epi>())) gemm(int M
     __syncthreads();
   }
 
-  // The epilogue's per-column inputs (the bias), loaded once.
-  typename Epi::Col cols[FN];
-#pragma unroll
-  for (int j = 0; j < FN; ++j)
-    if (n0 + wn + 16 * j + 4 * g < N) epi.col(n0 + wn + 16 * j + 4 * g, cols[j]);
-
-  // acc[i][j][r]: out[m0 + wm + 16i + c][n0 + wn + 16j + 4g + r]. A row's
-  // inputs (the output accumulated onto, a saved pre-activation) are all
-  // loaded before any is used, so their latencies overlap rather than add.
+  // The epilogue, 16 output rows of the wave's at a time, through LDS: lane l
+  // reads back row l / (WN / 4) + p * (256 / WN) (p = 0, 1, ...) of them, four
+  // consecutive columns, so a store writes whole WN-float runs of 256 / WN rows
+  // rather than 64-byte pieces of 16 (the accumulators' layout). The epilogue
+  // loads its per-column inputs (the bias) once, and a row group's inputs (the
+  // output accumulated onto, a saved pre-activation) all before using any, so
+  // their latencies overlap rather than add.
+  constexpr int WN = T::WN, LPR = WN / 4, RPI = 64 / LPR, NP = 16 / RPI;
+  float* const ws = smem + wave * WS;
+  const int lc = (lane % LPR) * 4, lr = lane / LPR, col = n0 + wn + lc;
+  typename Epi::Col cl;
+  if (col < N) epi.col(col, cl);
 #pragma unroll
   for (int i = 0; i < FM; ++i) {
-    const int r = m0 + wm + 16 * i + c;
-    if (r >= M) continue;
-    typename Epi::Row in[FN];
+    // acc[i][j][q]: out[m0 + wm + 16i + c][n0 + wn + 16j + 4g + q]
 #pragma unroll
     for (int j = 0; j < FN; ++j)
-      if (n0 + wn + 16 * j + 4 * g < N) epi.row(r, n0 + wn + 16 * j + 4 * g, in[j]);
+      *reinterpret_cast<float4*>(ws + c * (WN + 4) + 16 * j + 4 * g) =
+          float4{acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]};
+    __builtin_amdgcn_wave_barrier();
+    float4 v4[NP];
+    typename Epi::Row in[NP];
 #pragma unroll
-    for (int j = 0; j < FN; ++j) {
-      const int col = n0 + wn + 16 * j + 4 * g;
-      if (col < N) {
-        const float v[4] = {acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]};
-        epi.run(r, col, v, cols[j], in[j]);
+    for (int p = 0; p < NP; ++p) {
+      const int r = m0 + wm + 16 * i + lr + p * RPI;
+      v4[p] = *reinterpret_cast<const float4*>(ws + (lr + p * RPI) * (WN + 4) + lc);
+      if (r < M && col < N) epi.row(r, col, in[p]);
+    }
+    __builtin_amdgcn_wave_barrier();
+#pragma unroll
+    for (int p = 0; p < NP; ++p) {
+      const int r = m0 + wm + 16 * i + lr + p * RPI;
+      if (r < M && col < N) {
+        const float v[4] = {v4[p].x, v4[p].y, v4[p].z, v4[p].w};
+        epi.run(r, col, v, cl, in[p]);
       }
     }
   }
