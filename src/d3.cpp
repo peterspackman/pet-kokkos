@@ -690,7 +690,6 @@ struct Kernels {
   // with more neighbours than the list holds walks the grid again for each j
   // instead (slow, but a fixed capacity holds for a recorded step).
   int atm_cap = 0;
-  using ScratchD2L1 = ScratchD2;
   static std::size_t atm_scratch(int cap) {
     return ScratchD2::shmem_size(cap, kNb) + ScratchI1::shmem_size(cap);
   }
@@ -876,9 +875,12 @@ struct Kernels {
 namespace d3detail {
 
 Kernels::FV1 to_float(const DV1& d, const char* label) {
-  Kernels::FV1 f(label, d.extent(0));
+  const int n = int(d.extent(0));
+  Kernels::FV1 f(Kokkos::view_alloc(std::string(label)), n);
+  auto out = f;
+  auto in = d;
   Kokkos::parallel_for(
-      "d3_to_float", RangePolicy(0, (int) d.extent(0)), KOKKOS_LAMBDA(int q) { f(q) = float(d(q)); });
+      "d3_to_float", RangePolicy(0, n), KOKKOS_LAMBDA(int q) { out(q) = float(in(q)); });
   return f;
 }
 
