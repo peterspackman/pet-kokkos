@@ -27,13 +27,18 @@
 //
 // A block stages its k tile of both operands in LDS (the next tile's global
 // loads in flight meanwhile), and each wave runs its own WM x WN of the block.
-// Timed on an MI250X GCD at the network's shapes (k = 256-1024): 33-36 TF/s,
-// level with rocBLAS's sgemm, against 42.7 TF/s for a loop of nothing but
-// these instructions and 43.8 for rocBLAS on 8192^3. Slower, all measured: an
-// LDS-free variant, each wave loading its own fragments from global memory
-// (10-20%); 32-wide k tiles and double-buffered LDS (fewer blocks a CU); a
-// persistent grid prefetching its next tile during the epilogue (a pet-mad-s
-// evaluation 139 -> 155 ms).
+// Timed on an MI250X GCD at the network's shapes (k = 256-1024): 32-37 TF/s
+// with a plain epilogue, level with rocBLAS's sgemm and hipBLASLt, and over a
+// layer's GEMMs within 4% of the best of all rocBLAS's Tensile solutions for
+// each shape, against 41.3 TF/s for a loop of nothing but these instructions
+// (tools/roofline.md has the table). Slower, all measured: an LDS-free
+// variant, each wave loading its own fragments from global memory (10-20%);
+// the weight alone loaded straight to registers, the activation's LDS tile
+// double-buffered (5-25%); 32-wide k tiles and double-buffered LDS (fewer
+// blocks a CU); two k tiles of register prefetch (1%); a persistent grid
+// prefetching its next tile during the epilogue (a pet-mad-s evaluation 139 ->
+// 155 ms), or spreading each tile's epilogue over the next tile's main loop
+// (two sets of accumulators: 2 waves a SIMD, 20-35%).
 #pragma once
 
 #include <hip/hip_runtime.h>
