@@ -192,6 +192,10 @@ struct LayerSaves {
   View2D cpre, concat, cph, out_edge;
   std::vector<View2D> tokens, qkv, node_new, tmp_center, eps, tmp_edge;
   bool keep_concat = false;
+  // Which of the two the forward kept. Not concat.data(): a rank with no edges
+  // keeps an empty concat, whose data is null, and its backward must still
+  // take the branch that joins the ranks' exchange.
+  bool out_edge_kept = false;
 };
 
 // What one GNN layer of the residual featurizer saves for its backward, per

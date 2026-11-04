@@ -58,6 +58,7 @@ void PetModel::ff_layer(const DeviceEdgeData& dev, const PackedEdges& pk, int L,
   // norm's input is kept as the last block's edge output alone (LayerSaves).
   const bool tok_in_place = save;
   const bool keep_out_edge = save && !remote && !sav->keep_concat;
+  if (save) sav->out_edge_kept = keep_out_edge;
   View2D tok0 = tok_in_place ? keep(sav->tokens[0], "tok", 0, T, D) : View2D();
 
   View2D cpre = ws_.tmp(E, D), et = tok_in_place ? View2D(tok0.data() + std::size_t(N) * D, E, D) : ws_.tmp(E, D);
@@ -224,7 +225,7 @@ void PetModel::ff_layer_bwd(const DeviceEdgeData& dev, const PackedEdges& pk, in
 
   // The combination MLP. input_edge_adj passes through to the layer's input
   // unchanged, and out_edge gathers its own concat slot and its reverse's.
-  if (!sav.concat.data()) {  // kept as out_edge: the norm and the gather in one pass
+  if (sav.out_edge_kept) {  // kept as out_edge: the norm and the gather in one pass
     Workspace::Scope scope(ws_);
     View2D cph_adj = ws_.tmp(E, 2 * D), cnorm_adj = ws_.tmp(E, 2 * D);
     linear_silu_bwd(cph_adj, input_edge_adj, mat("combination_mlps." + ls + ".2.weight"), sav.cph);
