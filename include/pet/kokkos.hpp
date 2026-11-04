@@ -243,6 +243,21 @@ KOKKOS_INLINE_FUNCTION T silu(T x) {
   return x * sigmoid(x);
 }
 
+// The SiLU and SwiGLU activations' sigmoid with the choice made by the caller
+// (fast_sigmoid() in pet/gemm.hpp): fast, on an AMD GPU in fp32, is the hardware
+// exp and reciprocal, 1 ulp each, against the IEEE division and the library exp
+// (about 20 instructions more a value). Elsewhere, and in fp64, the accurate one.
+// The forward and backward passes both take it from here, so the backward's
+// derivative is of the sigmoid the forward used.
+KOKKOS_INLINE_FUNCTION float sigmoid(float x, bool fast) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  if (fast) return __builtin_amdgcn_rcpf(1.0f + __expf(-x));
+#endif
+  (void) fast;
+  return sigmoid(x);
+}
+KOKKOS_INLINE_FUNCTION double sigmoid(double x, bool) { return sigmoid(x); }
+
 // The hardware exp/log for the attention softmax (~2^-22 relative error, which
 // softmax weights do not notice). In fp64 builds, the accurate ones.
 KOKKOS_INLINE_FUNCTION float fast_exp(float x) {

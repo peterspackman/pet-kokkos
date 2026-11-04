@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <random>
+#include <type_traits>
 
 #include "pet/gemm.hpp"
 #include "pet/kokkos.hpp"
@@ -119,4 +120,43 @@ TEST_CASE("BF16 and FP16 run on AMD matrix cores", "[gemm]") {
 #else
   SUCCEED("HIP only");
 #endif
+}
+
+TEST_CASE("the fast sigmoid is within a few ulp of the accurate one, and is the accurate one when off",
+          "[gemm]") {
+  // sigmoid(x, true) on the device against sigmoid in double on the host. On an
+  // AMD GPU in fp32 it is the hardware exp and reciprocal: the exp's argument
+  // -x log2(e) rounds to an ulp of up to |x| ulp in the exponent, so the
+  // relative error grows with |x| (all of it below sigmoid ~ e^x, x < -20, where
+  // the values are below 2e-9). Elsewhere the two are one function.
+  const int n = 160001;
+  Kokkos::View<float*, pet::MemSpace> f("fast", n), a("accurate", n);
+  Kokkos::parallel_for(
+      "sigmoid_test", pet::RangePolicy(0, n), KOKKOS_LAMBDA(int i) {
+        const float x = -40.0f + 80.0f * float(i) / float(n - 1);
+        f(i) = pet::sigmoid(x, true);
+        a(i) = pet::sigmoid(x, false);
+      });
+  const auto hf = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), f);
+  const auto ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), a);
+  const bool fast_here = std::is_same_v<pet::Net, float> && pet::default_fast_sigmoid();
+  double worst_fast = 0.0, worst_accurate = 0.0;
+  int differ = 0;
+  for (int i = 0; i < n; ++i) {
+    const float x = -40.0f + 80.0f * float(i) / float(n - 1);
+    const double ref = 1.0 / (1.0 + std::exp(-double(x)));
+    const double scale = 6e-8 * (4.0 + std::fabs(x));  // half an ulp per unit of |x|, and 2 ulp
+    worst_fast = std::max(worst_fast, std::fabs(hf(i) - ref) / ref / scale);
+    worst_accurate = std::max(worst_accurate, std::fabs(ha(i) - ref) / ref / (6e-8 * 4.0));
+    differ += hf(i) != ha(i);
+  }
+  INFO("fast: worst " << worst_fast << " of its bound; accurate: " << worst_accurate << "; " << differ
+                      << " of " << n << " values differ");
+  CHECK(worst_accurate <= 1.0);
+  if (!fast_here) {
+    CHECK(differ == 0);
+    return;
+  }
+  CHECK(worst_fast <= 1.0);
+  CHECK(differ > 0);  // it really is the other function
 }

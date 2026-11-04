@@ -54,31 +54,30 @@ void linear_bwd(View2D in_adj, View2D out_adj, const WeightRef& W, Net beta) {
 void linear_silu(View2D out, View2D pre, View2D in, const WeightRef& W, View1D b) {
   // The fused kernels run in the native and TF32 modes only.
   if (!W.split && silu_in_fused(out, pre, in, W.v, b)) return;
-  linear(out, in, W, b);
-  const int n = out.extent(0) * out.extent(1);
+  // The GEMM writes the pre-activation where it is kept, and the pass reads it
+  // from there: no copy of it to write.
   const bool save = pre.data() != nullptr;
-  if (quads(out) && (!save || quads(pre))) {
-    Net *o = out.data(), *p = pre.data();
+  const View2D z = save ? pre : out;
+  linear(z, in, W, b);
+  const int n = out.extent(0) * out.extent(1);
+  const bool fast = fast_sigmoid();
+  if (quads(out) && quads(z)) {
+    Net *o = out.data(), *p = z.data();
     Kokkos::parallel_for(
         "silu", RangePolicy(0, n / 4), KOKKOS_LAMBDA(int q) {
-          Quad z = quad(o, q);
-          if (save) quad(p, q) = z;
-          for (int j = 0; j < 4; ++j) z.v[j] = silu(z.v[j]);
-          quad(o, q) = z;
+          Quad v = quad(p, q);
+          for (int j = 0; j < 4; ++j) v.v[j] *= sigmoid(v.v[j], fast);
+          quad(o, q) = v;
         });
     return;
   }
-  View1D o(out.data(), n), p(pre.data(), save ? n : 0);
-  Kokkos::parallel_for(
-      "silu", RangePolicy(0, n), KOKKOS_LAMBDA(int i) {
-        const Net z = o(i);
-        if (save) p(i) = z;
-        o(i) = silu(z);
-      });
+  View1D o(out.data(), n), p(z.data(), n);
+  Kokkos::parallel_for("silu", RangePolicy(0, n), KOKKOS_LAMBDA(int i) { o(i) = p(i) * sigmoid(p(i), fast); });
 }
 
 void silu_bwd(View2D grad, View2D pre) {
   const int n = grad.extent(0) * grad.extent(1);
+  const bool fast = fast_sigmoid();
   if (quads(grad) && quads(pre)) {
     Net *g = grad.data(), *p = pre.data();
     Kokkos::parallel_for(
@@ -86,7 +85,7 @@ void silu_bwd(View2D grad, View2D pre) {
           const Quad x = quad(p, q);
           Quad y = quad(g, q);
           for (int j = 0; j < 4; ++j) {
-            const Net sg = sigmoid(x.v[j]);
+            const Net sg = sigmoid(x.v[j], fast);
             y.v[j] *= sg * (Net(1) + x.v[j] * (Net(1) - sg));
           }
           quad(g, q) = y;
@@ -96,7 +95,7 @@ void silu_bwd(View2D grad, View2D pre) {
   View1D g(grad.data(), n), p(pre.data(), n);
   Kokkos::parallel_for(
       "silu_bwd", RangePolicy(0, n), KOKKOS_LAMBDA(int i) {
-        const Net x = p(i), sg = sigmoid(x);
+        const Net x = p(i), sg = sigmoid(x, fast);
         g(i) *= sg * (Net(1) + x * (Net(1) - sg));
       });
 }
@@ -140,6 +139,110 @@ void norm_bwd(View2D in_adj, View2D out_adj, View2D in, View1D weight, bool ln, 
   });
 }
 
+// The same arithmetic as norm_rows_bwd -- the same reductions in the same lane
+// order, the same expression per value -- so the adjoints come out bit for bit
+// as the norm pass and the gather after it gave them.
+#if defined(PET_HIP_NORMS)
+namespace {
+// concat_norm_bwd a wavefront an edge, as hip_rows::Bwd: lane l holds columns
+// l + 64 j of the concat row, the first V/2 of them oe's own, the rest its
+// reverse's (D a multiple of 64).
+struct ConcatBwd {
+  View2D edge_adj, out_adj, oe, ie_adj;
+  View1D weight;
+  IView1D rev;
+  bool ln;
+  template <int V>
+  __device__ void row(int k, int l) const {
+    constexpr int H = V / 2;
+    const int D = 64 * H, r = rev(k);
+    const bool pair = r >= 0 && r != k && rev(r) == k;
+    if (pair && r < k) return;  // the partner's wavefront has both
+    auto load = [&](int q, Net* x, Net* ga) {
+      const int p = rev(q);
+#pragma unroll
+      for (int j = 0; j < V; ++j) {
+        const int d = l + 64 * j;
+        x[j] = j < H ? oe(q, d) : p >= 0 ? oe(p, d - D) : Net(0);
+        ga[j] = out_adj(q, d);
+      }
+    };
+    Net xk[V], gk[V], xr[V], gr[V];
+    load(k, xk, gk);
+    const hip_rows::Stats sk = hip_rows::bwd_stats<V>(xk, gk, weight, l, 2 * D, ln);
+    hip_rows::Stats sr = sk;
+    if (r >= 0) {
+      load(r, xr, gr);
+      sr = hip_rows::bwd_stats<V>(xr, gr, weight, l, 2 * D, ln);
+    }
+#pragma unroll
+    for (int j = 0; j < H; ++j) {
+      const int d = l + 64 * j;
+      const Net back = r >= 0 ? hip_rows::grad(sr, xr[H + j], gr[H + j], weight(D + d)) : Net(0);
+      edge_adj(k, d) = ie_adj(k, d) + hip_rows::grad(sk, xk[j], gk[j], weight(d)) + back;
+      if (pair) edge_adj(r, d) = ie_adj(r, d) + hip_rows::grad(sr, xr[j], gr[j], weight(d)) +
+                                 hip_rows::grad(sk, xk[H + j], gk[H + j], weight(D + d));
+    }
+  }
+};
+}  // namespace
+#endif
+
+void concat_norm_bwd(View2D edge_adj, View2D out_adj, View2D oe, View1D weight, bool ln, View2D ie_adj,
+                     IView1D rev) {
+  const int E = oe.extent(0), D = oe.extent(1), W = 2 * D;
+#if defined(PET_HIP_NORMS)
+  if (D % 64 == 0 && hip_rows::launch("norm_cat_bwd", E, W, ConcatBwd{edge_adj, out_adj, oe, ie_adj, weight, rev, ln}))
+    return;
+#endif
+  struct Stats {
+    Net mu, inv, mg, mgx;
+  };
+  Kokkos::parallel_for(
+      "norm_cat_bwd", norm_policy(E), KOKKOS_LAMBDA(const Team& t) {
+        const int k = t.league_rank() * kNormRows + t.team_rank();
+        if (k >= E) return;
+        const int r = rev(k);
+        const bool pair = r >= 0 && r != k && rev(r) == k;
+        if (pair && r < k) return;  // the partner's team has both
+        // Row q of the concat, read from oe.
+        auto x = [&](int q, int d) {
+          if (d < D) return oe(q, d);
+          const int p = rev(q);
+          return p >= 0 ? oe(p, d - D) : Net(0);
+        };
+        auto stats = [&](int q) {
+          Net mu = Net(0);
+          if (ln) {
+            Net s = Net(0);
+            Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(t, W), [&](int d, Net& a) { a += x(q, d); }, s);
+            mu = s / W;
+          }
+          Net sq = Net(0), sg = Net(0), sgx = Net(0);
+          Kokkos::parallel_reduce(
+              Kokkos::ThreadVectorRange(t, W),
+              [&](int d, Net& a, Net& b, Net& c) {
+                const Net xv = x(q, d) - mu, gw = out_adj(q, d) * weight(d);
+                a += xv * xv;
+                b += gw;
+                c += gw * xv;
+              },
+              sq, sg, sgx);
+          const Net inv = norm_inv(sq, W, ln);
+          return Stats{mu, inv, ln ? sg / W : Net(0), sgx * inv / W};
+        };
+        auto g = [&](const Stats& s, int q, int d) {
+          const Net a = Kokkos::fma(out_adj(q, d), weight(d), -s.mg), b = mul_rn(x(q, d) - s.mu, s.inv);
+          return mul_rn(s.inv, Kokkos::fma(-b, s.mgx, a));
+        };
+        const Stats sk = stats(k), sr = r >= 0 ? stats(r) : sk;
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, D), [&](int d) {
+          edge_adj(k, d) = ie_adj(k, d) + g(sk, k, d) + (r >= 0 ? g(sr, r, D + d) : Net(0));
+          if (pair) edge_adj(r, d) = ie_adj(r, d) + g(sr, r, d) + g(sk, k, D + d);
+        });
+      });
+}
+
 // ---- SwiGLU -------------------------------------------------------------------
 
 void swiglu_in(View2D pre, View2D h, View2D in, const WeightRef& w_in, View1D b_in) {
@@ -148,21 +251,22 @@ void swiglu_in(View2D pre, View2D h, View2D in, const WeightRef& w_in, View1D b_
   linear(pre, in, w_in, b_in);
   if (!h.data()) return;
   const int F = h.extent(1);
+  const bool fast = fast_sigmoid();
   if (quads(h) && quads(pre) && pre.size() == 2 * h.size()) {
     // Flat: h's value j is pre's 2j and 2j + 1 (pre rows are twice as wide).
     Net *hp = h.data(), *pp = pre.data();
     Kokkos::parallel_for(
         "swiglu", RangePolicy(0, int(h.size() / 4)), KOKKOS_LAMBDA(int q) {
           const Quad a = quad(pp, 2 * q), b = quad(pp, 2 * q + 1);
-          quad(hp, q) = {{a.v[0] * sigmoid(a.v[1]), a.v[2] * sigmoid(a.v[3]), b.v[0] * sigmoid(b.v[1]),
-                          b.v[2] * sigmoid(b.v[3])}};
+          quad(hp, q) = {{a.v[0] * sigmoid(a.v[1], fast), a.v[2] * sigmoid(a.v[3], fast), b.v[0] * sigmoid(b.v[1], fast),
+                          b.v[2] * sigmoid(b.v[3], fast)}};
         });
     return;
   }
   Kokkos::parallel_for(
       "swiglu", RangePolicy(0, h.extent(0) * F), KOKKOS_LAMBDA(int i) {
         const int r = i / F, c = i % F;
-        h(r, c) = pre(r, 2 * c) * sigmoid(pre(r, 2 * c + 1));
+        h(r, c) = pre(r, 2 * c) * sigmoid(pre(r, 2 * c + 1), fast);
       });
 }
 
@@ -176,11 +280,13 @@ void swiglu(Workspace& ws, View2D out, View2D in, const WeightRef& w_in, View1D 
 
 void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const WeightRef& w_in,
                 const WeightRef& w_out, Net beta) {
+  if (swiglu_bwd_deferred(ws, in_adj, out_adj, pre, w_in, w_out, beta)) return;
   const int R = out_adj.extent(0), F = pre.extent(1) / 2;
   Workspace::Scope scope(ws);
   View2D pre_adj = ws.tmp(R, 2 * F);
   if (w_out.split || !swiglu_bwd_fused(pre_adj, out_adj, w_out.v, pre)) {
     View2D h_adj = ws.tmp(R, F);
+    const bool fast = fast_sigmoid();
     linear_bwd(h_adj, out_adj, w_out, 0);
     if (quads(h_adj) && quads(pre) && quads(pre_adj)) {
       Net *ha = h_adj.data(), *pp = pre.data(), *pa = pre_adj.data();
@@ -191,7 +297,7 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
               const Quad x = quad(pp, 2 * q + half);
               Quad y;
               for (int j = 0; j < 2; ++j) {
-                const Net v = x.v[2 * j], sg = sigmoid(x.v[2 * j + 1]), gj = g.v[2 * half + j];
+                const Net v = x.v[2 * j], sg = sigmoid(x.v[2 * j + 1], fast), gj = g.v[2 * half + j];
                 y.v[2 * j] = gj * sg;
                 y.v[2 * j + 1] = gj * v * sg * (Net(1) - sg);
               }
@@ -202,7 +308,7 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
       Kokkos::parallel_for(
           "swiglu_bwd", RangePolicy(0, R * F), KOKKOS_LAMBDA(int i) {
             const int r = i / F, c = i % F;
-            const Net v = pre(r, 2 * c), sg = sigmoid(pre(r, 2 * c + 1));
+            const Net v = pre(r, 2 * c), sg = sigmoid(pre(r, 2 * c + 1), fast);
             pre_adj(r, 2 * c) = h_adj(r, c) * sg;
             pre_adj(r, 2 * c + 1) = h_adj(r, c) * v * sg * (Net(1) - sg);
           });
@@ -261,10 +367,16 @@ void compress_fwd(View2D out, View2D sav, const CompressFold& f, View2D input_ed
 // One warp per edge, several edges a block (as the norms: one 32-thread block an
 // edge leaves a large GPU at its limit of resident blocks): silu' in place,
 // then the four geometry sums as one reduction. Nothing is computed for the
-// species blocks, which are constants.
-void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, View2D ie_adj) {
+// species blocks, which are constants. Where the GEMM can apply silu' in its
+// epilogue (CUDA's fused kernels) it does, and this pass only reads g for the
+// sums: one write and one read of g fewer, the same arithmetic.
+void compress_bwd(View2D g, View2D et_adj, const WeightRef& w2, View2D pre, const CompressFold& f, View2D x4_adj,
+                  View2D ie_adj) {
   const int D = g.extent(1), E = g.extent(0);
+  const bool fused = !w2.split && silu_bwd_fused(g, et_adj, w2.v, pre);
+  if (!fused) linear_bwd(g, et_adj, w2, 0);
   auto wx = f.wx;
+  const bool fast = fast_sigmoid();
   Kokkos::parallel_for(
       "compress_bwd", norm_policy(E), KOKKOS_LAMBDA(const Team& t) {
         const int r = t.league_rank() * kNormRows + t.team_rank();
@@ -273,9 +385,11 @@ void compress_bwd(View2D g, View2D pre, const CompressFold& f, View2D x4_adj, Vi
         Kokkos::parallel_reduce(
             Kokkos::ThreadVectorRange(t, D),
             [&](int d, Net& s0, Net& s1, Net& s2, Net& s3) {
-              const Net x = pre(r, d), sg = sigmoid(x);
-              const Net gd = g(r, d) * sg * (Net(1) + x * (Net(1) - sg));
-              g(r, d) = gd;
+              Net gd = g(r, d);
+              if (!fused) {
+                const Net x = pre(r, d), sg = sigmoid(x, fast);
+                g(r, d) = gd = gd * sg * (Net(1) + x * (Net(1) - sg));
+              }
               s0 += gd * wx(d, 0), s1 += gd * wx(d, 1), s2 += gd * wx(d, 2), s3 += gd * wx(d, 3);
             },
             a0, a1, a2, a3);

@@ -9,10 +9,9 @@
 
 int main(int argc, char** argv) {
   Kokkos::initialize(argc, argv);
-  // The tests check the implementation against fp32 references, so they run the
-  // GEMMs in fp32 (the default anyway); test_gemm_modes measures the other
-  // modes. PET_GEMM still overrides.
-  if (!std::getenv("PET_GEMM")) pet::gemm_mode() = pet::GemmMode::Native;
+  // The tests check the implementation against fp32 references, in the default
+  // modes (Native); test_gemm_modes and
+  // the determinism tests measure the others. PET_GEMM and PET_ATTN override.
   int rc = 0;
   {
     rc = Catch::Session().run(argc, argv);

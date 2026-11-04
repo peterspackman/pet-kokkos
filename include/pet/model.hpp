@@ -184,10 +184,14 @@ struct DeviceOut {
 
 // What one GNN layer of the feedforward featurizer saves for its backward, one
 // entry per attention block where it is a vector. Workspace keys carry `tag`.
+// The combination norm's input [out_edge | out_edge of the reverse edge] is
+// kept as out_edge alone, the backward reading both halves from it, unless
+// keep_concat (the Hessian path reads concat) or the edges cross ranks.
 struct LayerSaves {
   std::string tag;
-  View2D cpre, concat, cph;
+  View2D cpre, concat, cph, out_edge;
   std::vector<View2D> tokens, qkv, node_new, tmp_center, eps, tmp_edge;
+  bool keep_concat = false;
 };
 
 // What one GNN layer of the residual featurizer saves for its backward, per
@@ -311,6 +315,15 @@ class PetModel {
   // Device bytes per edge slot with every save kept, from the shapes (as
   // recompute_tier estimates them), for sizing a batch before any is measured.
   std::size_t bytes_per_slot() const;
+  // The kernels index a tensor's elements with 32-bit ints. The most elements one
+  // copy of a pass's tensors holds for `centres` centres with up to `max_neighbors`
+  // neighbours and `edges` kept edges, over-estimated, never under; and how many
+  // tangent directions (each a copy, plus the primal) stay within int range.
+  // `chunk` is the tier's chunk of token rows (chunk_rows_), 0 for none. The pass
+  // checks (check_index_range) once it knows its tier, before any kernel.
+  std::size_t pass_elements(long centres, int max_neighbors, long edges, int chunk = 0) const;
+  int max_index_directions(long centres, int max_neighbors, long edges, int chunk = 0) const;
+  void check_index_range(long centres, int max_neighbors, long edges, int chunk) const;
   int peak_max_neighbors() const { return peak_max_neighbors_; }
 
   // Internal, and public only because nvcc refuses a KOKKOS_LAMBDA inside a
@@ -403,6 +416,7 @@ class PetModel {
   View2D ll_features(int N, const std::string& key);
   // How much of the forward the backward keeps (see Recompute), from the shapes.
   Recompute recompute_tier(int N, int S, int E) const;
+  int edge_chunk_rows(int E) const;
   std::vector<std::uintptr_t> graph_key(const DeviceEdgeData& dev, bool grad) const;
   void load_all(const Checkpoint& ckpt);
 
@@ -440,6 +454,9 @@ class PetModel {
   // Under Recompute::Auto, the cheapest tier allowed: raised when a pass runs
   // out of memory, so the evaluations after it do not try the same again.
   Recompute tier_floor_ = Recompute::Never;
+  // Under Wide and Layers, the edge rows a row-local section (the edge MLP and
+  // its rebuild) runs at once; 0 all of them. Set for one ff_pass.
+  int chunk_rows_ = 0;
 };
 
 }  // namespace pet

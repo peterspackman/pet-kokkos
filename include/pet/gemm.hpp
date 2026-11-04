@@ -16,6 +16,7 @@
 #include <map>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 
 #if defined(KOKKOS_ENABLE_CUDA)
 #include <cublasLt.h>
@@ -31,9 +32,20 @@
 
 namespace pet {
 
-// How the network's GEMMs run. Anything but Native changes the answer, so it is
-// off unless asked for:
-//   Native           fp32 (fp64 in an fp64 build), the reference
+// How the network's GEMMs run. Native and TF32x3 are fp32-accurate; anything
+// else changes the answer, so it is off unless asked for:
+//   Native           fp32 (fp64 in an fp64 build) on the CUDA cores (vector
+//                    units, a CPU's BLAS), the reference
+//   TF32x3           fp32-accurate products on TF32 tensor cores: each operand
+//                    split into two TF32 parts rounded to nearest, three of
+//                    their four products summed (CUTLASS's 3xTF32 main loop,
+//                    fused_gemm.cpp). Measured against fp64 on pet-mad-xs/s,
+//                    pet-omat-s and pet-mols-s, its forces are as accurate as
+//                    Native's, its energies within an fp32 ulp per atom. The
+//                    default on A100, H100/H200 and B200 (default_gemm_mode);
+//                    asked for elsewhere it runs on any CUDA device from
+//                    compute capability 8.0 with CUTLASS, and as Native on
+//                    one without
 //   TF32             fp32 in and out, the products on TF32 tensor cores
 //   BF16, FP16       operands converted to 16 bits, on tensor or matrix cores,
 //                    fp32 accumulation and output (gemm_lowp.cpp)
@@ -45,48 +57,94 @@ namespace pet {
 // need an fp32 network; TF32 and FP8 need CUDA (compute capability 8.0 and
 // 8.9); BF16 and FP16 run on CUDA (8.0, 7.0) or on AMD's matrix cores (rocBLAS).
 // A GEMM the narrow path does not take (a shape cuBLASLt refuses) runs fp32.
-// Process-global, from PET_GEMM=native|tf32|bf16|fp16|fp8|ozaki; unset,
-// Native. TF32's error -- 0.1-0.4 meV/atom on pet-mad and pet-mols, NVE energy
+// Process-global, from PET_GEMM=native|tf32|bf16|fp16|fp8|ozaki|3xtf32; unset,
+// default_gemm_mode(). TF32's error -- 0.1-0.4 meV/atom on pet-mad and pet-mols, NVE energy
 // drift unchanged -- is far below the models' own, and on an H200 it more than
 // halves an evaluation, the plain fp32 GEMMs leaving the tensor cores idle; but
 // it is asked for, never assumed (README, "Faster modes").
-enum class GemmMode { Native, TF32, BF16, FP16, FP8, Ozaki };
+enum class GemmMode { Native, TF32, BF16, FP16, FP8, Ozaki, TF32x3 };
 
 inline GemmMode parse_gemm_mode(const char* s) {
-  const char* names[] = {"native", "tf32", "bf16", "fp16", "fp8", "ozaki"};
-  for (int i = 0; i < 6; ++i)
+  const char* names[] = {"native", "tf32", "bf16", "fp16", "fp8", "ozaki", "3xtf32"};
+  for (int i = 0; i < 7; ++i)
     if (std::strcmp(s, names[i]) == 0) return GemmMode(i);
   throw std::runtime_error(std::string("pet: unknown PET_GEMM mode '") + s + "'");
 }
 
+namespace detail {
+// Whether this device's TF32 tensor cores run several times its fp32 CUDA
+// cores' rate, so 3xTF32 beats fp32 (A100, H100/H200, B200: compute capability
+// 8.0, 9.x, 10.x, in a CUDA build with an fp32 network). Not on the GeForce and
+// workstation parts, where TF32 runs at about the fp32 rate.
+bool fast_tf32_device();
+int x3_tile_count();
+}  // namespace detail
+
+// The default: Native, plain fp32. TF32x3 is as accurate on the forces and
+// faster where detail::fast_tf32_device(), but its energy error is up to 15x
+// fp32's, so it is asked for (PET_GEMM=3xtf32), never assumed.
+inline GemmMode default_gemm_mode() { return GemmMode::Native; }
+
 inline GemmMode& gemm_mode() {
   static GemmMode m = [] {
     const char* e = std::getenv("PET_GEMM");
-    return e && *e ? parse_gemm_mode(e) : GemmMode::Native;
+    return e && *e ? parse_gemm_mode(e) : default_gemm_mode();
   }();
   return m;
 }
 
 // How attention's own products (scores, weights times values, and their
-// adjoints) run: Native fp32, or TF32 on tensor cores (CUDA, compute capability
-// 8.0 and later; elsewhere Native). Separate from the GEMM mode, and like it off
-// unless asked for, so each can be measured on its own. Process-global, from
-// PET_ATTN=native|tf32.
-enum class AttentionMode { Native, TF32 };
+// adjoints) run: Native fp32 on the CUDA cores; TF32x3, the TF32 kernels with
+// each operand split into two TF32 parts and three products for one (as
+// GemmMode::TF32x3), as accurate as Native (CUDA, compute capability 8.0 and
+// later, else Native); or TF32 on tensor cores, which changes the answer and is
+// off unless asked for. Separate from the GEMM mode, so each can be measured on
+// its own. Process-global, from PET_ATTN=native|tf32|3xtf32; unset, Native
+// (TF32x3, like the GEMM mode's, is opt-in).
+enum class AttentionMode { Native, TF32, TF32x3 };
+
+inline AttentionMode default_attention_mode() { return AttentionMode::Native; }
+
+inline AttentionMode parse_attention_mode(const char* e) {
+  if (!e || !*e) return default_attention_mode();
+  if (std::strcmp(e, "native") == 0) return AttentionMode::Native;
+  if (std::strcmp(e, "tf32") == 0) return AttentionMode::TF32;
+  if (std::strcmp(e, "3xtf32") == 0) return AttentionMode::TF32x3;
+  throw std::runtime_error(std::string("pet: unknown PET_ATTN mode '") + e + "'");
+}
+inline const char* attention_mode_name(AttentionMode m) {
+  return m == AttentionMode::TF32 ? "tf32" : m == AttentionMode::TF32x3 ? "3xtf32" : "native";
+}
 
 inline AttentionMode& attention_mode() {
-  static AttentionMode m = [] {
-    const char* e = std::getenv("PET_ATTN");
-    if (!e || !*e || std::strcmp(e, "native") == 0) return AttentionMode::Native;
-    if (std::strcmp(e, "tf32") == 0) return AttentionMode::TF32;
-    throw std::runtime_error(std::string("pet: unknown PET_ATTN mode '") + e + "'");
-  }();
+  static AttentionMode m = parse_attention_mode(std::getenv("PET_ATTN"));
   return m;
+}
+
+// The SiLU and SwiGLU sigmoid: fast (the hardware exp and reciprocal, see
+// sigmoid(x, fast) in pet/kokkos.hpp) by default on AMD GPUs in fp32, where it
+// makes the fused SiLU and SwiGLU GEMMs 5-15% faster at a few ulp of the activation;
+// PET_FAST_SIGMOID=0 restores the accurate one (and its bits). Process-global;
+// no effect on other backends or in fp64.
+inline bool default_fast_sigmoid() {
+#if defined(KOKKOS_ENABLE_HIP)
+  return std::is_same_v<Net, float>;
+#else
+  return false;
+#endif
+}
+inline bool& fast_sigmoid() {
+  static bool f = [] {
+    const char* e = std::getenv("PET_FAST_SIGMOID");
+    if (!e || !*e) return default_fast_sigmoid();
+    return e[0] != '0' && default_fast_sigmoid();
+  }();
+  return f;
 }
 
 // The numeric modes, for keys that must tell a recorded graph from another.
 inline std::uintptr_t numerics_key() {
-  return std::uintptr_t(gemm_mode()) | std::uintptr_t(attention_mode()) << 8;
+  return std::uintptr_t(gemm_mode()) | std::uintptr_t(attention_mode()) << 8 | std::uintptr_t(fast_sigmoid()) << 16;
 }
 
 #if defined(KOKKOS_ENABLE_CUDA)
@@ -281,6 +339,9 @@ void set_cutlass_tile(int tile);
 // (-1: the fastest, timed per shape).
 int tf32_tile_count();
 void set_tf32_tile(int tile);
+// The same for the TF32x3 mode (set_tf32_tile pins its tile too): 0 where it
+// does not run on CUTLASS tensor cores (no CUTLASS, before compute capability 8.0).
+int x3_tile_count();
 // For tests: whether AttentionMode::TF32 runs on tensor cores here (CUDA,
 // compute capability 8.0 and later), not falling back to fp32.
 bool tf32_attention_available();

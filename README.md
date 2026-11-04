@@ -420,8 +420,10 @@ The virial is `W = V·σ`, a symmetric tensor in Voigt order
 
 ### Faster modes
 
-Everything runs in fp32 unless you ask otherwise: the answers are the
-reference's, to fp32 rounding, on every device. Two independent switches trade
+Everything runs fp32-accurate unless you ask otherwise: the answers are the
+reference's, to fp32 rounding, on every device. The one exception is on by
+default on AMD GPUs and changes the answer by less than fp32's own error (the
+fast sigmoid, below). Two independent switches trade
 a little accuracy for speed on tensor cores. Each is process-wide and can be
 set by environment variable, by `pet::Options`, or as a metatomic option:
 
@@ -429,6 +431,59 @@ set by environment variable, by `pet::Options`, or as a metatomic option:
 |---|---|---|---|
 | GEMM mode | the dense layers' matrix products | see below | `PET_GEMM` / `gemm` / `gemm` |
 | attention mode | attention's own products (scores, weights times values, their adjoints) | NVIDIA, compute capability 8.0+ | `PET_ATTN` / `attention` / `attention` |
+
+**The fast sigmoid (AMD GPUs, on by default).** On an AMD GPU in an fp32
+build, the sigmoid in SiLU and SwiGLU, forward and backward, is the hardware's
+exp and reciprocal (1 ulp each) instead of the library exp and the IEEE
+division. That saves about 20 instructions a value, which matters because the
+activations are computed in the matrix-core GEMMs' epilogues: the SiLU GEMMs
+run 5-15% faster. `PET_FAST_SIGMOID=0` turns it off and gives back the accurate
+sigmoid's answer to the bit. The forward and backward use the same sigmoid, so
+forces stay the gradient of the energy computed, and results still repeat to
+the bit and do not depend on the batch. Elsewhere (NVIDIA, CPUs, fp64 builds)
+the switch does nothing. Measured on an MI250X against the fp64 build, on
+pet-mad-s, pet-mad-xs and pet-omat-s, 648- and 5184-atom water and 1728-atom
+diamond:
+
+| | energy | largest force error | RMS force error |
+|---|---|---|---|
+| accurate sigmoid against fp64 | 1e-6-2.1e-4 meV/atom | 6.0-7.2e-3 meV/Å | 1.4-2.0e-3 meV/Å |
+| fast sigmoid against fp64 | 1.3e-5-2.0e-4 meV/atom | 5.6-7.6e-3 meV/Å | 1.4-2.0e-3 meV/Å |
+| fast against accurate | 1.3-3.0e-5 meV/atom | 2.1-3.5e-3 meV/Å | 0.5-1.0e-3 meV/Å |
+
+That is, the change is below fp32's own error. Over 1000 NVE steps (648-atom
+water, 0.5 fs) the energy drifts 0.093 meV/atom with it against 0.090 without
+(pet-mad-s), 0.112 against 0.105 (pet-mad-xs). On one MI250X GCD it takes
+pet-mad-s at 5184-atom water from 117.8 to 116.7 ms, pet-omat-s from 85.7 to
+85.0, pet-mad-xs from 28.2 to 27.6, and diamond 1728 with pet-mad-xs from
+12.9 to 12.7.
+
+**fp32 on tensor cores (3xTF32, A100, H100/H200 and B200).**
+On these GPUs the TF32 tensor cores run 7-8x the rate of the fp32 CUDA cores,
+so with `PET_GEMM=3xtf32 PET_ATTN=3xtf32` the GEMMs and
+attention's products run there with each fp32 operand split into two TF32
+parts, both rounded to nearest, and three of their four products summed in
+fp32. That carries fp32's 24 bits, not TF32's 11. Measured against the fp64
+build on pet-mad-xs, pet-mad-s, pet-omat-s and pet-mols-s, 648- and 5184-atom
+water and 1728-atom diamond:
+
+| against fp64 | energy | largest force error | RMS force error |
+|---|---|---|---|
+| fp32 on the CUDA cores (the default) | 1e-5-2.2e-4 meV/atom | 3.4-9.6e-3 meV/Å | 0.8-2.2e-3 meV/Å |
+| `PET_GEMM=3xtf32 PET_ATTN=3xtf32` | 5e-5-2.2e-3 meV/atom | 3.6-11e-3 meV/Å | 1.0-2.5e-3 meV/Å |
+| `PET_GEMM=tf32 PET_ATTN=tf32` | 0.02-0.31 meV/atom | 1.4-9.3 meV/Å | 0.3-2.1 meV/Å |
+
+The forces are as accurate as CUDA-core fp32's; the energy's error, though up
+to 15x fp32's, is under 2.2e-6 eV per atom, about 3e-7 of the energy per atom:
+an fp32 ulp or two. Results repeat to the bit, do not depend on the batch or
+on which tensor-core tile the GEMMs time fastest, but differ from the CUDA-core
+path's at rounding level. On an H200 it is 23-25% faster than the CUDA cores
+(the table below). (CUTLASS's own 3xTF32 truncates the big part, which biases
+the energy by up to 5e-3 meV/atom; rounding both parts to nearest removes most
+of that.)
+It is opt-in, not the default, for that energy error. On RTX and workstation
+GPUs TF32 runs at about the fp32 rate, so `3xtf32` runs there (from compute
+capability 8.0) but is not faster.
 
 **For MD or relaxations on a recent NVIDIA GPU** (A100, H100/H200, RTX 30xx/40xx),
 `PET_GEMM=tf32 PET_ATTN=tf32` is the one to use. Measured against fp32, on
@@ -444,11 +499,18 @@ pet-mad-xs, pet-mad-s, pet-mols-s and pet-omat-l, 648-atom water and
 all far below the models' own errors. With `PET_GEMM=tf32` the NVE energy drift
 is the same as fp32's; it has not yet been measured with `PET_ATTN=tf32`.
 
-What they buy, ms per evaluation with forces:
+What they buy, ms per evaluation with forces. On an H200 (best of 20):
+
+| | fp32, CUDA cores (default) | `3xtf32` | `PET_GEMM=tf32 PET_ATTN=tf32` |
+|---|---|---|---|
+| pet-mad-s, 5184-atom water | 87.9 | 65.7 | 30.7 |
+| pet-omat-s, 5184-atom water | 60.9 | 46.0 | 21.8 |
+| pet-mad-xs, 5184-atom water | 17.7 | 13.7 | 9.0 |
+
+and, measured earlier (2026-10, CUDA-core fp32 as the default then):
 
 | | fp32 | `PET_GEMM=tf32` | + `PET_ATTN=tf32` |
 |---|---|---|---|
-| H200, pet-mad-s, 5184-atom water | 92.0 | 37.6 | 33.2 |
 | H200, pet-mols-s, 5184-atom water | 98.5 | 51.0 | 39.0 |
 | H200, pet-omat-l, 2592-atom water | 439 | 138 | 116 |
 | RTX 4080 SUPER, pet-mad-s, 648-atom water | 24.5 | 17.3 | 16.7 |
@@ -456,7 +518,8 @@ What they buy, ms per evaluation with forces:
 
 An H200's fp32 runs on its CUDA cores, several times slower than its TF32
 tensor cores, so it gains the most; an RTX 4080's TF32 and fp32 peaks are about
-equal, and what it gains is from better-used kernels.
+equal, and what it gains is from better-used kernels (and there the default
+stays on the CUDA cores).
 
 The other GEMM modes:
 
@@ -526,16 +589,30 @@ stress uncertainties upet derives from ensembles are not implemented.
 ## Environment variables
 
 - `PET_MODEL_DIR`: extra directories to search for models.
-- `PET_GEMM`: `native` (default, fp32), `tf32`, `fp16`, `bf16`, `fp8` or
-  `ozaki`; see [Faster modes](#faster-modes).
-- `PET_ATTN`: `native` (default, fp32) or `tf32`; see
-  [Faster modes](#faster-modes).
+- `PET_GEMM`: `native` (fp32 on the CUDA cores or CPU), `3xtf32` (as
+  accurate on the forces, on tensor cores; faster on A100, H100/H200 and B200),
+  `tf32`, `fp16`, `bf16`, `fp8` or `ozaki`; see [Faster modes](#faster-modes).
+- `PET_ATTN`: `native` (the default), `3xtf32` or
+  `tf32`; see [Faster modes](#faster-modes).
+- `PET_TF32_TILE=0..7`: pin the CUTLASS tensor-core tile (`tf32` on Ampere and
+  Ada, `3xtf32`) instead of timing them; for tests and profiling.
 - `PET_CUTLASS=0`: use plain cuBLAS instead of the CUTLASS kernels.
-- `PET_GRAPHS=0`: don't use CUDA/HIP graphs (useful when profiling).
+- `PET_GRAPHS=0`: don't use CUDA graphs (useful when profiling). On HIP graphs
+  are off unless `PET_GRAPHS=1`: under ROCm 7.0.1 a replayed graph gave wrong
+  forces in a stepping loop, and they never made an MI250X evaluation faster.
+- `PET_MFMA_GEMM=0`: on AMD CDNA GPUs, use rocBLAS/hipBLASLt instead of the
+  built-in fp32 matrix-core GEMMs and their fused epilogues.
+- `PET_FAST_SIGMOID=0`: on AMD GPUs, use the accurate sigmoid in SiLU and
+  SwiGLU instead of the hardware exp and reciprocal (the default there; no
+  effect elsewhere); see [Faster modes](#faster-modes).
 - `PET_RECOMPUTE`: `never`, `wide` or `layers` forces how much of the forward
   the backward recomputes; by default the cheapest tier whose estimate fits the
   device (less a reserve of 10% or 1.5 GiB) is taken, and a pass that runs out
   of memory anyway is rerun a tier lower. `pet-eval --memory` shows the choice.
+  Under `wide` and `layers` the edge MLP (and, on AMD CDNA GPUs, the
+  attention) runs over chunks of rows, an eighth of the edges and at least 64k
+  rows, so its widest temporaries are a chunk's; the answer is the same to the
+  bit. `PET_EDGE_CHUNK=rows` sets the chunk, for tests.
 - `PET_DEVICE_SEARCH`: `auto`, `cells` or `brute`, for the GPU neighbour search.
 - `PET_NEIGHBORS=builtin`: use the built-in host neighbour search instead of
   vesin.

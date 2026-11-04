@@ -123,9 +123,9 @@ class Calculator {
     }
     if (gemm) pet::gemm_mode() = pet::parse_gemm_mode(gemm->c_str());
     if (attention) {
-      if (*attention != "native" && *attention != "tf32")
-        throw std::invalid_argument("pet_kokkos: attention must be native or tf32");
-      pet::attention_mode() = *attention == "tf32" ? pet::AttentionMode::TF32 : pet::AttentionMode::Native;
+      if (*attention != "native" && *attention != "tf32" && *attention != "3xtf32")
+        throw std::invalid_argument("pet_kokkos: attention must be native, tf32 or 3xtf32");
+      pet::attention_mode() = pet::parse_attention_mode(attention->c_str());
     }
     calc_ = std::make_unique<pet::Calculator>(model, o);
   }
@@ -219,9 +219,9 @@ NB_MODULE(_core, m) {
   m.def(
       "precision_modes",
       [] {
-        const char* gemm[] = {"native", "tf32", "bf16", "fp16", "fp8", "ozaki"};
+        const char* gemm[] = {"native", "tf32", "bf16", "fp16", "fp8", "ozaki", "3xtf32"};
         return std::make_pair(std::string(gemm[int(pet::gemm_mode())]),
-                              std::string(pet::attention_mode() == pet::AttentionMode::TF32 ? "tf32" : "native"));
+                              std::string(pet::attention_mode_name(pet::attention_mode())));
       },
       "The process-wide (gemm, attention) modes: native unless set by a Calculator or PET_GEMM / PET_ATTN.");
   m.def(

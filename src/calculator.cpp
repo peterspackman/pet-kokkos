@@ -220,14 +220,23 @@ struct Calculator::Impl {
       : ckpt(adjusted(Checkpoint(json_path, weights_path), o)), model(ckpt), opts(o) {
     for (int z = 0; z < (int) ckpt.species_to_index.size(); ++z)
       if (ckpt.species_to_index[z] >= 0) atomic_types.push_back(z);
-    if (o.gemm != GemmMode::Native) gemm_mode() = o.gemm;
-    if (o.attention != AttentionMode::Native) attention_mode() = o.attention;
+    if (o.gemm) gemm_mode() = *o.gemm;
+    if (o.attention) attention_mode() = *o.attention;
     if (const char* f = std::getenv("PET_MD_FIXED")) opts.md_fixed_shapes = f[0] == '1';
     std::size_t free_b = 0, total_b = 0;
     device_memory(o, free_b, total_b);
     // PET_GRAPHS=0 is for profilers that fence around every kernel.
     const char* g = std::getenv("PET_GRAPHS");
+#if defined(KOKKOS_ENABLE_HIP)
+    // On HIP only when asked for (PET_GRAPHS=1): under ROCm 7.0.1 on an MI250X a
+    // stepping engine's replayed graph gave garbage forces from its second
+    // replay on (tests [edges]; eager runs are right), and graphs never made an
+    // evaluation there faster (pet-mad-s, 5184 water 147.7 ms either way;
+    // pet-mad-xs, 648 water 6.3 ms).
+    model.set_graphs(o.graphs && g && g[0] == '1');
+#else
     model.set_graphs(o.graphs && !(g && g[0] == '0'));
+#endif
     model.set_non_conservative(o.non_conservative);
     model.set_uncertainty(o.uncertainty);
     // PET_RECOMPUTE=never|wide|layers|auto overrides the option, to compare tiers.
@@ -380,6 +389,13 @@ Calculator::Response Calculator::response(const System& system, int K, const std
   // directions, and later calls start from there.
   int chunk = std::max(1, std::min(std::max(K, 1), int(0.5 * double(total_b) / per_dir)));
   if (I.resp_chunk_cap > 0) chunk = std::min(chunk, I.resp_chunk_cap);
+  // and as many as the kernels' 32-bit element indices reach
+  const int by_index = I.model.max_index_directions(N, ed.max_neighbors, R);
+  if (by_index < 1 && K > 0)
+    throw std::runtime_error("pet: " + std::to_string(N) +
+                             " atoms are too many for a Hessian-vector product on one device (tensors past 2^31 "
+                             "elements)");
+  chunk = std::max(1, std::min(chunk, by_index));
 
   Response r;
   r.K = K;

@@ -72,6 +72,7 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
 
   const PackedEdges pk = pack_edges(dev);
   const int E = pk.E;
+  check_index_range(N, dev.max_neighbors, E, 0);
   auto off = pk.off, rev = pk.reverse;
   const Tokens tk{off, N, dev.edge_capacity};
   const int T = N + E;
@@ -224,17 +225,20 @@ DeviceOut PetModel::residual_pass(const DeviceEdgeData& dev, bool grad) {
     // tokens = [node_L ; et]: only et depends on the geometry. input_edge feeds
     // compress.0 and, through message passing, carries half of ie_adj. The two
     // buffers alternate by layer: this layer's is written while the last's is read.
-    View2D et_adj = ws_.n2("re_et_adj", E, D), cpre_adj = ws_.n2("re_cpre_adj", E, D);
+    // et's adjoint is the tokens' edge rows, read where they are unless a
+    // capacity's dead rows must read as zeros.
+    const bool dead = tk.dead;
+    View2D et_adj = dead ? ws_.n2("re_et_adj", E, D) : View2D(tokens_adj.data() + std::size_t(N) * D, E, D);
+    View2D cpre_adj = ws_.n2("re_cpre_adj", E, D);
     View2D ie_next = ws_.n2("re_ie_" + std::to_string(L % 2), E, D);
     const bool has_msg = L + 1 < G;
     Kokkos::parallel_for(
         "reb_et", RangePolicy(0, E * D), KOKKOS_LAMBDA(int i) {
           const int k = i / D, d = i % D;
-          et_adj(k, d) = k < off(N) ? tokens_adj(N + k, d) : Net(0);  // past: a capacity's dead rows
+          if (dead) et_adj(k, d) = k < off(N) ? tokens_adj(N + k, d) : Net(0);  // past: a capacity's dead rows
           ie_next(k, d) = has_msg ? Net(0.5) * ie_adj(k, d) : Net(0);
         });
-    linear_bwd(cpre_adj, et_adj, mat(g + ".compress.2.weight"), 0);
-    compress_bwd(cpre_adj, s.cpre, compress_fold(L), x4_adj, ie_next);
+    compress_bwd(cpre_adj, et_adj, mat(g + ".compress.2.weight"), s.cpre, compress_fold(L), x4_adj, ie_next);
     ie_adj = ie_next;
   }
 

@@ -3,6 +3,7 @@
 // energy: neighbour slots follow the edge list, force gradients are gathered per
 // atom, and per-structure sums are ordered. The model is compared against
 // itself, with TF32 off.
+#include <cstdlib>
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -46,8 +47,9 @@ TEST_CASE("repeated evaluation is bit-identical", "[model][determinism]") {
       continue;
     }
     pet::Calculator calc(found->first, found->second);
-    // The process-global setting, which PET_GEMM could have changed.
-    REQUIRE(pet::gemm_mode() == pet::GemmMode::Native);
+    // The process-global setting, which PET_GEMM could have changed: an
+    // fp32-accurate one.
+    REQUIRE((pet::gemm_mode() == pet::GemmMode::Native || pet::gemm_mode() == pet::GemmMode::TF32x3));
 
     for (const auto& path : golden_paths(model)) {
       const Golden g = load_golden(path);
@@ -220,6 +222,14 @@ TEST_CASE("recomputing activations in the backward changes nothing", "[model][de
         const pet::Results ref = keep->compute(g.system, true);
         require_bit_identical(ref, wide->compute(g.system, true), "Recompute::Wide");
         require_bit_identical(ref, layers->compute(g.system, true), "Recompute::Layers");
+        // Wide and Layers run the edge MLP a chunk of rows at a time where the
+        // GEMMs are batch invariant; chunks of a few rows here, the same bits.
+        if (pet::batch_invariant_gemms()) {
+          setenv("PET_EDGE_CHUNK", "37", 1);
+          require_bit_identical(ref, wide->compute(g.system, true), "Recompute::Wide, chunked");
+          require_bit_identical(ref, layers->compute(g.system, true), "Recompute::Layers, chunked");
+          unsetenv("PET_EDGE_CHUNK");
+        }
       }
     }
   }
@@ -417,9 +427,10 @@ TEST_CASE("the TF32 mode's tensor-core tile does not change the answer", "[model
     return;
   }
   struct Restore {
+    pet::GemmMode gemm = pet::gemm_mode();
     ~Restore() {
       pet::detail::set_tf32_tile(-1);
-      pet::gemm_mode() = pet::GemmMode::Native;
+      pet::gemm_mode() = gemm;
     }
   } restore;
   pet::gemm_mode() = pet::GemmMode::TF32;
@@ -448,6 +459,71 @@ TEST_CASE("the TF32 mode's tensor-core tile does not change the answer", "[model
   }
 }
 
+TEST_CASE("the 3xTF32 modes keep fp32's accuracy, repeat themselves and keep batch invariance",
+          "[model][determinism]") {
+  // GemmMode::TF32x3 and AttentionMode::TF32x3 split each operand into two TF32
+  // parts and sum three products: about fp32's 24 bits, where TF32 keeps 11
+  // (0.1-0.4 meV/atom from fp32). Their distance from fp32 must be fp32
+  // rounding's, far below TF32's; every tile walks k in one order, and each
+  // (atom, head) is one block, so the bits repeat and do not depend on the
+  // batch or the tile.
+  const int tiles = pet::detail::x3_tile_count();
+  if (tiles == 0 || !pet::detail::tf32_attention_available()) {
+    WARN("the 3xTF32 modes do not run on CUTLASS tensor cores here; skipping");
+    return;
+  }
+  struct Restore {
+    pet::GemmMode gemm = pet::gemm_mode();
+    pet::AttentionMode attn = pet::attention_mode();
+    ~Restore() {
+      pet::detail::set_tf32_tile(-1);
+      pet::gemm_mode() = gemm;
+      pet::attention_mode() = attn;
+    }
+  } restore;
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    pet::Options opts;
+    opts.graphs = false;
+    const pet::Calculator calc(found->first, found->second, opts);
+    const std::vector<pet::System> batch = rattled_batch(model);
+    if (batch.empty()) continue;
+    DYNAMIC_SECTION(model) {
+      pet::gemm_mode() = pet::GemmMode::Native;
+      pet::attention_mode() = pet::AttentionMode::Native;
+      const Device fp32 = device_eval(calc, batch);
+      pet::gemm_mode() = pet::GemmMode::TF32x3;
+      pet::attention_mode() = pet::AttentionMode::TF32x3;
+      REQUIRE(pet::batch_invariant_gemms());
+      const Device a = device_eval(calc, batch), b = device_eval(calc, batch);
+      for (std::size_t s = 0; s < batch.size(); ++s) {
+        INFO("structure " << s);
+        REQUIRE(a.energy[s] == b.energy[s]);
+        REQUIRE(a.forces[s] == b.forces[s]);
+        const double de = std::abs(a.energy[s] - fp32.energy[s]) / batch[s].n_atoms;
+        double df = 0.0;
+        for (std::size_t i = 0; i < a.forces[s].size(); ++i) df = worst(df, std::abs(a.forces[s][i] - fp32.forces[s][i]));
+        INFO("|dE| = " << 1e3 * de << " meV/atom, max |dF| = " << 1e3 * df << " meV/A from fp32");
+        CHECK(de <= 1e-5);
+        CHECK(df <= 1e-3);
+        require_same_structure(a, int(s), device_eval(calc, {batch[s]}), "alone");
+      }
+      for (int tile = 0; tile < tiles; ++tile) {
+        INFO("tile " << tile);
+        pet::detail::set_tf32_tile(tile);
+        const Device pinned = device_eval(calc, batch);
+        for (std::size_t s = 0; s < batch.size(); ++s) {
+          REQUIRE(pinned.energy[s] == a.energy[s]);
+          REQUIRE(pinned.forces[s] == a.forces[s]);
+          REQUIRE(pinned.virial[s] == a.virial[s]);
+        }
+      }
+      pet::detail::set_tf32_tile(-1);
+    }
+  }
+}
+
 TEST_CASE("TF32 attention repeats itself, keeps batch invariance, and stays near fp32", "[model][determinism]") {
   // AttentionMode::TF32 rounds attention's operands to TF32 (10-bit mantissa)
   // on tensor cores. Each (atom, head) is one block in a fixed order, so it
@@ -459,7 +535,8 @@ TEST_CASE("TF32 attention repeats itself, keeps batch invariance, and stays near
     return;
   }
   struct Restore {
-    ~Restore() { pet::attention_mode() = pet::AttentionMode::Native; }
+    pet::AttentionMode attn = pet::attention_mode();
+    ~Restore() { pet::attention_mode() = attn; }
   } restore;
   for (const auto& model : golden_models()) {
     const auto found = find_model(model);
@@ -485,6 +562,61 @@ TEST_CASE("TF32 attention repeats itself, keeps batch invariance, and stays near
         CHECK(de <= 1e-3);
         CHECK(df <= 0.03);
         if (pet::batch_invariant_gemms()) require_same_structure(a, int(s), device_eval(calc, {batch[s]}), "alone");
+      }
+    }
+  }
+}
+
+TEST_CASE("PET_FAST_SIGMOID=0 gives the accurate sigmoid's bits back; the fast one stays close",
+          "[model][determinism]") {
+  // The switch is read at each launch, so turning it off mid-process restores
+  // the accurate sigmoid's answer to the bit (the answer of a build without the
+  // fast one). Off HIP, or in fp64, the two are one function.
+  if (quick()) SKIP("PET_TEST_QUICK is set");
+  struct Restore {
+    bool saved = pet::fast_sigmoid();
+    ~Restore() { pet::fast_sigmoid() = saved; }
+  } restore;
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    pet::Options opts;
+    opts.graphs = false;
+    const pet::Calculator calc(found->first, found->second, opts);
+    const std::vector<pet::System> batch = rattled_batch(model);
+    if (batch.empty()) continue;
+    DYNAMIC_SECTION(model) {
+      pet::fast_sigmoid() = false;
+      const Device accurate = device_eval(calc, batch);
+      pet::fast_sigmoid() = true;
+      const Device fast = device_eval(calc, batch);
+      pet::fast_sigmoid() = false;
+      const Device again = device_eval(calc, batch);
+      pet::fast_sigmoid() = true;
+      const Device fast_again = device_eval(calc, batch);
+      const bool differs = pet::default_fast_sigmoid();
+      for (std::size_t b = 0; b < batch.size(); ++b) {
+        INFO("structure " << b);
+        REQUIRE(again.energy[b] == accurate.energy[b]);
+        REQUIRE(again.forces[b] == accurate.forces[b]);
+        REQUIRE(fast_again.energy[b] == fast.energy[b]);
+        REQUIRE(fast_again.forces[b] == fast.forces[b]);
+        if (!differs) {
+          REQUIRE(fast.energy[b] == accurate.energy[b]);
+          REQUIRE(fast.forces[b] == accurate.forces[b]);
+          continue;
+        }
+        // Measured on MI250X, pet-mad-s/-xs and pet-omat-s at water 648-5184
+        // and diamond 1728 (README, Faster modes): |dE| <= 3e-5 meV/atom and
+        // max|dF| <= 3.5e-3 meV/A against the accurate sigmoid, below fp32's
+        // own error against fp64; the bounds here are 30x those.
+        const double n = batch[b].n_atoms, de = std::abs(fast.energy[b] - accurate.energy[b]) / n;
+        double df = 0.0;
+        for (std::size_t i = 0; i < fast.forces[b].size(); ++i)
+          df = worst(df, std::abs(fast.forces[b][i] - accurate.forces[b][i]));
+        INFO("|dE| " << de << " eV/atom, max|dF| " << df << " eV/A");
+        CHECK(de <= 1e-6);
+        CHECK(df <= 1e-4);
       }
     }
   }

@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <stdexcept>
 
@@ -805,6 +807,15 @@ BatchResult PetModel::energy_forces_batch(const DeviceEdgeData& dev, bool comput
   return out;
 }
 
+// The rows of a chunk under Wide and Layers (chunk_rows_): an eighth of the
+// edges, and at least 64k, where the GEMMs still run at full speed.
+// PET_EDGE_CHUNK=rows overrides it, to test the chunking on small structures.
+int PetModel::edge_chunk_rows(int E) const {
+  if (const char* c = std::getenv("PET_EDGE_CHUNK"))
+    if (std::atoi(c) > 0) return std::atoi(c);
+  return std::max(65536, (E + 7) / 8);
+}
+
 Recompute PetModel::recompute_tier(int N, int S, int E) const {
   // Estimated from the shapes: what one layer saves, how much of that is the two
   // widest activations (qkv and the edge MLP's pre-activation), and the working
@@ -825,10 +836,19 @@ Recompute PetModel::recompute_tier(int N, int S, int E) const {
   // the tmp pool's slack; measured on pet-mad-xs and -s), so they are scaled to
   // predict it.
   const std::size_t inputs = sizeof(Net) * G * ((res ? 0 : std::size_t(N) * h_.d_node) + NE * D);
+  // Under Wide and Layers the edge MLP's two wide temporaries are a chunk's (and
+  // on AMD's matrix cores so are the attention's qkv and its adjoint, which the
+  // terms below never counted separately: they share the work term's room).
+  const std::size_t chunk = res || !batch_invariant_gemms() ? NE : std::min<std::size_t>(NE, edge_chunk_rows(E));
+  const std::size_t work_chunked = work - sizeof(Net) * (NE - chunk) * 2 * ew;
+  // The pool came out at 0.86-0.96 of these for Wide and 0.99-1.07 for Layers
+  // with the edge MLP and attention chunked (MI250X GCD, pet-mad-s, -xs,
+  // pet-omat-s, 8k-166k atoms), so Layers takes a little more.
   auto need = [&](Recompute r) {
-    const std::size_t terms =
-        work + (r == Recompute::Never ? G * layer : r == Recompute::Wide ? G * (layer - wide) : inputs + layer - wide);
-    return terms + terms / 3;
+    const std::size_t terms = r == Recompute::Never ? work + G * layer
+                              : r == Recompute::Wide ? work_chunked + G * (layer - wide)
+                                                     : work_chunked + inputs + layer - wide;
+    return terms + (r == Recompute::Layers ? terms / 100 * 45 : terms / 3);
   };
   auto fits = [&](Recompute r) { return mem_budget_ == 0 || need(r) <= mem_budget_; };
   const Recompute r = recompute_ != Recompute::Auto                    ? recompute_
@@ -866,6 +886,36 @@ std::string PetModel::memory_report() const {
 #endif
   if (total_b) std::snprintf(line, sizeof line, "\n  device %.2f GiB free of %.2f GiB", free_b / GiB, total_b / GiB), r += line;
   return r + "\n";
+}
+
+std::size_t PetModel::pass_elements(long centres, int max_neighbors, long edges, int chunk) const {
+  const std::size_t C = std::max(0L, centres), S = std::size_t(std::max(0, max_neighbors)) + 1;
+  const std::size_t rows = std::max(std::size_t(std::max(0L, edges)), C * (S - 1)) + C;
+  // Whole: the token and edge rows at the concat's and the readout heads'
+  // widths, the atoms' at the node width (doubled where conditioning concats),
+  // and attention's per-(token, head) statistics.
+  const std::size_t narrow = std::max(2 * h_.d_pet, h_.d_head);
+  // The widest two -- the edge MLP's pre-activation, attention's qkv -- are a
+  // chunk's under Wide and Layers (a run of whole atoms: up to S rows over), the
+  // qkv only where attention_chunks().
+  const std::size_t part = chunk > 0 ? std::min(rows, std::size_t(chunk) + S) : rows;
+  const std::size_t qkv_rows = attention_chunks(h_.head_dim) ? part : rows;
+  const std::size_t ffw = std::max<std::size_t>(2 * h_.d_feedforward, ffn_pre_width("gnn_layers.0.trans.layers.0.mlp"));
+  return std::max({rows * narrow, C * 2 * h_.d_node, part * ffw, qkv_rows * 3 * h_.d_pet, C * h_.num_heads * S * 2});
+}
+
+int PetModel::max_index_directions(long centres, int max_neighbors, long edges, int chunk) const {
+  const std::size_t per = std::max<std::size_t>(1, pass_elements(centres, max_neighbors, edges, chunk));
+  return int(std::min<std::size_t>(std::numeric_limits<int>::max(), std::numeric_limits<int>::max() / per)) - 1;
+}
+
+void PetModel::check_index_range(long centres, int max_neighbors, long edges, int chunk) const {
+  if (max_index_directions(centres, max_neighbors, edges, chunk) >= 0) return;
+  throw std::runtime_error("pet: " + std::to_string(centres) + " atoms with up to " + std::to_string(max_neighbors) +
+                           " neighbours make tensors of up to " +
+                           std::to_string(pass_elements(centres, max_neighbors, edges, chunk)) +
+                           " elements, past the 2^31 the kernels index: too many atoms for one device. Split the "
+                           "structure across more devices (in LAMMPS, more GPUs or ranks).");
 }
 
 std::size_t PetModel::bytes_per_slot() const {
