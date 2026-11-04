@@ -3,6 +3,7 @@
 #
 #   lmp -in in.pet -var data diamond_216 -var model pet-mad-s -var elements C
 #   lmp -in in.pet -var data water_648 -var model pet-mad-s -var elements "H O"
+#   lmp -in in.pet -var data water_648 -var model pet-mad-xs -var elements "H O" -var extra "d3 pbesol"
 
 variable        nsteps index 100
 
@@ -13,7 +14,8 @@ boundary        p p p
 read_data       ${data}.data
 
 variable        mode index images
-pair_style      pet ${model} mode ${mode}
+variable        extra index ""
+pair_style      pet ${model} mode ${mode} ${extra}
 pair_coeff      * * ${elements}
 
 # The per-atom virial (folded from pet-kokkos's edge gradients) must sum to the

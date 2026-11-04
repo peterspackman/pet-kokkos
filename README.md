@@ -42,6 +42,9 @@ to provide `pair_style pet` and `pet/kk`. Engines that load
 [metatomic](https://github.com/metatensor/metatomic) plugins can use the plugin
 in [`metatomic/`](#metatomic-plugin).
 
+Grimme's D3 dispersion correction can be added to any model's results, or
+evaluated on its own, on the device ([D3 dispersion](#d3-dispersion)).
+
 ## Performance
 
 One evaluation with forces, neighbour list included, in fp32 (the default; see
@@ -586,6 +589,168 @@ for pet-mad-s), so pet-kokkos applies its inverse in double precision; the
 results match metatomic's float64 evaluation to about 1e-6. The force and
 stress uncertainties upet derives from ensembles are not implemented.
 
+## D3 dispersion
+
+A model trained on a DFT functional without dispersion misses the van der
+Waals attraction that functional misses. pet-kokkos can add Grimme's DFT-D3
+correction to every result (energy, per-atom energy, forces, virial), computed
+on the device alongside the model:
+
+```bash
+pet-eval pet-mad-s water.xyz -f --d3 pbesol             # rational (BJ) damping
+pet-eval pet-mad-s water.xyz -f --d3 pbesol --d3-atm    # with the three-body term
+pet-eval none water.xyz -f --d3 pbesol                  # D3 alone
+```
+
+```cpp
+pet::Options opts;
+opts.d3 = pet::D3Settings::functional("pbesol");        // or pet::D3 on its own
+pet::Calculator calc("pet-mad-s", opts);
+```
+
+```python
+calc = pet_kokkos.Calculator("pet-mad-s", d3="pbesol")
+d3 = pet_kokkos.D3("pbesol", atm=True)                  # alone: d3.compute(numbers, positions, cell, pbc)
+```
+
+In LAMMPS: `pair_style pet pet-mad-s d3 pbesol` (see [lammps/](lammps/README.md)).
+
+**Which functional** is a question about the model's training data, and
+pet-kokkos leaves it to you: D3 is off unless asked for. Use the functional the
+reference energies were computed with: PET-MAD was trained on PBEsol, so
+`pbesol`; a model trained on PBE data, `pbe`. A model trained on a functional
+that already includes dispersion must not get D3 on top: the OMol models'
+ωB97M-V has VV10, a nonlocal dispersion term.
+
+**Damping**: rational (Becke-Johnson, `bj`, the default) or the original zero
+damping (`zero`), with s-dftd3's published parameters for about 160 functionals
+(`pet-eval --d3-list`, `pet_kokkos.d3_functionals()`), or your own
+(`--d3-params s6=..,s8=..,a1=..,a2=..`, `pet::D3Params`; a2 in bohr as
+published on the command line and in Python). The Axilrod-Teller-Muto
+three-body term is off unless asked for (`--d3-atm`: s9 = 1). The reference C6
+table and parameters are tad-dftd3's (Apache-2.0; see [NOTICE](NOTICE)).
+
+**Accuracy against s-dftd3.** In double, at s-dftd3's cutoffs (`--d3-reference`: pairs to
+95 bohr, CN and three-body to 40 bohr), energies agree with s-dftd3 1.7.0 to
+1e-10 eV, forces to 1e-10 eV/Å and virials to 2e-9 eV, for both dampings with
+and without the three-body term, on molecules, small periodic cells (one atom of
+Cu or W, which takes tens of thousands of images) and a slab
+(`tests/test_d3.cpp`, references by `tools/make_d3_golden.py`).
+
+**Cutoffs.** Those cutoffs are slow, so by default the pair sum stops at 12 Å,
+the coordination numbers at 8 Å and the three-body sum at 8 Å, each through a
+smooth taper 2 Å wide (C3: energy and forces stay continuous in MD). The pair
+energy falls off as 1/r^6, but its sum beyond a cutoff only as 1/r^3, and at
+12 Å what is left is too much: 0.5 meV/atom in water and 15-28 meV/atom in a
+transition metal, with a matching error in the pressure. So for a 3D-periodic
+structure the default adds the sum beyond the taper back as a uniform continuum
+(g(r) = 1), the tail correction MD codes use for Lennard-Jones: its energy, its
+pressure, and its forces through the coordination numbers. It costs O(N) (the
+C6 sum factorises over each element's reference weights). Errors against a
+converged sum (pairs to 106 Å, PBE, BJ), per atom, with the forces' largest
+difference and the pressure's:
+
+| | E(D3) | default (12 Å, tail) | no tail | 15 Å, tail | s-dftd3's cutoffs |
+|---|---|---|---|---|---|
+| water, 648 atoms | −33.4 meV | −0.008 meV, 0.02 meV/Å, 0.0002 GPa | +0.47 meV, 0.008 GPa | −0.007 meV | +0.005 meV |
+| CO2 crystal, 96 | −69.5 meV | −0.03 meV, 0.03 meV/Å, 0.001 GPa | +1.1 meV, 0.011 GPa | −0.009 meV | +0.012 meV |
+| diamond, 64 | −191 meV | −0.01 meV, 0.02 meV/Å, 0.003 GPa | +3.1 meV, 0.085 GPa | +0.001 meV | +0.03 meV |
+| Cu fcc, 108 | −583 meV | +0.12 meV, 0.18 meV/Å, 0.03 GPa | +15.4 meV, 0.17 GPa | −0.03 meV | +0.15 meV |
+| W bcc, 128 | −696 meV | +0.39 meV, 0.39 meV/Å, 0.06 GPa | +28.3 meV, 0.35 GPa | +0.06 meV | +0.25 meV |
+
+The default is as close to the converged energy as s-dftd3's own cutoffs are;
+its forces are within 0.4 meV/Å. The coordination numbers' cutoff hardly
+matters (6, 8 or 21 Å agree to 0.001 meV/atom). Metals keep a pressure error of
+a few hundredths of a GPa from their structure past 10 Å; `--d3-cutoff 15`
+halves it (at about twice the pair sum's cost). The tail needs the whole
+periodic cell, so it is for `compute`, `compute_batch`, `compute_device`, an
+engine's periodic list (shifts or images: LAMMPS mode images), and not for
+molecules, slabs or an engine's ghost atoms (`D3Cutoffs::tail`,
+`--d3-no-tail`, `d3_tail no`).
+
+The three-body term converges more slowly, and costs much more per cutoff (its
+triangles grow as r^6). Against 21 Å, with the 2 Å taper:
+
+| three-body cutoff | water | CO2 | diamond | Cu |
+|---|---|---|---|---|
+| E(ATM) at 21 Å | +1.60 meV | +2.96 meV | +14.9 meV | +70.3 meV |
+| 8 Å (default) | −0.18 meV | −0.53 meV | −4.2 meV | −35 meV |
+| 10 Å | −0.06 meV | −0.15 meV | −1.4 meV | −11 meV |
+| 12 Å | −0.03 meV | −0.07 meV | −0.6 meV | −4.5 meV |
+| 16 Å | −0.006 meV | −0.016 meV | −0.15 meV | −1.1 meV |
+
+**Precision.** D3's working precision is a setting (`D3Settings::precision`,
+`--d3-precision`, `precision=` in Python, `d3_precision` in LAMMPS): `double`;
+`mixed`, each pair's and triangle's arithmetic in float and everything kept per
+atom or summed in double; or `float` throughout. The default follows the
+network's: `float` (whose error is below an fp32 network's own rounding), and
+`double` in the fp64 build. The grid's setup and the results handed back (each
+structure's energy and virial summed over its atoms) are double in all three.
+Each against double, per atom, with the largest force and pressure differences
+(PBE, BJ; the double results match s-dftd3 to 1e-10):
+
+| | mixed | float |
+|---|---|---|
+| s-dftd3's cutoffs, water (648 and 5184) | 7e-9 meV, 2e-6 meV/Å, 8e-9 GPa | 2e-5 meV, 1e-4 meV/Å, 8e-7 GPa |
+| s-dftd3's cutoffs, diamond / Cu / W / CO2 | ≤ 3e-5 meV, 2e-5 meV/Å, 4e-7 GPa | ≤ 2e-4 meV, 3e-3 meV/Å, 1e-5 GPa |
+| default cutoffs, all of the above | ≤ 3e-5 meV, 2e-5 meV/Å, 4e-7 GPa | ≤ 2e-5 meV, 3e-3 meV/Å, 3e-6 GPa |
+| default cutoffs + three-body, all | ≤ 4e-5 meV, 2e-5 meV/Å, 5e-7 GPa | ≤ 2e-5 meV, 3e-3 meV/Å, 3e-6 GPa |
+| a 243-atom water cluster (no cell) | 2e-7 meV, 2e-6 meV/Å | 9e-7 meV, 2e-5 meV/Å |
+
+The largest float force difference (3e-6 eV/Å, in W) is a few parts in 10^6 of
+its forces; the truncation errors above are 100 to 10000 times larger. Float's
+forces are its energy's gradient to finite differences' resolution, and its
+results are as reproducible as double's: the same bits run to run and in any
+batch. NVE with pet-mad-xs + D3 (648 water molecules' atoms, 0.5 fs, 2 ps)
+drifts −0.043 meV/atom/ps with double D3, −0.028 mixed, −0.041 float, and
++0.018 without D3: the network's own drift.
+
+**Cost.** On an RTX 4080 SUPER (whose double precision is 1/64 of its single),
+the 5184-atom water box (`water_648` replicated 2x2x2), forces included:
+
+| | pet-eval, one evaluation | LAMMPS `pet/kk`, per MD step |
+|---|---|---|
+| pet-mad-xs | 21.4 ms | 20.4 ms |
+| pet-mad-xs + D3, float | 22.7-23.3 ms | |
+| pet-mad-xs + D3, mixed | 24.1 ms | 23.1 ms |
+| pet-mad-xs + D3, double | 25.5-26.3 ms | 24.4 ms |
+| pet-mad-s | 142.9-144.8 ms | 154.2 ms |
+| pet-mad-s + D3, float | 144.5-145.1 ms | |
+| pet-mad-s + D3, double | 146.9-147.9 ms | 158.6 ms |
+| D3 alone, float / mixed / double | 1.9 / 3.4 / 4.6 ms | |
+| D3 alone + three-body (8 Å), float / mixed / double | 7.6 / 41 / 111 ms | |
+| D3 alone, s-dftd3's cutoffs, float / double | 76 / 158 ms | |
+
+In float, D3 at the default cutoffs adds 6-9% to a pet-mad-xs step and 0.2-1%
+to a pet-mad-s one on this card (D3 alone includes pet-eval's staging of the
+structure; its passes take about 1.6 ms). On GPUs with full-rate double precision (A100, H100/H200, MI250X)
+double costs about what float does. The three-body term sums each atom's
+~(n^2)/2 neighbour pairs: opt-in, with a short cutoff.
+
+**How it runs.** No pair list is stored. Each structure is binned once per
+call (the PET search's counting sort, `sort_into_bins`, at a bin width chosen
+for D3's radii), positions are gathered into bin order, and three passes walk
+the bins on the fly, a warp per atom: the coordination numbers; the pair
+energy, forces, virial and dE/dCN; and the coordination numbers' chain rule.
+Each atom sums its own full neighbourhood in a fixed order, the hits compacted
+so every lane works, and the warp combines its lanes in a fixed tree: no
+atomics, so results are the same to the bit run to run and whichever batch a
+structure is in. An engine's atoms are binned each step into a box kept between
+rebuilds (a graph replays the step). The three-body term gathers each atom's
+neighbours into a list in scratch memory and shares out its pairs.
+
+**Engines.** D3 searches the atoms itself, so an engine's list only tells it
+how to see them (`EdgeListView::periodic` and friends): a periodic list (shifts
+or images) is the owned atoms in their cell; owned atoms and ghosts without an
+exchange need ghosts out to the pair plus CN cutoff (`ghost_cutoff()` includes
+it); with an Exchange, ghosts only to the pair cutoff
+(`exchange_ghost_cutoff()`), their coordination numbers forwarded from their
+owners and their dE/dCN sent home. Only the owned atoms' energy counts; every
+atom gets the force of it. D3 is in the forces and virial `compute_edges`
+returns but not in its `edge_gradient`, which is the model's (its per-atom
+virial share is `Results::atom_virial`). `response()` takes D3's part by
+central differences of its forces (to ~1e-8; D3 is double and smooth).
+
 ## Environment variables
 
 - `PET_MODEL_DIR`: extra directories to search for models.
@@ -616,6 +781,9 @@ stress uncertainties upet derives from ensembles are not implemented.
 - `PET_DEVICE_SEARCH`: `auto`, `cells` or `brute`, for the GPU neighbour search.
 - `PET_NEIGHBORS=builtin`: use the built-in host neighbour search instead of
   vesin.
+- `PET_D3_PROFILE=1`: print each D3 pass's time (fenced). `PET_D3_BIN=width`
+  sets D3's bin width in Å (default half its longest cutoff);
+  `PET_D3_ATM_CAP=n` caps the three-body neighbour list, for tests.
 
 ## Testing
 

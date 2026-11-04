@@ -18,6 +18,8 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <string>
+
 #include "pet/device_geometry.hpp"
 #include "pet/kokkos.hpp"
 
@@ -54,6 +56,23 @@ struct RawEdges {
   IView1D offsets;  // [Ntot+1] start of each atom's contiguous run
   int count = 0;    // E
 };
+
+// Floor division and the matching non-negative remainder. A bin index outside
+// [0, n) folds into the box and the quotient is the lattice shift that took it
+// there; C's / and % truncate toward zero instead, which gets both wrong for
+// negative indices.
+KOKKOS_INLINE_FUNCTION int floor_div(int a, int n) {
+  const int q = a / n;
+  return (a % n != 0 && ((a < 0) != (n < 0))) ? q - 1 : q;
+}
+KOKKOS_INLINE_FUNCTION int floor_mod(int a, int n) { return a - floor_div(a, n) * n; }
+
+// The counting sort both grids share (this search's and D3's, d3.hpp): atom i
+// is in bin abin(i) of nbins; bin c's atoms come out as batom[bstart(c),
+// bstart(c + 1)), in atom order whatever order the threads arrived in. Scratch
+// is from `ws` under keys starting `prefix`.
+void sort_into_bins(Workspace& ws, const std::string& prefix, const IView1D& abin, int N, int nbins,
+                    IView1D& bstart, IView1D& batom);
 
 // Build the raw edge list with a cell list. `posw` is the wrapped positions and
 // `cinv` the per-structure inverse cell that build_nef_device already computes.

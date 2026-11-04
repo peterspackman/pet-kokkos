@@ -1,0 +1,20 @@
+pet-kokkos is BSD-3-Clause licensed (LICENSE). It includes data from:
+
+tad-dftd3 (https://github.com/dftd3/tad-dftd3), version 0.7.0
+tad-mctc (https://github.com/tad-mctc/tad-mctc), version 0.8.0
+  Copyright Sebastian Ehlert, Marvin Friede and contributors.
+  Licensed under the Apache License, Version 2.0
+  (https://www.apache.org/licenses/LICENSE-2.0).
+
+  src/d3_data.cpp holds the DFT-D3 reference C6 coefficients and reference
+  coordination numbers, covalent radii, <r^4>/<r^2> ratios, pairwise van der
+  Waals radii and functional damping parameters, as tad-dftd3 and tad-mctc
+  distribute them, converted to tables by tools/gen_d3_data.py (the C6 table
+  and radii restored from float32 to the four-decimal values they were
+  published with; no values are otherwise changed). The functional parameters
+  are tad-dftd3's copy of s-dftd3's parameters.toml; each is a published fit,
+  cited by DOI in src/d3_data.cpp.
+
+  The D3 method and its reference data: S. Grimme, J. Antony, S. Ehrlich and
+  H. Krieg, J. Chem. Phys. 132, 154104 (2010); rational damping: S. Grimme,
+  S. Ehrlich and L. Goerigk, J. Comput. Chem. 32, 1456 (2011).

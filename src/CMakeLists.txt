@@ -15,6 +15,7 @@
 #   device_cell_list.cpp  the device cell list
 #   vesin_neighbors.cpp   the host search through vesin
 #   calculator.cpp   the public entry point
+#   d3.cpp           DFT-D3 dispersion on the device (d3_data.cpp: its tables, generated)
 #   io/extxyz.cpp    extended XYZ
 #   fused_gemm.cpp   GEMMs with their elementwise neighbours fused (CUTLASS)
 #   ozaki.cpp        fp64-accurate GEMMs on integer tensor cores
@@ -33,6 +34,8 @@ add_library(pet_kokkos STATIC
     device_geometry.cpp
     device_cell_list.cpp
     calculator.cpp
+    d3.cpp
+    d3_data.cpp
     checkpoint.cpp
     io/extxyz.cpp
     ozaki.cpp

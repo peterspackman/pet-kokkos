@@ -98,6 +98,27 @@ supported; the global virial is PET's symmetric one (PET is not exactly
 rotation invariant, so LAMMPS's f.r would keep one side of an antisymmetric
 part). Runtime switches: `PET_CUTLASS=0`, `PET_GRAPHS=0`.
 
+Grimme's D3 dispersion (pet-kokkos README, "D3 dispersion") is added with
+`d3 FUNCTIONAL` and its keywords:
+
+```
+pair_style  pet pet-mad-s d3 pbesol                       # rational (BJ) damping
+pair_style  pet pet-mad-s d3 pbesol d3_atm yes d3_damping zero d3_cutoff 15
+```
+
+`d3_damping bj|zero`, `d3_atm yes|no` (the three-body term), `d3_cutoff`,
+`d3_cn_cutoff`, `d3_atm_cutoff` (Å; 12, 8, 8), `d3_taper` (Å, 2; 0 is a hard
+cutoff), `d3_tail yes|no` and `d3_precision float|mixed|double` (the default
+float, or double in an fp64 build; see the pet-kokkos README). D3 searches the atoms itself rather than using
+LAMMPS's list. In `images` mode it sees the owned atoms in the periodic box
+(the box's periodic axes), with the long-range tail. In `exchange` mode it needs
+ghosts to its pair cutoff, so the ghost cutoff is raised to it (LAMMPS's
+neighbour list stays PET's); the ghosts' coordination numbers and their
+dE/dCN cross by the same atom comm PET uses, and there is no tail (no rank sees
+the whole box). In `ghosts` mode the ghost cutoff covers its pair plus CN
+cutoffs. Energy, forces, per-atom energy and virial and the global virial all
+include it.
+
 The network runs in fp32 unless asked otherwise. On a recent NVIDIA GPU
 (A100, H100/H200, RTX 30xx/40xx), `PET_GEMM=tf32 PET_ATTN=tf32` in the job's
 environment runs it on tensor cores: about 2.8x faster on an H200 for
@@ -114,7 +135,13 @@ on the same structure:
 cd examples
 lmp -in in.pet -var data diamond_216 -var model pet-mad-s -var elements C -var nsteps 0
 python3 compare.py diamond_216 /path/to/pet-eval pet-mad-s log.lammps
+# with D3: the same settings for both
+lmp -in in.pet -var data water_648 -var model pet-mad-xs -var elements "H O" -var extra "d3 pbesol" -var nsteps 0
+python3 compare.py water_648 /path/to/pet-eval pet-mad-xs log.lammps -- --d3 pbesol
 ```
+
+In `exchange` or `ghosts` mode D3 has no tail: compare against
+`-- --d3 pbesol --d3-no-tail`.
 
 ## Licence
 

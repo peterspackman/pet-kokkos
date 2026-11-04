@@ -9,6 +9,12 @@ Units are the model's: Angstrom, eV, eV/A. ``virial`` is the symmetric
 W = V * stress in Voigt order [xx, yy, zz, xy, xz, yz]. For ASE, see
 ``pet_kokkos.ase.PETCalculator``.
 
+Grimme's D3 dispersion correction, on its own or added to a model:
+
+>>> d3 = pet_kokkos.D3("pbesol")                      # rational (BJ) damping
+>>> d3.compute(numbers, positions, cell, pbc=True)["energy"]
+>>> calc = pet_kokkos.Calculator("pet-mad-s", d3="pbesol")
+
 Everything runs in plain fp32 unless asked otherwise: ``gemm="3xtf32"`` and
 ``attention="3xtf32"`` keep fp32's force accuracy on the tensor cores of A100,
 H100/H200 and B200, faster there; ``gemm="tf32"`` and ``attention="tf32"`` run on TF32 tensor cores on recent
@@ -27,9 +33,10 @@ import numpy as np
 from ._backend import core as _core
 from .models import data_dir, download, resolve
 
-__all__ = ["Calculator", "backend", "precision_modes", "download", "data_dir", "metatomic_plugin"]
+__all__ = ["Calculator", "D3", "d3_functionals", "backend", "precision_modes", "download", "data_dir",
+           "metatomic_plugin"]
 
-_live: "weakref.WeakSet[Calculator]" = weakref.WeakSet()
+_live: "weakref.WeakSet" = weakref.WeakSet()
 
 
 def backend() -> str:
@@ -65,6 +72,103 @@ def _arrays(numbers, positions, cell, pbc):
     return numbers, positions, cell, pbc
 
 
+def d3_functionals(damping: str = "bj") -> list[str]:
+    """The functionals with published D3 parameters for a damping, "bj" or "zero"."""
+    return list(_core.d3_functionals(damping))
+
+
+class D3:
+    """Grimme's DFT-D3 dispersion correction (pet::D3), on the device, in double.
+
+    functional: the DFT functional whose parameters to use ("pbe", "pbesol",
+        "r2scan", "b3lyp", ...; ``d3_functionals()`` lists them). Which one
+        suits a model is the model's training data's: PET-MAD was trained on
+        PBEsol. A model trained on a dispersion-inclusive functional (the omol
+        models, wB97M-V) already has dispersion: do not add D3 to it.
+    damping: "bj" (rational, Becke-Johnson; the default) or "zero".
+    atm: add the Axilrod-Teller-Muto three-body term (s9 = 1).
+    s6, s8, a1, a2, rs6, rs8, alpha, s9: override parameters, in their
+        published units (a2 in bohr). Without a functional, give them all.
+    cutoff, cn_cutoff, atm_cutoff: where the pair, coordination-number and
+        three-body sums stop (Angstrom; default 12, 8 and 8), each with a smooth
+        taper of width *_taper ending there (default 2; 0 is a hard cutoff).
+    tail: add the pair sum beyond the cutoff for 3D-periodic structures as a
+        uniform continuum (energy, pressure and the forces through the CNs).
+    reference: s-dftd3's cutoffs (95 bohr pairs, 40 bohr CN and three-body,
+        hard, no tail): slow, for checking.
+    precision: "float" (the default, but "double" in an fp64 build), "mixed"
+        (each pair's and triangle's arithmetic in float, sums in double) or
+        "double"; see the README's "D3 dispersion" for each one's error.
+
+    ``compute`` takes the arrays a Calculator does and returns ``energy``,
+    ``energies`` [N] and, with forces, ``forces`` [N, 3] and ``virial`` [6].
+    """
+
+    def __init__(
+        self,
+        functional: str | None = None,
+        damping: str = "bj",
+        atm: bool = False,
+        *,
+        s6: float | None = None,
+        s8: float | None = None,
+        a1: float | None = None,
+        a2: float | None = None,
+        rs6: float | None = None,
+        rs8: float | None = None,
+        alpha: float | None = None,
+        s9: float | None = None,
+        cutoff: float | None = None,
+        cutoff_taper: float | None = None,
+        cn_cutoff: float | None = None,
+        cn_taper: float | None = None,
+        atm_cutoff: float | None = None,
+        atm_taper: float | None = None,
+        tail: bool = True,
+        reference: bool = False,
+        precision: str | None = None,
+    ):
+        self.functional = functional
+        self._d3 = _core.D3(
+            functional, damping, atm, s6=s6, s8=s8, a1=a1, a2=a2, rs6=rs6, rs8=rs8, alpha=alpha, s9=s9,
+            cutoff=cutoff, cutoff_taper=cutoff_taper, cn_cutoff=cn_cutoff, cn_taper=cn_taper,
+            atm_cutoff=atm_cutoff, atm_taper=atm_taper, tail=tail, reference=reference,
+            precision=precision,
+        )
+        _live.add(self)
+
+    def compute(self, numbers, positions, cell=None, pbc=None, *, forces=True) -> dict:
+        """D3's energy (and forces and virial) for one structure, as Calculator.compute."""
+        z, x, c, p = _arrays(numbers, positions, cell, pbc)
+        return self._d3.compute(z, x, c, p, forces)
+
+    def compute_batch(self, structures: Iterable[Sequence], *, forces=True) -> list[dict]:
+        """Several structures in one pass: each item is (numbers, positions, cell, pbc)."""
+        return self._d3.compute_batch([_arrays(*s[:4]) for s in structures], forces)
+
+    @property
+    def params(self) -> dict:
+        """damping, s6, s8, a1, a2 (bohr), rs6, rs8, alpha, s9."""
+        return self._d3.params
+
+    @property
+    def cutoffs(self) -> dict:
+        """cutoff, cutoff_taper, cn_cutoff, cn_taper, atm_cutoff, atm_taper (Angstrom), tail."""
+        return self._d3.cutoffs
+
+    def ghost_cutoff(self, exchange: bool = False) -> float:
+        """How far past its own atoms an engine must supply ghosts (see pet::D3)."""
+        return self._d3.ghost_cutoff(exchange)
+
+    def close(self) -> None:
+        """Free the device memory now."""
+        self._d3.close()
+
+    def __repr__(self) -> str:
+        p = self.params
+        return f"D3({self.functional!r}, damping={p['damping']!r}, s9={p['s9']})"
+
+
 class Calculator:
     """A loaded PET model. Reuse one across calls: it keeps its device memory,
     caches and recorded graphs between them.
@@ -91,6 +195,9 @@ class Calculator:
         Hessian jumps wherever a pair distance crosses one, which strain
         derivatives of force constants (quasi-harmonic free energies) trip
         over. It changes the model slightly; nothing for a bump-tapered model.
+    d3: add Grimme's D3 dispersion to every result: a functional's name
+        ("pbesol"), with ``d3_damping`` and ``d3_atm``, or a ``D3`` with
+        settings of its own. Off by default; see ``D3`` for which functional.
     """
 
     def __init__(
@@ -107,8 +214,14 @@ class Calculator:
         non_conservative: bool = False,
         uncertainty: bool = False,
         smooth_cutoff: bool = False,
+        d3: "str | D3 | None" = None,
+        d3_damping: str = "bj",
+        d3_atm: bool = False,
     ):
         self.model = resolve(model)
+        if isinstance(d3, str):
+            d3 = D3(d3, d3_damping, d3_atm)
+        self.d3 = d3
         self.non_conservative = non_conservative
         self._calc = _core.Calculator(
             self.model,
@@ -122,6 +235,7 @@ class Calculator:
             non_conservative=non_conservative,
             uncertainty=uncertainty,
             smooth_cutoff=smooth_cutoff,
+            d3=None if d3 is None else d3._d3,
         )
         _live.add(self)
 
@@ -159,7 +273,8 @@ class Calculator:
 
         One structure at a time; every published model. See
         ``pet_kokkos.properties`` for Hessians, vibrations and elastic tensors
-        built on it.
+        built on it. With D3, D3's part is by central differences of its
+        forces (it is double and smooth, so to ~1e-8).
         """
         z, x, c, p = _arrays(numbers, positions, cell, pbc)
         n = len(z)
@@ -211,7 +326,10 @@ def _shutdown() -> None:
     # Every model's device memory must go before Kokkos does. The wrappers may
     # outlive us (IPython's Out history holds them), so drop their cores here
     # too, or nanobind reports them as leaked.
-    for calc in list(_live):
-        calc.close()
-        del calc._calc
+    for obj in list(_live):
+        obj.close()
+        if hasattr(obj, "_calc"):
+            del obj._calc
+        if hasattr(obj, "_d3"):
+            del obj._d3
     _core._finalize()

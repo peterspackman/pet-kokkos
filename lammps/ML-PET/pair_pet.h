@@ -92,6 +92,7 @@ class PairPET : public Pair {
   }
   bool energy_only(long) { return false; }
 
+  int periodic_axes() const;
   void set_images(const List &l, bool half);
   void set_ghosts(const List &l);
   void set_exchange(const List &l);
