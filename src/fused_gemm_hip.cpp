@@ -95,10 +95,14 @@ void launch(const char* name, int M, int N, int K, Pro A, const float* B, Epi ep
   if (t < 0) {
     const long cus = cu_count();
     t = blocks<Large>(M, N) >= 9 * cus ? 0 : blocks<Mid>(M, N) >= 4 * cus ? 1 : 2;
+    // Where one 128 x 128 block spans N (pet-mad-xs's width 128) it reads each
+    // activation row once, not twice: 23.8 -> 25.1 TF/s at E x 128 x 256 and
+    // 27.0 -> 30.1 at E x 128 x 512 (E = 125k), so from 4 blocks a CU.
+    if (t == 1 && N <= 128 && blocks<Large>(M, N) >= 4 * cus) t = 0;
     // An activation built as it loads (SwigluAdj: two sigmoids a pair) is built
     // once a row block when one block spans N: 64 x 256 there, 27.5 -> 29.3
     // TF/s at the SwiGLU backward's E x 256 x 1024.
-    if (t == 0 && !std::is_same_v<Pro, mg::Rows> && N <= 256) t = 3;
+    if (t == 0 && !std::is_same_v<Pro, mg::Rows> && N > 128 && N <= 256) t = 3;
   }
   uint64_t id = 0;
   if (Kokkos::Tools::profileLibraryLoaded()) Kokkos::Tools::beginParallelFor(name, 0, &id);
