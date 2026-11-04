@@ -121,8 +121,11 @@ brackets):
 
 The MI250X column is the MFMA kernel's fused epilogues (`--backend hip`); with
 the activations as separate passes (`--backend unfused`, rocBLAS) it is 79.3,
-55.2 and 14.7 ms. At the 42.7 TF/s a loop of nothing but fp32 MFMAs reaches on
-a GCD (the practical peak) pet-mad-s's GEMMs alone take 62.6 ms, not 56.1.
+55.2 and 14.7 ms. A loop of nothing but fp32 MFMAs reaches 41.3 TF/s on a GCD
+(the practical peak: v_mfma_f32_16x16x4f32 at 1-3 blocks a CU and 4-16
+independent chains alike, 40.3 for 32x32x2; 42.7 measured in October), so
+pet-mad-s's GEMMs alone take 64.7 ms there, not 56.1: 90% of the 47.9 TF/s
+peak is above what the matrix cores sustain.
 
 Against earlier measurements: MI250X pet-mad-s ~150 ms a step in LAMMPS (that
 step also carries LAMMPS's own work), H200 native ~94 ms in October (47% of
@@ -136,11 +139,12 @@ FP64-bound: the cell list's double distances and the solver's double divisions).
 ## MI250X, measured (one GCD, rocprofv3 kernel trace)
 
 pet-mad-s, water 5184, forces, kernel time per evaluation by category against
-the bound (`--backend hip`), perf-integrate and after the perf-mi250x-2 branch:
+the bound (`--backend hip`), perf-integrate and after the perf-mi250x-2 branch
+(GEMM after the gemm-redesign branch: 89.3, 93.4 before it in the same job):
 
 | category | bound ms | perf-integrate | now | now / bound |
 |---|---|---|---|---|
-| GEMM | 56.1 (62.6 at 42.7 TF/s) | 94.1 | 92.9 | 60% (67% of the practical) |
+| GEMM | 56.1 (64.7 at 41.3 TF/s) | 94.1 | 92.9 | 60% (70% of the practical) |
 | attention | 3.7 | 14.0 | 9.8 | 38% |
 | norms | 8.1 | 17.2 | 10.9 | 74% |
 | elementwise | 1.1 | 3.2 | 3.2 | 35% |
@@ -148,13 +152,67 @@ the bound (`--backend hip`), perf-integrate and after the perf-mi250x-2 branch:
 | gather, forces | 0.25 | 0.6 | 0.6 | |
 | total | 69.4 | 132.8 | 121.3 (121.7 wall) | 57% |
 
-The GEMM kernel alone reaches 30-37 TF/s at the network's shapes (70-87% of the
-practical peak); without its main loop's global loads it reaches 38-40, and
-without those and the epilogue's stores 40.5: the rest is load latency three
-waves a SIMD do not hide. Deeper register prefetch costs those waves and loses;
-double-buffered LDS halves the blocks a CU and loses. The attention kernels
-move near the minimum of DRAM bytes (0.94 GB a layer read against 0.82 unique)
-at a third of the bandwidth: latency-bound, one 16-token block a wave.
+The GEMM kernel alone reaches 32-37 TF/s at the network's shapes with a plain
+epilogue (78-90% of the practical peak). In the network each GEMM runs at its
+standalone speed with its epilogue: the fused epilogues' extra traffic (a saved
+pre-activation, the output accumulated onto, the pre-activation the SiLU
+backward reads) and their sigmoids cost 15-30% on those GEMMs, not overlapped
+by the matrix cores. The attention kernels move near the minimum of DRAM bytes
+(0.94 GB a layer read against 0.82 unique) at a third of the bandwidth:
+latency-bound, one 16-token block a wave.
+
+## MI250X: the vendor fp32 GEMMs at the network's shapes
+
+One GCD, ROCm 7.0.1, TF/s (peak 47.9, practical 41.3), the network's GEMMs at
+pet-mad-s water 5184 (E = 154240 edge rows, T = 159424 tokens), NT = against
+an [N, K] weight (forward), NN = a [K, N] one (the backward's input gradient;
+no weight gradients are formed). "ours" is the MFMA kernel before the
+gemm-redesign branch, plain epilogue; rocBLAS as `rocblas_gemm_ex` picks it
+and the best of all its Tensile solutions for the shape (282-315, each timed);
+hipBLASLt the best of its top-32 heuristic algorithms, plain / with its bias /
+with bias + Swish epilogue; Composable Kernel the best of its prebuilt fp32
+XDL instances (its lds_direct_load ones do not run on gfx90a):
+
+| GEMM | M x N x K | ours | rocBLAS | rocBLAS best | hipBLASLt | + bias | + Swish | CK |
+|---|---|---|---|---|---|---|---|---|
+| compress NT | E x 256 x 256 | 32.1 | 33.1 | 33.5 | 32.3 | 32.2 | 31.5 | 30.8 |
+| qkv NT | T x 768 x 256 | 35.1 | 25.1 | 35.1 | 33.8 | 33.6 | 32.2 | 31.5 |
+| mlp.w_in NT | E x 1024 x 256 | 35.0 | 33.8 | 35.1 | 33.2 | 33.2 | 32.2 | 31.5 |
+| comb.0 NT | E x 512 x 512 | 36.3 | 34.0 | 36.6 | 34.8 | 34.7 | 34.2 | 32.4 |
+| comb.2 NT | E x 256 x 512 | 34.7 | 33.4 | 35.3 | 33.9 | 34.0 | 33.4 | 31.5 |
+| cmlp.w_in NT | 5184 x 4096 x 1024 | 36.7 | 37.0 | 37.0 | 34.8 | 34.7 | 34.8 | 31.1 |
+| comb.0^T NN | E x 512 x 512 | 36.4 | 34.1 | 38.0 | 36.2 | 35.7 | 35.2 | 33.1 |
+| mlp.w_in^T NN | E x 256 x 1024 | 36.9 | 33.9 | 38.7 | 36.7 | 36.1 | 36.0 | 33.2 |
+| qkv^T NN | T x 256 x 768 | 35.9 | 33.3 | 37.9 | 35.4 | 35.3 | 35.0 | 32.3 |
+| compress^T NN | E x 256 x 256 | 32.9 | 31.0 | 35.8 | 32.5 | 32.4 | 32.0 | 31.3 |
+| pet-mad-xs NT | E x 128 x 128 | 18.4 | 25.0 | 27.7 | 23.7 | 23.5 | 23.0 | |
+| pet-mad-xs NN | E x 128 x 256 | 25.1 | 26.9 | 31.0 | 27.2 | 27.0 | 26.7 | |
+| square NT | 8192^3 | 30.5 | 32.3 | 38.5 | 38.4 | 38.4 | 38.4 | 33.2 |
+
+Over the 15 GEMMs of a layer (both directions): ours 20.9 ms, rocBLAS 22.7,
+the best Tensile solution for each shape 20.2, hipBLASLt 21.4 (21.9 with
+Swish). None is near peak at these shapes: the vendors' default picks reach
+51-77% of 47.9, the best of every solution 70-81%, about ours, which is level
+with them NT and 4-9% behind the best NN. Only at width 128 (pet-mad-xs) are
+they clearly ahead (25-31 TF/s against 18-25).
+
+What the best Tensile kernels do (names of the solutions timed fastest): the
+same v_mfma_f32_16x16x4f32; NT at MT128x128x16 (our tile) or MT64x96x32; NN at
+MT256x64x16 with the weight loaded straight into the MFMA's registers (DTVA1),
+only the activation through LDS; two k tiles of global loads in flight (PGR2),
+LDS operands read several MFMA steps ahead (PLR5-9), one LDS buffer, the loads
+and LDS traffic interleaved between the MFMAs by hand in assembly (SIA3), no
+direct-to-LDS loads (DTL0) and no split-K. Tried in our compiler-scheduled
+kernel, all bit-identical, all slower: two k tiles of register prefetch (-1%,
+147 VGPRs, still 3 waves), the weight direct-to-VGPR with the activation
+double-buffered (one barrier a k tile; -5 to -25% at 128 x 128 and at
+Tensile's 64 x 256), 32-deep k tiles (-5 to -25%), eight-wave 128 x 128
+blocks (level), a persistent grid spreading each tile's epilogue over the
+next tile's main loop (two sets of accumulators: 2 waves a SIMD and spills,
+-20 to -35%), and starting the first blocks staggered (-1 to -3%: the
+epilogues do not collide in time). What won: the epilogue's output through
+LDS so a store writes whole rows (Composable Kernel's "CShuffle"), +3-17% on
+the fused epilogues, and two tile choices where one block spans N.
 
 ## Assumptions and limits
 
