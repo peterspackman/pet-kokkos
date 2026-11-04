@@ -101,6 +101,7 @@ template <class DeviceType> void PairPETKokkos<DeviceType>::rebuild()
     Kokkos::parallel_for("pet_image_of", Range(0, nall), KOKKOS_LAMBDA(int j) { image_of(j) = by_tag(tag(j)); });
     cell_rows(cell);
     v.image_of = d_image_of.data(), v.positions = positions(), v.cell = cell;
+    v.periodic = periodic_axes();
   }
   if (mode == Mode::Exchange) {
     route_on_device(v);

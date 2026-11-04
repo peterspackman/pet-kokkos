@@ -108,7 +108,8 @@ class D3 {
      std::optional<double> s8, std::optional<double> a1, std::optional<double> a2_bohr, std::optional<double> rs6,
      std::optional<double> rs8, std::optional<double> alpha, std::optional<double> s9, std::optional<double> cutoff,
      std::optional<double> cutoff_taper, std::optional<double> cn_cutoff, std::optional<double> cn_taper,
-     std::optional<double> atm_cutoff, std::optional<double> atm_taper, bool tail, bool reference) {
+     std::optional<double> atm_cutoff, std::optional<double> atm_taper, bool tail, bool reference,
+     bool mixed_precision) {
     const pet::D3Damping d = pet::d3_damping(damping);
     if (functional) s_ = pet::D3Settings::functional(*functional, d, atm);
     else s_.params.damping = d, s_.params.s9 = atm ? 1.0 : 0.0;
@@ -130,6 +131,7 @@ class D3 {
     if (atm_cutoff) c.atm = *atm_cutoff;
     if (atm_taper) c.atm_taper = *atm_taper;
     c.tail = tail && !reference;
+    s_.mixed_precision = mixed_precision;
     if (!functional && !(a1 || rs6))
       throw std::invalid_argument("pet_kokkos.D3: give a functional, or its parameters (s8 and a1, a2 or rs6)");
   }
@@ -345,12 +347,13 @@ NB_MODULE(_core, m) {
                     std::optional<double>, std::optional<double>, std::optional<double>, std::optional<double>,
                     std::optional<double>, std::optional<double>, std::optional<double>, std::optional<double>,
                     std::optional<double>, std::optional<double>, std::optional<double>, std::optional<double>, bool,
-                    bool>(),
+                    bool, bool>(),
            "functional"_a.none(), "damping"_a = "bj", "atm"_a = false, "s6"_a = nb::none(), "s8"_a = nb::none(),
            "a1"_a = nb::none(), "a2"_a = nb::none(), "rs6"_a = nb::none(), "rs8"_a = nb::none(),
            "alpha"_a = nb::none(), "s9"_a = nb::none(), "cutoff"_a = nb::none(), "cutoff_taper"_a = nb::none(),
            "cn_cutoff"_a = nb::none(), "cn_taper"_a = nb::none(), "atm_cutoff"_a = nb::none(),
-           "atm_taper"_a = nb::none(), "tail"_a = true, "reference"_a = false)
+           "atm_taper"_a = nb::none(), "tail"_a = true, "reference"_a = false,
+           "mixed_precision"_a = false)
       .def("compute", &D3::compute, "numbers"_a, "positions"_a, "cell"_a = nb::none(),
            "pbc"_a = std::array<bool, 3>{false, false, false}, "forces"_a = true)
       .def("compute_batch", &D3::compute_batch, "items"_a, "forces"_a = true)

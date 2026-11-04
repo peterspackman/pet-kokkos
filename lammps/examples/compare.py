@@ -2,13 +2,20 @@
 """LAMMPS's single point (log.lammps + <data>.forces) against pet-eval's on the
 same structure (<data>.xyz): energy, per-atom energy, forces, pressure.
 
-    compare.py DATA PET_EVAL MODEL [LOG]
+    compare.py DATA PET_EVAL MODEL [LOG] [-- PET_EVAL_ARGS...]
+
+PET_EVAL_ARGS match what pair_style was given beyond the model, e.g. after
+"d3 pbesol" in mode images: -- --d3 pbesol; in mode exchange or ghosts, where
+D3 has no tail: -- --d3 pbesol --d3-no-tail.
 """
 import json, subprocess, sys
 
-data, pet_eval, model = sys.argv[1:4]
-log = sys.argv[4] if len(sys.argv) > 4 else "log.lammps"
-ref = json.loads(subprocess.run([pet_eval, model, data + ".xyz", "--forces", "--per-atom", "--json"],
+argv = sys.argv[1:]
+extra = argv[argv.index("--") + 1:] if "--" in argv else []
+argv = argv[:argv.index("--")] if "--" in argv else argv
+data, pet_eval, model = argv[:3]
+log = argv[3] if len(argv) > 3 else "log.lammps"
+ref = json.loads(subprocess.run([pet_eval, model, data + ".xyz", "--forces", "--per-atom", "--json"] + extra,
                                 capture_output=True, text=True, check=True).stdout)["frames"][0]
 
 lines = open(log).read().splitlines()

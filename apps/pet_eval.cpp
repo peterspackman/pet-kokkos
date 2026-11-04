@@ -71,6 +71,8 @@ void usage() {
       "      --d3-taper W     width of the smooth taper ending at each cutoff\n"
       "                       (default 2; 0 is a hard cutoff)\n"
       "      --d3-no-tail     no long-range tail correction for periodic frames\n"
+      "      --d3-mixed       each pair's arithmetic in float, sums in double: faster\n"
+      "                       on GPUs with slow fp64, within ~1e-7 relative\n"
       "      --d3-reference   s-dftd3's cutoffs: 95 bohr pairs, 40 bohr CN and\n"
       "                       ATM, no taper, no tail (slow; for checking)\n"
       "      --d3-list        list the functionals with D3 parameters and exit\n"
@@ -111,7 +113,7 @@ struct Args {
   int spin = 1;
   // D3
   std::string d3_functional, d3_damping = "bj", d3_params;
-  bool d3_atm = false, d3_reference = false, d3_list = false, d3_no_tail = false;
+  bool d3_atm = false, d3_reference = false, d3_list = false, d3_no_tail = false, d3_mixed = false;
   double d3_cutoff = -1, d3_cn_cutoff = -1, d3_atm_cutoff = -1, d3_taper = -1;
   bool d3_only() const { return model_spec == "none"; }
 };
@@ -148,6 +150,7 @@ std::optional<pet::D3Settings> d3_settings(const Args& a) {
   if (a.d3_atm_cutoff > 0) s.cutoffs.atm = a.d3_atm_cutoff;
   if (a.d3_taper >= 0) s.cutoffs.pair_taper = s.cutoffs.cn_taper = s.cutoffs.atm_taper = a.d3_taper;
   if (a.d3_no_tail) s.cutoffs.tail = false;
+  s.mixed_precision = a.d3_mixed;
   return s;
 }
 
@@ -221,6 +224,8 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.d3_atm_cutoff = std::atof(next("--d3-atm-cutoff").c_str());
     } else if (s == "--d3-taper") {
       a.d3_taper = std::atof(next("--d3-taper").c_str());
+    } else if (s == "--d3-mixed") {
+      a.d3_mixed = true;
     } else if (s == "--d3-no-tail") {
       a.d3_no_tail = true;
     } else if (s == "--d3-reference") {

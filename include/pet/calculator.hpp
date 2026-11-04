@@ -129,6 +129,10 @@ struct Results {
   // flux... are all folds of it: F_i = sum over i's edges of g - sum over edges
   // into i of g, W = sum over edges of v (x) g.
   std::vector<double> edge_gradient;    // [n_edges*3] eV/A
+  // With edge gradients and Options::d3: D3's share of the per-atom virial
+  // (W = sum v (x) dE/dv, Voigt; each pair half to each end), which is in no
+  // edge gradient. [n_atoms*6] eV; empty otherwise.
+  std::vector<double> atom_virial;
   // Options::uncertainty only: the LLPR energy uncertainty (a standard
   // deviation), and the ensemble's members, which average to `energy`.
   std::vector<double> energy_uncertainty;           // [B] eV

@@ -79,27 +79,30 @@ const d3data::Functional* find_functional(const std::string& name) {
 
 // The smooth step: 1 below rc - w, 0 past rc, 1 - (35x^4 - 84x^5 + 70x^6 - 20x^7)
 // between (cutoff.hpp's smooth cutoff, here with its derivative). w = 0: hard.
-KOKKOS_INLINE_FUNCTION void taper(double r, double rc, double w, double& t, double& dt) {
-  dt = 0.0;
+// In T: double, or float in mixed precision.
+template <class T>
+KOKKOS_INLINE_FUNCTION void taper(T r, T rc, T w, T& t, T& dt) {
+  dt = T(0);
   if (r > rc) {
-    t = 0.0;
+    t = T(0);
     return;
   }
-  const double lo = rc - w;
-  if (w <= 0.0 || r <= lo) {
-    t = 1.0;
+  const T lo = rc - w;
+  if (w <= T(0) || r <= lo) {
+    t = T(1);
     return;
   }
-  const double x = (r - lo) / w, x2 = x * x, x3 = x2 * x;
-  t = 1.0 - x3 * x * (35.0 - 84.0 * x + 70.0 * x2 - 20.0 * x3);
-  dt = -140.0 * x3 * (1.0 - 3.0 * x + 3.0 * x2 - x3) / w;  // -140 x^3 (1 - x)^3 / w
+  const T x = (r - lo) / w, x2 = x * x, x3 = x2 * x;
+  t = T(1) - x3 * x * (T(35) - T(84) * x + T(70) * x2 - T(20) * x3);
+  dt = T(-140) * x3 * (T(1) - T(3) * x + T(3) * x2 - x3) / w;  // -140 x^3 (1 - x)^3 / w
 }
 
 // The CN's counting function 1 / (1 + exp(-k (rco / r - 1))) and its r-derivative.
-KOKKOS_INLINE_FUNCTION void count(double r, double rco, double& f, double& df) {
-  const double ex = Kokkos::exp(-kKcn * (rco / r - 1.0));
-  f = 1.0 / (1.0 + ex);
-  df = -kKcn * rco / (r * r) * ex * f * f;
+template <class T>
+KOKKOS_INLINE_FUNCTION void count(T r, T rco, T& f, T& df) {
+  const T ex = Kokkos::exp(T(-kKcn) * (rco / r - T(1)));
+  f = T(1) / (T(1) + ex);
+  df = T(-kKcn) * rco / (r * r) * ex * f * f;
 }
 
 constexpr double kPi = 3.14159265358979323846;
@@ -238,6 +241,38 @@ struct Kernels {
   DV1 pairtab;  // [kZ * kZ * 3] per element pair: Q = C8/C6, then BJ's R0^6, R0^8 or zero's rs6 R0, rs8 R0
   DV1 tailtab;  // [kZ * kZ] per element pair: the pair term per unit C6 beyond the pair cutoff, integrated
   DV1 lr0;      // [kZ * kZ] log((4/3) R0_ab), the ATM's damping radii
+  // Mixed precision (D3Settings::mixed_precision): each pair's and triangle's
+  // arithmetic in float from float copies of the tables and weights; the sums
+  // stay double.
+  bool mixed = false;
+  using FV1 = Kokkos::View<float*, LR, MemSpace>;
+  using FV2 = Kokkos::View<float**, LR, MemSpace>;
+  FV1 c6f, pairtabf, rcovf, r0f, lr0f;
+  FV2 gwsf, dgwsf;
+  template <class T>
+  KOKKOS_INLINE_FUNCTION T tc6(int i) const {
+    if constexpr (std::is_same_v<T, float>) return c6f(i); else return c6(i);
+  }
+  template <class T>
+  KOKKOS_INLINE_FUNCTION T tgw(int k, int a) const {
+    if constexpr (std::is_same_v<T, float>) return gwsf(k, a); else return gws(k, a);
+  }
+  template <class T>
+  KOKKOS_INLINE_FUNCTION T tdgw(int k, int a) const {
+    if constexpr (std::is_same_v<T, float>) return dgwsf(k, a); else return dgws(k, a);
+  }
+  template <class T>
+  KOKKOS_INLINE_FUNCTION T tpair(int i) const {
+    if constexpr (std::is_same_v<T, float>) return pairtabf(i); else return pairtab(i);
+  }
+  template <class T>
+  KOKKOS_INLINE_FUNCTION T trcov(int z) const {
+    if constexpr (std::is_same_v<T, float>) return rcovf(z); else return rcov(z);
+  }
+  template <class T>
+  KOKKOS_INLINE_FUNCTION T tlr0(int i) const {
+    if constexpr (std::is_same_v<T, float>) return lr0f(i); else return lr0(i);
+  }
   // The tail correction's per-structure state: elements present, and each
   // element's reference weights summed over the structure's atoms.
   IView2D present;   // [B, kZ]
@@ -421,26 +456,27 @@ struct Kernels {
   }
 
   // C6 between slots ki (its weights wi, dwi over ni references) and kj, and dC6/dCN_i.
-  KOKKOS_INLINE_FUNCTION void c6_pair(int zi, int ni, const double* wi, const double* dwi, int kj, int zj, double& C,
-                                      double& dC) const {
+  template <class T>
+  KOKKOS_INLINE_FUNCTION void c6_pair(int zi, int ni, const T* wi, const T* dwi, int kj, int zj, T& C, T& dC) const {
     const int nj = nref(zj);
     const int base = (zi * kZ + zj) * (kR * kR);
-    C = 0.0, dC = 0.0;
+    C = T(0), dC = T(0);
     for (int a = 0; a < ni; ++a) {
-      double u = 0.0;
-      for (int bb = 0; bb < nj; ++bb) u += c6(base + a * kR + bb) * gws(kj, bb);
+      T u = T(0);
+      for (int bb = 0; bb < nj; ++bb) u += tc6<T>(base + a * kR + bb) * tgw<T>(kj, bb);
       C += wi[a] * u;
       dC += dwi[a] * u;
     }
   }
-  KOKKOS_INLINE_FUNCTION double c6_plain(int ki, int zi, int kj, int zj) const {
+  template <class T>
+  KOKKOS_INLINE_FUNCTION T c6_plain(int ki, int zi, int kj, int zj) const {
     const int ni = nref(zi), nj = nref(zj);
     const int base = (zi * kZ + zj) * (kR * kR);
-    double C = 0.0;
+    T C = T(0);
     for (int a = 0; a < ni; ++a) {
-      double u = 0.0;
-      for (int bb = 0; bb < nj; ++bb) u += c6(base + a * kR + bb) * gws(kj, bb);
-      C += gws(ki, a) * u;
+      T u = T(0);
+      for (int bb = 0; bb < nj; ++bb) u += tc6<T>(base + a * kR + bb) * tgw<T>(kj, bb);
+      C += tgw<T>(ki, a) * u;
     }
     return C;
   }
@@ -454,14 +490,18 @@ struct Kernels {
 
   KOKKOS_INLINE_FUNCTION void operator()(TagCN, const Member<TagCN>& t) const {
     const int ks = t.league_rank(), zi = zs(ks);
-    const double rci = rcov(zi);
     double s[1];
+    auto hit = [&](auto real, int k, double d2, double* acc) {
+      using T = decltype(real);
+      const T r = Kokkos::sqrt(T(d2));
+      T f, df, tp, dtp;
+      count<T>(r, trcov<T>(zi) + trcov<T>(zs(k)), f, df);
+      taper<T>(r, T(rc), T(wc), tp, dtp);
+      acc[0] += double(f * tp);
+    };
     team_walk<1>(t, ks, rc, [&](int k, const double*, double d2, double* acc) {
-      const double r = Kokkos::sqrt(d2);
-      double f, df, tp, dtp;
-      count(r, rci + rcov(zs(k)), f, df);
-      taper(r, rc, wc, tp, dtp);
-      acc[0] += f * tp;
+      if (mixed) hit(0.0f, k, d2, acc);
+      else hit(0.0, k, d2, acc);
     }, s);
     Kokkos::single(Kokkos::PerThread(t), [&] { cn(batom(ks)) = s[0]; });
   }
@@ -491,26 +531,29 @@ struct Kernels {
       }
       gws(k, a) = g;
       dgws(k, a) = dg;
+      if (mixed) gwsf(k, a) = float(g), dgwsf(k, a) = float(dg);
     }
   }
 
   // The two-body term per unit C6, untapered, and its r-derivative; ir = 1/r.
-  KOKKOS_INLINE_FUNCTION void damped(double r, double ir, double d2, int zi, int zj, double& e, double& de) const {
+  template <class T>
+  KOKKOS_INLINE_FUNCTION void damped(T r, T ir, T d2, int zi, int zj, T& e, T& de) const {
     const int p = 3 * (zi * kZ + zj);
-    const double Q = pairtab(p);
-    const double r6 = d2 * d2 * d2, r8 = r6 * d2;
+    const T Q = tpair<T>(p), S6 = T(s6), S8 = T(s8);
+    const T r6 = d2 * d2 * d2, r8 = r6 * d2;
     if (bj) {
-      const double A = r6 + pairtab(p + 1), Bd = r8 + pairtab(p + 2), id = 1.0 / (A * Bd);
-      const double t6 = Bd * id, t8 = A * id;  // 1/(r^6 + R0^6), 1/(r^8 + R0^8)
-      e = -(s6 * t6 + s8 * Q * t8);
-      de = (6.0 * s6 * r6 * t6 * t6 + 8.0 * s8 * Q * r8 * t8 * t8) * ir;
+      const T A = r6 + tpair<T>(p + 1), Bd = r8 + tpair<T>(p + 2), id = T(1) / (A * Bd);
+      const T t6 = Bd * id, t8 = A * id;  // 1/(r^6 + R0^6), 1/(r^8 + R0^8)
+      e = -(S6 * t6 + S8 * Q * t8);
+      de = (T(6) * S6 * r6 * t6 * t6 + T(8) * S8 * Q * r8 * t8 * t8) * ir;
     } else {
-      const double q6 = Kokkos::pow(r / pairtab(p + 1), -alp), q8 = Kokkos::pow(r / pairtab(p + 2), -(alp + 2.0));
-      const double f6 = 1.0 / (1.0 + 6.0 * q6), f8 = 1.0 / (1.0 + 6.0 * q8);
-      const double df6 = 6.0 * alp * q6 * ir * f6 * f6, df8 = 6.0 * (alp + 2.0) * q8 * ir * f8 * f8;
-      const double i6 = 1.0 / r6, i8 = i6 / d2;
-      e = -(s6 * f6 * i6 + s8 * Q * f8 * i8);
-      de = -(s6 * (df6 - 6.0 * f6 * ir) * i6 + s8 * Q * (df8 - 8.0 * f8 * ir) * i8);
+      const T al = T(alp);
+      const T q6 = Kokkos::pow(r / tpair<T>(p + 1), -al), q8 = Kokkos::pow(r / tpair<T>(p + 2), -(al + T(2)));
+      const T f6 = T(1) / (T(1) + T(6) * q6), f8 = T(1) / (T(1) + T(6) * q8);
+      const T df6 = T(6) * al * q6 * ir * f6 * f6, df8 = T(6) * (al + T(2)) * q8 * ir * f8 * f8;
+      const T i6 = T(1) / r6, i8 = i6 / d2;
+      e = -(S6 * f6 * i6 + S8 * Q * f8 * i8);
+      de = -(S6 * (df6 - T(6) * f6 * ir) * i6 + S8 * Q * (df8 - T(8) * f8 * ir) * i8);
     }
   }
 
@@ -526,25 +569,31 @@ struct Kernels {
     const int ks = t.league_rank(), i = batom(ks), zi = zs(ks), ni = nref(zi);
     const double oi = owned_atom(i);
     double wi[kR], dwi[kR];
-    for (int a = 0; a < kR; ++a) wi[a] = gws(ks, a), dwi[a] = dgws(ks, a);
+    float wif[kR], dwif[kR];
+    for (int a = 0; a < kR; ++a) wi[a] = gws(ks, a), dwi[a] = dgws(ks, a), wif[a] = float(wi[a]), dwif[a] = float(dwi[a]);
     constexpr int K = F ? 11 : 1;
     double s[K];
-    team_walk<K>(t, ks, rp, [&](int k, const double* v, double d2, double* acc) {
+    auto hit = [&](auto real, const auto* w_i, const auto* dw_i, int k, const double* v, double d2, double* acc) {
+      using T = decltype(real);
       const double wt = 0.5 * (oi + owned(k));
       if (wt == 0.0) return;
       const int zj = zs(k);
-      const double r = Kokkos::sqrt(d2), ir = 1.0 / r;
-      double C, dC, u, du, tp, dtp;
-      c6_pair(zi, ni, wi, dwi, k, zj, C, dC);
-      damped(r, ir, d2, zi, zj, u, du);
-      taper(r, rp, wp, tp, dtp);
-      acc[0] += 0.5 * oi * C * u * tp;
+      const T r = Kokkos::sqrt(T(d2)), ir = T(1) / r;
+      T C, dC, u, du, tp, dtp;
+      c6_pair<T>(zi, ni, w_i, dw_i, k, zj, C, dC);
+      damped<T>(r, ir, T(d2), zi, zj, u, du);
+      taper<T>(r, T(rp), T(wp), tp, dtp);
+      acc[0] += 0.5 * oi * double(C * u * tp);
       if constexpr (F) {
-        const double g = wt * C * (du * tp + u * dtp) * ir;  // dE/dv = g v
+        const double g = wt * double(C * (du * tp + u * dtp) * ir);  // dE/dv = g v
         for (int x = 0; x < 3; ++x) acc[1 + x] += g * v[x];
         add_virial(acc + 4, 0.5 * g, v);
-        acc[10] += wt * dC * u * tp;
+        acc[10] += wt * double(dC * u * tp);
       }
+    };
+    team_walk<K>(t, ks, rp, [&](int k, const double* v, double d2, double* acc) {
+      if (mixed) hit(0.0f, wif, dwif, k, v, d2, acc);
+      else hit(0.0, wi, dwi, k, v, d2, acc);
     }, s);
     Kokkos::single(Kokkos::PerThread(t), [&] {
       eat(i) = s[0];
@@ -566,68 +615,72 @@ struct Kernels {
   // Atom i's neighbours within the cutoff, with what each triangle needs of
   // them: slot, v = r_j - r_i, |v|^2, |v|, the taper and its derivative, C6_ij,
   // dC6_ij/dCN_i, (4/3) R0_ij.
+  template <class T>
   struct Nb {
     int k;
-    double v[3], d2, r, ir, t, dt, sC, dCr, lr, lr0;  // sC = sqrt(C6_ij), dCr = dC6_ij/C6_ij, logs of r and (4/3) R0
+    T v[3], d2, r, ir, t, dt, sC, dCr, lr, lr0;  // sC = sqrt(C6_ij), dCr = dC6_ij/C6_ij, logs of r and (4/3) R0
   };
-  static constexpr int kNb = 12;  // the doubles of an Nb in the list
-  KOKKOS_INLINE_FUNCTION Nb neighbour(int k, const double* v, double d2, int zi, int ni, const double* wi,
-                                      const double* dwi) const {
-    Nb n;
+  static constexpr int kNb = 12;  // the values of an Nb in the list
+  template <class T>
+  KOKKOS_INLINE_FUNCTION Nb<T> neighbour(int k, const double* v, double d2, int zi, int ni, const T* wi,
+                                         const T* dwi) const {
+    Nb<T> n;
     n.k = k;
-    for (int x = 0; x < 3; ++x) n.v[x] = v[x];
-    n.d2 = d2, n.r = Kokkos::sqrt(d2), n.ir = 1.0 / n.r;
+    for (int x = 0; x < 3; ++x) n.v[x] = T(v[x]);
+    n.d2 = T(d2), n.r = Kokkos::sqrt(T(d2)), n.ir = T(1) / n.r;
     const int zj = zs(k);
-    double C, dC;
-    c6_pair(zi, ni, wi, dwi, k, zj, C, dC);
-    n.sC = Kokkos::sqrt(C), n.dCr = C > 0.0 ? dC / C : 0.0;
-    taper(n.r, ra, wa, n.t, n.dt);
-    n.lr = Kokkos::log(n.r), n.lr0 = lr0(zi * kZ + zj);
+    T C, dC;
+    c6_pair<T>(zi, ni, wi, dwi, k, zj, C, dC);
+    n.sC = Kokkos::sqrt(C), n.dCr = C > T(0) ? dC / C : T(0);
+    taper<T>(n.r, T(ra), T(wa), n.t, n.dt);
+    n.lr = Kokkos::log(n.r), n.lr0 = tlr0<T>(zi * kZ + zj);
     return n;
   }
   // One triangle i, j, k into atom i's sums: e, f[3], w[6], dE/dCN_i.
-  template <bool F>
-  KOKKOS_INLINE_FUNCTION void triangle(double oi, const Nb& J, const Nb& K, double* acc) const {
-    const double vjk[3] = {K.v[0] - J.v[0], K.v[1] - J.v[1], K.v[2] - J.v[2]};
-    const double c = vjk[0] * vjk[0] + vjk[1] * vjk[1] + vjk[2] * vjk[2];
-    if (c > ra * ra || c < 1e-20) return;
+  template <bool F, class T>
+  KOKKOS_INLINE_FUNCTION void triangle(double oi, const Nb<T>& J, const Nb<T>& K, double* acc) const {
+    const T vjk[3] = {K.v[0] - J.v[0], K.v[1] - J.v[1], K.v[2] - J.v[2]};
+    const T c = vjk[0] * vjk[0] + vjk[1] * vjk[1] + vjk[2] * vjk[2];
+    if (c > T(ra * ra) || c < T(1e-20)) return;
     const double wt = (oi + owned(J.k) + owned(K.k)) / 3.0;
     if (wt == 0.0) return;
     const int zj = zs(J.k), zk = zs(K.k);
-    const double a = J.d2, b = K.d2, rij = J.r, rik = K.r, rjk = Kokkos::sqrt(c), irjk = 1.0 / rjk;
-    const double ex = (alp + 2.0) / 3.0;
-    const double Cjk = c6_plain(J.k, zj, K.k, zk);
-    const double C9 = s9 * J.sC * K.sC * Kokkos::sqrt(Kokkos::fabs(Cjk)) * isEh;
+    const T a = J.d2, b = K.d2, rij = J.r, rik = K.r, rjk = Kokkos::sqrt(c), irjk = T(1) / rjk;
+    const T ex = T((alp + 2.0) / 3.0);
+    const T Cjk = c6_plain<T>(J.k, zj, K.k, zk);
+    const T C9 = T(s9) * J.sC * K.sC * Kokkos::sqrt(Kokkos::fabs(Cjk)) * T(isEh);
     // (R0 / P)^ex from logs: R0 the product of the sides' (4/3) R0, P of the sides.
-    const double u = Kokkos::exp(ex * (J.lr0 + K.lr0 + lr0(zj * kZ + zk) - J.lr - K.lr - Kokkos::log(rjk)));
-    const double fd = 1.0 / (1.0 + 6.0 * u);
-    const double iP = J.ir * K.ir * irjk, iP3 = iP * iP * iP, iP5 = iP3 * iP * iP;
-    const double X = a - b + c, Y = a + b - c, Zt = -a + b + c, sgeo = X * Y * Zt;
-    const double ang = 0.375 * sgeo * iP5 + iP3;
-    double tjk, dtjk;
-    taper(rjk, ra, wa, tjk, dtjk);
-    const double T = J.t * K.t * tjk;
-    const double E = C9 * ang * fd * T;
-    acc[0] += oi * E / 3.0;
+    const T u = Kokkos::exp(ex * (J.lr0 + K.lr0 + tlr0<T>(zj * kZ + zk) - J.lr - K.lr - Kokkos::log(rjk)));
+    const T fd = T(1) / (T(1) + T(6) * u);
+    const T iP = J.ir * K.ir * irjk, iP3 = iP * iP * iP, iP5 = iP3 * iP * iP;
+    const T X = a - b + c, Y = a + b - c, Zt = -a + b + c, sgeo = X * Y * Zt;
+    const T ang = T(0.375) * sgeo * iP5 + iP3;
+    T tjk, dtjk;
+    taper<T>(rjk, T(ra), T(wa), tjk, dtjk);
+    const T Tp = J.t * K.t * tjk;
+    const T E = C9 * ang * fd * Tp;
+    acc[0] += oi * double(E) / 3.0;
     if constexpr (F) {
       // d(ang)/d(each squared side), P d(fd)/dP, then each side's dE/dr:
       // through the angle factor, the damping and the tapers.
-      const double s_a = Y * Zt + X * Zt - X * Y, s_b = -Y * Zt + X * Zt + X * Y, s_c = Y * Zt - X * Zt + X * Y;
-      const double ia = J.ir * J.ir, ib = K.ir * K.ir, ic = irjk * irjk;
-      const double dang_a = (0.375 * (s_a - 2.5 * sgeo * ia) * iP5 - 1.5 * iP3 * ia);
-      const double dang_b = (0.375 * (s_b - 2.5 * sgeo * ib) * iP5 - 1.5 * iP3 * ib);
-      const double dang_c = (0.375 * (s_c - 2.5 * sgeo * ic) * iP5 - 1.5 * iP3 * ic);
-      const double dfd = 6.0 * ex * u * fd * fd;
-      const double gij = C9 * (2.0 * rij * dang_a * fd * T + ang * dfd * J.ir * T + ang * fd * J.dt * K.t * tjk);
-      const double gik = C9 * (2.0 * rik * dang_b * fd * T + ang * dfd * K.ir * T + ang * fd * J.t * K.dt * tjk);
-      const double gjk = C9 * (2.0 * rjk * dang_c * fd * T + ang * dfd * irjk * T + ang * fd * J.t * K.t * dtjk);
-      const double hij = wt * gij * J.ir, hik = wt * gik * K.ir, hjk = wt * gjk * irjk;  // dE/dv = h v
-      for (int x = 0; x < 3; ++x) acc[1 + x] += hij * J.v[x] + hik * K.v[x];
-      add_virial(acc + 4, hij / 3.0, J.v);
-      add_virial(acc + 4, hik / 3.0, K.v);
-      add_virial(acc + 4, hjk / 3.0, vjk);
+      const T s_a = Y * Zt + X * Zt - X * Y, s_b = -Y * Zt + X * Zt + X * Y, s_c = Y * Zt - X * Zt + X * Y;
+      const T ia = J.ir * J.ir, ib = K.ir * K.ir, ic = irjk * irjk;
+      const T dang_a = (T(0.375) * (s_a - T(2.5) * sgeo * ia) * iP5 - T(1.5) * iP3 * ia);
+      const T dang_b = (T(0.375) * (s_b - T(2.5) * sgeo * ib) * iP5 - T(1.5) * iP3 * ib);
+      const T dang_c = (T(0.375) * (s_c - T(2.5) * sgeo * ic) * iP5 - T(1.5) * iP3 * ic);
+      const T dfd = T(6) * ex * u * fd * fd;
+      const T gij = C9 * (T(2) * rij * dang_a * fd * Tp + ang * dfd * J.ir * Tp + ang * fd * J.dt * K.t * tjk);
+      const T gik = C9 * (T(2) * rik * dang_b * fd * Tp + ang * dfd * K.ir * Tp + ang * fd * J.t * K.dt * tjk);
+      const T gjk = C9 * (T(2) * rjk * dang_c * fd * Tp + ang * dfd * irjk * Tp + ang * fd * J.t * K.t * dtjk);
+      const double hij = wt * double(gij * J.ir), hik = wt * double(gik * K.ir), hjk = wt * double(gjk * irjk);
+      const double vj[3] = {J.v[0], J.v[1], J.v[2]}, vk[3] = {K.v[0], K.v[1], K.v[2]};
+      const double vd[3] = {vjk[0], vjk[1], vjk[2]};
+      for (int x = 0; x < 3; ++x) acc[1 + x] += hij * vj[x] + hik * vk[x];  // dE/dv = h v
+      add_virial(acc + 4, hij / 3.0, vj);
+      add_virial(acc + 4, hik / 3.0, vk);
+      add_virial(acc + 4, hjk / 3.0, vd);
       // dE/dCN_i through C6_ij and C6_ik: C9 ~ sqrt(C6_ij C6_ik C6_jk).
-      acc[10] += wt * 0.5 * E * (J.dCr + K.dCr);
+      acc[10] += wt * 0.5 * double(E * (J.dCr + K.dCr));
     }
   }
 
@@ -643,10 +696,15 @@ struct Kernels {
   }
   template <bool F>
   KOKKOS_INLINE_FUNCTION void operator()(TagATM<F>, const Member<TagATM<F>>& t) const {
+    if (mixed) atm<F, float>(t);
+    else atm<F, double>(t);
+  }
+  template <bool F, class T>
+  KOKKOS_INLINE_FUNCTION void atm(const Member<TagATM<F>>& t) const {
     const int ks = t.league_rank(), i = batom(ks), zi = zs(ks), ni = nref(zi);
     const double oi = owned_atom(i);
-    double wi[kR], dwi[kR];
-    for (int a = 0; a < kR; ++a) wi[a] = gws(ks, a), dwi[a] = dgws(ks, a);
+    T wi[kR], dwi[kR];
+    for (int a = 0; a < kR; ++a) wi[a] = T(gws(ks, a)), dwi[a] = T(dgws(ks, a));
     ScratchD2 L(t.team_scratch(1), atm_cap, kNb);
     ScratchI1 Lk(t.team_scratch(1), atm_cap);
     const double R2 = ra * ra, x0 = xs(ks, 0), y0 = xs(ks, 1), z0 = xs(ks, 2);
@@ -684,13 +742,13 @@ struct Kernels {
       t.team_barrier();
       Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, n), [&](int m) {
         const double v[3] = {L(m, 0), L(m, 1), L(m, 2)};
-        const Nb b = neighbour(Lk(m), v, L(m, 3), zi, ni, wi, dwi);
+        const Nb<T> b = neighbour<T>(Lk(m), v, L(m, 3), zi, ni, wi, dwi);
         L(m, 4) = b.r, L(m, 5) = b.ir, L(m, 6) = b.t, L(m, 7) = b.dt, L(m, 8) = b.sC, L(m, 9) = b.dCr;
         L(m, 10) = b.lr, L(m, 11) = b.lr0;
       });
       t.team_barrier();
       auto get = [&](int m) {
-        Nb b;
+        Nb<T> b;
         b.k = Lk(m);
         for (int x = 0; x < 3; ++x) b.v[x] = L(m, x);
         b.d2 = L(m, 3), b.r = L(m, 4), b.ir = L(m, 5), b.t = L(m, 6), b.dt = L(m, 7), b.sC = L(m, 8), b.dCr = L(m, 9);
@@ -701,8 +759,8 @@ struct Kernels {
           Kokkos::ThreadVectorRange(t, kLanes),
           [&](int lane, Sums<11>& sum) {
             for (int p = lane; p < n; p += kLanes) {
-              const Nb J = get(p);
-              for (int q = p + 1; q < n; ++q) triangle<F>(oi, J, get(q), sum.v);
+              const Nb<T> J = get(p);
+              for (int q = p + 1; q < n; ++q) triangle<F, T>(oi, J, get(q), sum.v);
             }
           },
           Kokkos::Sum<Sums<11>>(s));
@@ -713,7 +771,7 @@ struct Kernels {
           Kokkos::ThreadVectorRange(t, kLanes),
           [&](int lane, Sums<11>& sum) {
             lane_walk(ks, ra, lane, [&](int kj, const double* vij, double a, int qj) {
-              const Nb J = neighbour(kj, vij, a, zi, ni, wi, dwi);
+              const Nb<T> J = neighbour<T>(kj, vij, a, zi, ni, wi, dwi);
               runs(ks, ra, [&](int k0, int k1, const double* sh, int qk) {
                 if (qk < qj) return;
                 const double ox = sh[0] - x0, oy = sh[1] - y0, oz = sh[2] - z0;
@@ -721,7 +779,7 @@ struct Kernels {
                   const double vik[3] = {xs(kk, 0) + ox, xs(kk, 1) + oy, xs(kk, 2) + oz};
                   const double b = vik[0] * vik[0] + vik[1] * vik[1] + vik[2] * vik[2];
                   if (b < 1e-20 || b > R2) continue;
-                  triangle<F>(oi, J, neighbour(kk, vik, b, zi, ni, wi, dwi), sum.v);
+                  triangle<F, T>(oi, J, neighbour<T>(kk, vik, b, zi, ni, wi, dwi), sum.v);
                 }
               });
             });
@@ -786,18 +844,23 @@ struct Kernels {
   // sum_j (dE/dCN_i + dE/dCN_j) dcn_ij/dv. Sums: f[3], w[6].
   KOKKOS_INLINE_FUNCTION void operator()(TagChain, const Member<TagChain>& t) const {
     const int ks = t.league_rank(), i = batom(ks), zi = zs(ks);
-    const double di = dedcns(ks), rci = rcov(zi);
+    const double di = dedcns(ks);
     double s[9];
-    team_walk<9>(t, ks, rc, [&](int k, const double* v, double d2, double* acc) {
+    auto hit = [&](auto real, int k, const double* v, double d2, double* acc) {
+      using T = decltype(real);
       const double sum = di + dedcns(k);
       if (sum == 0.0) return;
-      const double r = Kokkos::sqrt(d2);
-      double c, dc, tp, dtp;
-      count(r, rci + rcov(zs(k)), c, dc);
-      taper(r, rc, wc, tp, dtp);
-      const double g = sum * (dc * tp + c * dtp) / r;
+      const T r = Kokkos::sqrt(T(d2));
+      T c, dc, tp, dtp;
+      count<T>(r, trcov<T>(zi) + trcov<T>(zs(k)), c, dc);
+      taper<T>(r, T(rc), T(wc), tp, dtp);
+      const double g = sum * double((dc * tp + c * dtp) / r);
       for (int x = 0; x < 3; ++x) acc[x] += g * v[x];
       add_virial(acc + 3, 0.5 * g, v);
+    };
+    team_walk<9>(t, ks, rc, [&](int k, const double* v, double d2, double* acc) {
+      if (mixed) hit(0.0f, k, v, d2, acc);
+      else hit(0.0, k, v, d2, acc);
     }, s);
     Kokkos::single(Kokkos::PerThread(t), [&] {
       for (int x = 0; x < 3; ++x) fat(i, x) += s[x];
@@ -812,6 +875,13 @@ struct Kernels {
 
 namespace d3detail {
 
+Kernels::FV1 to_float(const DV1& d, const char* label) {
+  Kernels::FV1 f(label, d.extent(0));
+  Kokkos::parallel_for(
+      "d3_to_float", RangePolicy(0, (int) d.extent(0)), KOKKOS_LAMBDA(int q) { f(q) = float(d(q)); });
+  return f;
+}
+
 void fill_identity(IView1D id) {
   Kokkos::parallel_for("d3_identity", RangePolicy(0, (int) id.extent(0)), KOKKOS_LAMBDA(int z) { id(z) = z; });
 }
@@ -824,6 +894,7 @@ struct Core {
   // tables
   IView1D nref, identity;
   DV1 cnref, rcov, r4r2, r0, c6, pairtab, tailtab, lr0;
+  Kernels::FV1 c6f, pairtabf, rcovf, lr0f;  // float copies, for mixed precision
   // the grid as last sized
   bool sized = false;
   std::size_t resizes = 0;
@@ -916,6 +987,10 @@ struct Core {
     auto hl = Kokkos::create_mirror_view(lr0 = DV1("d3:lr0", std::size_t(kZ) * kZ));
     for (int i = 0; i < kZ * kZ; ++i) hl(i) = hr0(i) > 0 ? std::log(4.0 / 3.0 * hr0(i)) : 0.0;
     Kokkos::deep_copy(lr0, hl);
+    if (s.mixed_precision) {
+      c6f = to_float(c6, "d3:c6f"), pairtabf = to_float(pairtab, "d3:pairtabf");
+      rcovf = to_float(rcov, "d3:rcovf"), lr0f = to_float(lr0, "d3:lr0f");
+    }
     Kokkos::deep_copy(overflow, 0);
   }
 
@@ -1174,6 +1249,14 @@ struct Core {
     Kernels k;
     k.nref = nref, k.ztab = at.ztab.extent(0) > 0 ? at.ztab : identity, k.cnref = cnref, k.rcov = rcov;
     k.r4r2 = r4r2, k.r0 = r0, k.c6 = c6, k.pairtab = pairtab, k.tailtab = tailtab, k.lr0 = lr0;
+    k.mixed = s.mixed_precision;
+    if (k.mixed) {
+      k.c6f = c6f, k.pairtabf = pairtabf, k.rcovf = rcovf, k.lr0f = lr0f;
+      auto fv2 = [&](const char* key, int r, int c) {
+        return Kernels::FV2(reinterpret_cast<float*>(ws.r1(key, (r * c + 1) / 2 + 1).data()), r, c);
+      };
+      k.gwsf = fv2("d3:gwsf", N, kR), k.dgwsf = fv2("d3:dgwsf", N, kR);
+    }
     k.soff = at.soff, k.scnt = at.scnt, k.scell = at.scell;
     k.tail = s.cutoffs.tail && at.n_local < 0;
     k.type = at.type, k.sid = at.sid, k.sper = at.sper, k.pos = at.pos;

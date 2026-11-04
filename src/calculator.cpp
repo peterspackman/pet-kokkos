@@ -666,7 +666,8 @@ Results Calculator::session_results(const DeviceEdgeData& dev, bool compute_forc
                                     bool keep_grid) const {
   auto& I = *impl_;
   BatchResult br = I.model.energy_forces_batch(dev, compute_forces);
-  if (I.d3) add_device(br, I.d3->evaluate(I.d3_session_atoms(), compute_forces, keep_grid), compute_forces);
+  D3::Out d3o;
+  if (I.d3) add_device(br, d3o = I.d3->evaluate(I.d3_session_atoms(), compute_forces, keep_grid), compute_forces);
   Results out;
   out.n_atoms = {dev.n_atoms};
   to_host(out.energy, br.energy);
@@ -677,6 +678,12 @@ Results Calculator::session_results(const DeviceEdgeData& dev, bool compute_forc
   to_host(out.virial, br.virial);
   out.struct_id.assign(dev.n_atoms, 0);
   if (!edge_gradients) return out;
+  if (I.d3 && d3o.atom_virial.extent(0) > 0) {
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d3o.atom_virial);
+    out.atom_virial.assign(std::size_t(dev.n_atoms) * 6, 0.0);
+    for (std::size_t i = 0; i < h.extent(0); ++i)
+      for (int k = 0; k < 6; ++k) out.atom_virial[6 * i + k] = h(i, k);
+  }
   if (I.model.non_conservative())
     throw std::runtime_error("pet::Calculator: edge gradients need the backward, which non_conservative skips");
   // A half list's pair gets both directions: g(i -> j) - g(j -> i).

@@ -303,3 +303,30 @@ TEST_CASE("D3 ATM past the neighbour list's capacity", "[d3]") {
   for (std::size_t k = 0; k < ra.forces.size(); ++k) CHECK(std::fabs(ra.forces[k] - rb.forces[k]) < 1e-12);
   for (int k = 0; k < 6; ++k) CHECK(std::fabs(ra.virial[k] - rb.virial[k]) < 1e-11);
 }
+
+// Mixed precision: float arithmetic per pair and triangle, double sums. Within
+// ~1e-6 relative of the double path, and as reproducible.
+TEST_CASE("D3 in mixed precision", "[d3]") {
+  const pet::System s = water_box(3, 13);
+  for (int atm = 0; atm < 2; ++atm)
+    for (auto damping : {pet::D3Damping::BJ, pet::D3Damping::Zero}) {
+      DYNAMIC_SECTION((damping == pet::D3Damping::BJ ? "bj" : "zero") << (atm ? "+atm" : "")) {
+        pet::D3Settings set = pet::D3Settings::functional("pbe", damping, atm);
+        set.cutoffs.atm = 5.0;
+        const pet::D3 dbl(set);
+        set.mixed_precision = true;
+        const pet::D3 mix(set);
+        const pet::Results a = dbl.compute(s), b = mix.compute(s), b2 = mix.compute(s);
+        INFO("E " << a.energy[0] << " mixed " << b.energy[0]);
+        CHECK(std::fabs(a.energy[0] - b.energy[0]) < 1e-6 * std::fabs(a.energy[0]));
+        double err = 0, scale = 0;
+        for (std::size_t k = 0; k < a.forces.size(); ++k)
+          err = worst(err, std::fabs(a.forces[k] - b.forces[k])), scale = std::max(scale, std::fabs(a.forces[k]));
+        INFO("force error " << err << " of " << scale);
+        CHECK(err < 1e-5 * scale);
+        for (int k = 0; k < 6; ++k) CHECK(std::fabs(a.virial[k] - b.virial[k]) < 1e-6 * std::fabs(a.energy[0]));
+        CHECK(b.energy[0] == b2.energy[0]);
+        for (std::size_t k = 0; k < b.forces.size(); ++k) REQUIRE(b.forces[k] == b2.forces[k]);
+      }
+    }
+}

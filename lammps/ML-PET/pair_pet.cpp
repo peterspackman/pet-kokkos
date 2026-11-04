@@ -10,8 +10,19 @@
    Contributing author: Peter Spackman
 ------------------------------------------------------------------------- */
 
-// pair_style pet MODEL [mode images|exchange|ghosts] [gpu_aware auto|yes|no]
+// pair_style pet MODEL [mode images|exchange|ghosts] [gpu_aware auto|yes|no] [d3 FUNCTIONAL [d3 keywords]]
 // pair_coeff * * ELEMENT...        (one element symbol per atom type)
+//
+// d3 FUNCTIONAL adds Grimme's D3 dispersion (pet/d3.hpp) with that functional's
+// parameters: d3_damping bj|zero, d3_atm yes|no, d3_cutoff R, d3_cn_cutoff R,
+// d3_atm_cutoff R, d3_taper W (Angstrom; defaults 12, 8, 8 and 2), d3_tail
+// yes|no (the pair sum beyond the cutoff for a periodic box: mode images only),
+// d3_mixed yes|no (float arithmetic per pair, double sums: faster on GPUs with
+// slow fp64).
+// D3 searches the atoms itself: mode images sees the owned atoms in the box;
+// mode exchange needs ghosts to its pair cutoff (the ghost cutoff is raised to
+// it), whose CNs and dE/dCN cross by the same comm as PET's atom values; mode
+// ghosts needs its pair plus CN cutoff (also raised).
 //
 // MODEL is a pet-kokkos model name (searched on PET_MODEL_DIR and friends) or a
 // path prefix to MODEL.json and MODEL.safetensors. Units metal, newton pair on.
@@ -161,6 +172,10 @@ void PairPET::compute(int eflag, int vflag)
   if (eflag_atom)
     for (int i = 0; i < nlocal; ++i) eatom[i] += r.per_atom_energy[i];
   if (!forces) return;
+  // D3's per-atom virial, which no edge gradient holds; minus, as below.
+  if (vflag_atom && r.atom_virial.size() >= 6 * std::size_t(n))
+    for (int i = 0; i < n; ++i)
+      for (int k = 0; k < 6; ++k) vatom[i][k] -= r.atom_virial[6 * i + k];
   for (int i = 0; i < n; ++i)
     for (int c = 0; c < 3; ++c) f[i][c] += r.forces[3 * i + c];
   // LAMMPS's virial is sum (x_i - x_j) (x) F_i, minus pet-kokkos's sum v (x) dE/dv.
@@ -183,6 +198,12 @@ void PairPET::compute(int eflag, int vflag)
                              -0.5 * (d[0] * g[2] + d[2] * g[0]), -0.5 * (d[1] * g[2] + d[2] * g[1])};
         for (int k = 0; k < 6; ++k) vatom[i][k] += 0.5 * w[k], vatom[j][k] += 0.5 * w[k];
       }
+}
+
+// The box's periodic axes, for D3 in mode images (bit d: lattice vector d).
+int PairPET::periodic_axes() const
+{
+  return domain->xperiodic | domain->yperiodic << 1 | domain->zperiodic << 2;
 }
 
 // LAMMPS's h is xx yy zz yz xz xy; pet-kokkos wants the lattice vectors as rows.
@@ -595,6 +616,7 @@ void PairPET::set(int n, bool half)
   v.exchange = mode == Mode::Exchange ? &link : nullptr;
   v.atomic_numbers = z.data(), v.offsets = off.data(), v.neighbors = nbr.data();
   v.shifts = shift.empty() ? nullptr : shift.data();
+  v.periodic = mode == Mode::Images ? periodic_axes() : 0;
   try {
     calc->set_neighbors(v);
   } catch (std::exception &e) {
@@ -621,9 +643,27 @@ void PairPET::settings(int narg, char **arg)
     error->all(FLERR, "Illegal pair_style pet command: pair_style pet MODEL [mode images|exchange|ghosts] "
                       "[gpu_aware auto|yes|no]");
   mode = comm->nprocs == 1 ? Mode::Images : Mode::Exchange;
+  std::string d3_functional, d3_damping = "bj";
+  bool d3_atm = false, d3_tail = true, d3_mixed = false;
+  double d3_cut = -1, d3_cn = -1, d3_atm_cut = -1, d3_taper = -1;
+  auto yes = [&](const std::string &key, const std::string &val) {
+    if (val == "yes") return true;
+    if (val == "no") return false;
+    error->all(FLERR, "Illegal pair_style pet keyword: {} {} (yes or no)", key, val);
+    return false;
+  };
   for (int k = 1; k < narg; k += 2) {
     const std::string key = arg[k], val = arg[k + 1];
-    if (key == "mode" && val == "images") mode = Mode::Images;
+    if (key == "d3") d3_functional = val;
+    else if (key == "d3_damping") d3_damping = val;
+    else if (key == "d3_atm") d3_atm = yes(key, val);
+    else if (key == "d3_tail") d3_tail = yes(key, val);
+    else if (key == "d3_mixed") d3_mixed = yes(key, val);
+    else if (key == "d3_cutoff") d3_cut = utils::numeric(FLERR, val, false, lmp);
+    else if (key == "d3_cn_cutoff") d3_cn = utils::numeric(FLERR, val, false, lmp);
+    else if (key == "d3_atm_cutoff") d3_atm_cut = utils::numeric(FLERR, val, false, lmp);
+    else if (key == "d3_taper") d3_taper = utils::numeric(FLERR, val, false, lmp);
+    else if (key == "mode" && val == "images") mode = Mode::Images;
     else if (key == "mode" && val == "exchange") mode = Mode::Exchange;
     else if (key == "mode" && val == "ghosts") mode = Mode::Ghosts;
     else if (key == "gpu_aware" && val == "auto") aware = Aware::Auto;
@@ -667,6 +707,20 @@ void PairPET::settings(int narg, char **arg)
   // more than the launches it saves. PET_MD_FIXED=0|1 decides instead.
   opts.md_fixed_shapes = mode == Mode::Images && atom->natoms <= 2000;
   try {
+    if (!d3_functional.empty()) {
+      pet::D3Settings s = pet::D3Settings::functional(d3_functional, pet::d3_damping(d3_damping), d3_atm);
+      if (d3_cut > 0) s.cutoffs.pair = d3_cut;
+      if (d3_cn > 0) s.cutoffs.cn = d3_cn;
+      if (d3_atm_cut > 0) s.cutoffs.atm = d3_atm_cut;
+      if (d3_taper >= 0) s.cutoffs.pair_taper = s.cutoffs.cn_taper = s.cutoffs.atm_taper = d3_taper;
+      s.cutoffs.tail = d3_tail;
+      s.mixed_precision = d3_mixed;
+      opts.d3 = s;
+      if (comm->me == 0)
+        utils::logmesg(lmp, "pair_style pet: D3({}) {} damping{}, cutoffs {} / CN {} / ATM {} A, taper {} A{}\n",
+                       d3_functional, d3_damping, d3_atm ? " + ATM" : "", s.cutoffs.pair, s.cutoffs.cn,
+                       s.cutoffs.atm, s.cutoffs.pair_taper, s.cutoffs.tail ? ", tail (mode images)" : "");
+    }
     calc = std::make_unique<pet::Calculator>(arg[0], opts);
   } catch (std::exception &e) {
     error->all(FLERR, "pair_style pet: {}", e.what());
@@ -725,8 +779,13 @@ void PairPET::init_style()
     else neighbor->add_request(this);  // half: pet-kokkos mirrors it
     return;
   }
-  if (mode == Mode::Exchange) {  // owned atoms' lists; ghosts one cutoff deep
+  if (mode == Mode::Exchange) {  // owned atoms' lists; ghosts one cutoff deep, or D3's pair cutoff
     neighbor->add_request(this, NeighConst::REQ_FULL);
+    const double ghost = calc->exchange_ghost_cutoff() + neighbor->skin;
+    if (calc->d3() && comm->cutghostuser < ghost) {
+      comm->cutghostuser = ghost;
+      if (comm->me == 0) utils::logmesg(lmp, "pair_style pet: ghost cutoff raised to {:.4g} A for D3\n", ghost);
+    }
     return;
   }
   // Neighbours of ghosts too: their features feed the owned atoms' through the

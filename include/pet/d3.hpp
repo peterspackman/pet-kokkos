@@ -80,6 +80,10 @@ struct D3Cutoffs {
 struct D3Settings {
   D3Params params;
   D3Cutoffs cutoffs;
+  // Each pair's and triangle's arithmetic in float, its sums still in double:
+  // several times faster on a GPU with slow double precision (consumer cards),
+  // and within ~1e-7 relative of the double results. Off by default.
+  bool mixed_precision = false;
   // A functional's parameters with the default cutoffs.
   static D3Settings functional(const std::string& name, D3Damping damping = D3Damping::BJ, bool atm = false);
 };
