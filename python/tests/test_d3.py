@@ -21,7 +21,7 @@ CASES = json.loads(REFERENCE.read_text())["cases"]
 def test_matches_s_dftd3(case):
     cut = case["cutoffs_bohr"]
     bohr = 0.529177210903
-    d3 = pet_kokkos.D3(damping=case["damping"], **case["params"], s9=case["s9"], reference=True,
+    d3 = pet_kokkos.D3(damping=case["damping"], **case["params"], s9=case["s9"], reference=True, precision="double",
                        cutoff=cut["pair"] * bohr, cn_cutoff=cut["cn"] * bohr, atm_cutoff=cut["atm"] * bohr)
     r = d3.compute(case["numbers"], case["positions"], case.get("cell"), case.get("pbc"))
     assert abs(r["energy"] - case["energy"]) <= 2e-9 * abs(case["energy"])

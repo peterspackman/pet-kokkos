@@ -96,9 +96,9 @@ class D3:
         uniform continuum (energy, pressure and the forces through the CNs).
     reference: s-dftd3's cutoffs (95 bohr pairs, 40 bohr CN and three-body,
         hard, no tail): slow, for checking.
-    mixed_precision: each pair's and triangle's arithmetic in float, the sums
-        in double: several times faster on GPUs with slow double precision,
-        within ~1e-7 relative of the default (all double).
+    precision: "float" (the default, but "double" in an fp64 build), "mixed"
+        (each pair's and triangle's arithmetic in float, sums in double) or
+        "double"; see the README's "D3 dispersion" for each one's error.
 
     ``compute`` takes the arrays a Calculator does and returns ``energy``,
     ``energies`` [N] and, with forces, ``forces`` [N, 3] and ``virial`` [6].
@@ -126,14 +126,14 @@ class D3:
         atm_taper: float | None = None,
         tail: bool = True,
         reference: bool = False,
-        mixed_precision: bool = False,
+        precision: str | None = None,
     ):
         self.functional = functional
         self._d3 = _core.D3(
             functional, damping, atm, s6=s6, s8=s8, a1=a1, a2=a2, rs6=rs6, rs8=rs8, alpha=alpha, s9=s9,
             cutoff=cutoff, cutoff_taper=cutoff_taper, cn_cutoff=cn_cutoff, cn_taper=cn_taper,
             atm_cutoff=atm_cutoff, atm_taper=atm_taper, tail=tail, reference=reference,
-            mixed_precision=mixed_precision,
+            precision=precision,
         )
         _live.add(self)
 

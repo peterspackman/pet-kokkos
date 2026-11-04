@@ -22,6 +22,9 @@ pet::D3Settings settings(bool tail) {
   pet::D3Settings s = pet::D3Settings::functional("pbesol", pet::D3Damping::BJ, true);
   s.cutoffs.pair = 8.0, s.cutoffs.cn = 6.0, s.cutoffs.atm = 5.0;  // short: ghost shells stay small
   s.cutoffs.tail = tail;
+  // Double: an engine's ghosts sum the same terms in another order, to ~1e-10
+  // in double (and ~1e-6 in float, which test_d3.cpp covers).
+  s.precision = pet::D3Precision::Double;
   return s;
 }
 

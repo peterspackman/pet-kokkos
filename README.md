@@ -630,7 +630,7 @@ published on the command line and in Python). The Axilrod-Teller-Muto
 three-body term is off unless asked for (`--d3-atm`: s9 = 1). The reference C6
 table and parameters are tad-dftd3's (Apache-2.0; see [NOTICE](NOTICE)).
 
-**Accuracy against s-dftd3.** At s-dftd3's cutoffs (`--d3-reference`: pairs to
+**Accuracy against s-dftd3.** In double, at s-dftd3's cutoffs (`--d3-reference`: pairs to
 95 bohr, CN and three-body to 40 bohr), energies agree with s-dftd3 1.7.0 to
 1e-10 eV, forces to 1e-10 eV/Å and virials to 2e-9 eV, for both dampings with
 and without the three-body term, on molecules, small periodic cells (one atom of
@@ -679,29 +679,53 @@ triangles grow as r^6). Against 21 Å, with the 2 Å taper:
 | 12 Å | −0.03 meV | −0.07 meV | −0.6 meV | −4.5 meV |
 | 16 Å | −0.006 meV | −0.016 meV | −0.15 meV | −1.1 meV |
 
+**Precision.** D3's working precision is a setting (`D3Settings::precision`,
+`--d3-precision`, `precision=` in Python, `d3_precision` in LAMMPS): `double`;
+`mixed`, each pair's and triangle's arithmetic in float and everything kept per
+atom or summed in double; or `float` throughout. The default follows the
+network's: `float` (whose error is below an fp32 network's own rounding), and
+`double` in the fp64 build. The grid's setup and the results handed back (each
+structure's energy and virial summed over its atoms) are double in all three.
+Each against double, per atom, with the largest force and pressure differences
+(PBE, BJ; the double results match s-dftd3 to 1e-10):
+
+| | mixed | float |
+|---|---|---|
+| s-dftd3's cutoffs, water (648 and 5184) | 7e-9 meV, 2e-6 meV/Å, 8e-9 GPa | 2e-5 meV, 1e-4 meV/Å, 8e-7 GPa |
+| s-dftd3's cutoffs, diamond / Cu / W / CO2 | ≤ 3e-5 meV, 2e-5 meV/Å, 4e-7 GPa | ≤ 2e-4 meV, 3e-3 meV/Å, 1e-5 GPa |
+| default cutoffs, all of the above | ≤ 3e-5 meV, 2e-5 meV/Å, 4e-7 GPa | ≤ 2e-5 meV, 3e-3 meV/Å, 3e-6 GPa |
+| default cutoffs + three-body, all | ≤ 4e-5 meV, 2e-5 meV/Å, 5e-7 GPa | ≤ 2e-5 meV, 3e-3 meV/Å, 3e-6 GPa |
+| a 243-atom water cluster (no cell) | 2e-7 meV, 2e-6 meV/Å | 9e-7 meV, 2e-5 meV/Å |
+
+The largest float force difference (3e-6 eV/Å, in W) is a few parts in 10^6 of
+its forces; the truncation errors above are 100 to 10000 times larger. Float's
+forces are its energy's gradient to finite differences' resolution, and its
+results are as reproducible as double's: the same bits run to run and in any
+batch. NVE with pet-mad-xs + D3 (648 water molecules' atoms, 0.5 fs, 2 ps)
+drifts −0.043 meV/atom/ps with double D3, −0.028 mixed, −0.041 float, and
++0.018 without D3: the network's own drift.
+
 **Cost.** On an RTX 4080 SUPER (whose double precision is 1/64 of its single),
 the 5184-atom water box (`water_648` replicated 2x2x2), forces included:
 
 | | pet-eval, one evaluation | LAMMPS `pet/kk`, per MD step |
 |---|---|---|
-| pet-mad-xs | 21.7 ms | 20.4 ms |
-| pet-mad-xs + D3 | 25.8 ms | 24.4 ms |
-| pet-mad-xs + D3, `mixed_precision` | 24.5 ms | 23.1 ms |
-| pet-mad-s | 143.7 ms | 154.2 ms |
-| pet-mad-s + D3 | 148.4 ms | 158.6 ms |
-| D3 alone (default cutoffs) | 5.6 ms | |
-| D3 alone, + three-body (8 Å) | 112 ms (44 ms mixed) | |
-| D3 alone, s-dftd3's cutoffs | 157 ms | |
-| pet-mad-xs + D3, s-dftd3's cutoffs | 180 ms | |
+| pet-mad-xs | 21.4 ms | 20.4 ms |
+| pet-mad-xs + D3, float | 22.7-23.3 ms | |
+| pet-mad-xs + D3, mixed | 24.1 ms | 23.1 ms |
+| pet-mad-xs + D3, double | 25.5-26.3 ms | 24.4 ms |
+| pet-mad-s | 142.9-144.8 ms | 154.2 ms |
+| pet-mad-s + D3, float | 144.5-145.1 ms | |
+| pet-mad-s + D3, double | 146.9-147.9 ms | 158.6 ms |
+| D3 alone, float / mixed / double | 1.9 / 3.4 / 4.6 ms | |
+| D3 alone + three-body (8 Å), float / mixed / double | 7.6 / 41 / 111 ms | |
+| D3 alone, s-dftd3's cutoffs, float / double | 76 / 158 ms | |
 
-So D3 at the default cutoffs adds about a fifth to a pet-mad-xs step and 3% to
-a pet-mad-s one on this card; on GPUs with full-rate double precision (A100,
-H100/H200, MI250X) its share is smaller. The three-body term is the expensive
-part: each atom sums its ~(n^2)/2 neighbour pairs, so it is opt-in and keeps
-a short cutoff. `mixed_precision` (`--d3-mixed`, `d3_mixed yes`) does each
-pair's and triangle's arithmetic in float and keeps the sums in double: within
-~1e-7 relative of the default, and 2.5x faster for the three-body term; off by
-default.
+In float, D3 at the default cutoffs adds 6-9% to a pet-mad-xs step and 0.2-1%
+to a pet-mad-s one on this card (D3 alone includes pet-eval's staging of the
+structure; its passes take about 1.6 ms). On GPUs with full-rate double precision (A100, H100/H200, MI250X)
+double costs about what float does. The three-body term sums each atom's
+~(n^2)/2 neighbour pairs: opt-in, with a short cutoff.
 
 **How it runs.** No pair list is stored. Each structure is binned once per
 call (the PET search's counting sort, `sort_into_bins`, at a bin width chosen

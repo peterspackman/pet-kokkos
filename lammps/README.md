@@ -108,8 +108,8 @@ pair_style  pet pet-mad-s d3 pbesol d3_atm yes d3_damping zero d3_cutoff 15
 
 `d3_damping bj|zero`, `d3_atm yes|no` (the three-body term), `d3_cutoff`,
 `d3_cn_cutoff`, `d3_atm_cutoff` (Å; 12, 8, 8), `d3_taper` (Å, 2; 0 is a hard
-cutoff), `d3_tail yes|no` and `d3_mixed yes|no` (each pair's arithmetic in float,
-the sums in double: faster on GPUs with slow fp64, within ~1e-7 relative). D3 searches the atoms itself rather than using
+cutoff), `d3_tail yes|no` and `d3_precision float|mixed|double` (the default
+float, or double in an fp64 build; see the pet-kokkos README). D3 searches the atoms itself rather than using
 LAMMPS's list. In `images` mode it sees the owned atoms in the periodic box
 (the box's periodic axes), with the long-range tail. In `exchange` mode it needs
 ghosts to its pair cutoff, so the ghost cutoff is raised to it (LAMMPS's

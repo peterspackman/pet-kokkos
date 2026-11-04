@@ -71,8 +71,8 @@ void usage() {
       "      --d3-taper W     width of the smooth taper ending at each cutoff\n"
       "                       (default 2; 0 is a hard cutoff)\n"
       "      --d3-no-tail     no long-range tail correction for periodic frames\n"
-      "      --d3-mixed       each pair's arithmetic in float, sums in double: faster\n"
-      "                       on GPUs with slow fp64, within ~1e-7 relative\n"
+      "      --d3-precision P float (the default; double in an fp64 build), mixed\n"
+      "                       (float pairs, double sums) or double\n"
       "      --d3-reference   s-dftd3's cutoffs: 95 bohr pairs, 40 bohr CN and\n"
       "                       ATM, no taper, no tail (slow; for checking)\n"
       "      --d3-list        list the functionals with D3 parameters and exit\n"
@@ -113,7 +113,8 @@ struct Args {
   int spin = 1;
   // D3
   std::string d3_functional, d3_damping = "bj", d3_params;
-  bool d3_atm = false, d3_reference = false, d3_list = false, d3_no_tail = false, d3_mixed = false;
+  bool d3_atm = false, d3_reference = false, d3_list = false, d3_no_tail = false;
+  std::string d3_precision;
   double d3_cutoff = -1, d3_cn_cutoff = -1, d3_atm_cutoff = -1, d3_taper = -1;
   bool d3_only() const { return model_spec == "none"; }
 };
@@ -150,7 +151,7 @@ std::optional<pet::D3Settings> d3_settings(const Args& a) {
   if (a.d3_atm_cutoff > 0) s.cutoffs.atm = a.d3_atm_cutoff;
   if (a.d3_taper >= 0) s.cutoffs.pair_taper = s.cutoffs.cn_taper = s.cutoffs.atm_taper = a.d3_taper;
   if (a.d3_no_tail) s.cutoffs.tail = false;
-  s.mixed_precision = a.d3_mixed;
+  if (!a.d3_precision.empty()) s.precision = pet::d3_precision(a.d3_precision);
   return s;
 }
 
@@ -224,8 +225,8 @@ bool parse_args(int argc, char** argv, Args& a, int& rc) {
       a.d3_atm_cutoff = std::atof(next("--d3-atm-cutoff").c_str());
     } else if (s == "--d3-taper") {
       a.d3_taper = std::atof(next("--d3-taper").c_str());
-    } else if (s == "--d3-mixed") {
-      a.d3_mixed = true;
+    } else if (s == "--d3-precision") {
+      a.d3_precision = next("--d3-precision");
     } else if (s == "--d3-no-tail") {
       a.d3_no_tail = true;
     } else if (s == "--d3-reference") {
@@ -357,12 +358,12 @@ void print_json(const Args& a, const pet::Calculator* calc, const std::optional<
     const pet::D3Cutoffs& c = d3->cutoffs;
     std::printf("  \"d3\": {\"functional\": \"%s\", \"damping\": \"%s\", \"s6\": %s, \"s8\": %s, \"a1\": %s, "
                 "\"a2\": %s, \"rs6\": %s, \"rs8\": %s, \"alpha\": %s, \"s9\": %s, \"cutoff\": %s, \"taper\": %s, "
-                "\"cn_cutoff\": %s, \"cn_taper\": %s, \"atm_cutoff\": %s, \"atm_taper\": %s, \"tail\": %s},\n",
+                "\"cn_cutoff\": %s, \"cn_taper\": %s, \"atm_cutoff\": %s, \"atm_taper\": %s, \"tail\": %s, \"precision\": \"%s\"},\n",
                 a.d3_functional.c_str(), p.damping == pet::D3Damping::BJ ? "bj" : "zero", num(p.s6).c_str(),
                 num(p.s8).c_str(), num(p.a1).c_str(), num(p.a2).c_str(), num(p.rs6).c_str(), num(p.rs8).c_str(),
                 num(p.alpha).c_str(), num(p.s9).c_str(), num(c.pair).c_str(), num(c.pair_taper).c_str(),
                 num(c.cn).c_str(), num(c.cn_taper).c_str(), num(c.atm).c_str(), num(c.atm_taper).c_str(),
-                c.tail ? "true" : "false");
+                c.tail ? "true" : "false", pet::d3_precision_name(d3->precision));
   }
   std::printf("  \"seconds\": %s,\n", num(best_seconds).c_str());
   std::printf("  \"vesin\": %s,\n", pet::vesin_available() ? "true" : "false");

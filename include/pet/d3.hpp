@@ -57,6 +57,22 @@ D3Params d3_parameters(const std::string& functional, D3Damping damping = D3Damp
 std::vector<std::string> d3_functionals(D3Damping damping = D3Damping::BJ);
 D3Damping d3_damping(const std::string& name);  // "bj" | "rational" | "zero"
 
+// The arithmetic D3 is done in. Double: everything. Mixed: each pair's and
+// triangle's terms in float, everything kept per atom and every sum in double.
+// Float: all of it in float. The structure's frame and bins, and the results
+// handed back (D3::Out, each structure's sums), are double in every one.
+enum class D3Precision { Double, Mixed, Float };
+// The default follows the network's precision: Float where the network is fp32
+// (D3's float error, ~1e-6 relative, is below the network's own rounding;
+// README "D3 dispersion" has the numbers), Double in the fp64 build.
+#if defined(PET_KOKKOS_FP64)
+inline constexpr D3Precision kD3DefaultPrecision = D3Precision::Double;
+#else
+inline constexpr D3Precision kD3DefaultPrecision = D3Precision::Float;
+#endif
+D3Precision d3_precision(const std::string& name);  // "double" | "mixed" | "float"
+const char* d3_precision_name(D3Precision p);
+
 // Where each sum stops, in Angstrom: a term is multiplied by a smooth step from 1
 // at cutoff - taper to 0 at cutoff (taper 0: a hard cutoff, as s-dftd3's).
 //
@@ -80,10 +96,8 @@ struct D3Cutoffs {
 struct D3Settings {
   D3Params params;
   D3Cutoffs cutoffs;
-  // Each pair's and triangle's arithmetic in float, its sums still in double:
-  // several times faster on a GPU with slow double precision (consumer cards),
-  // and within ~1e-7 relative of the double results. Off by default.
-  bool mixed_precision = false;
+  // See D3Precision; README "D3 dispersion" has each one's errors and cost.
+  D3Precision precision = kD3DefaultPrecision;
   // A functional's parameters with the default cutoffs.
   static D3Settings functional(const std::string& name, D3Damping damping = D3Damping::BJ, bool atm = false);
 };

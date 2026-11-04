@@ -63,6 +63,7 @@ std::vector<Case> load_cases() {
       q.rs6 = p.at("rs6").get<double>(), q.rs8 = p.at("rs8").get<double>();
     }
     q.s9 = c.at("s9").get<double>();
+    k.set.precision = pet::D3Precision::Double;  // s-dftd3 to ~1e-10
     const auto& cut = c.at("cutoffs_bohr");
     k.set.cutoffs = pet::D3Cutoffs::reference();
     k.set.cutoffs.pair = cut.at("pair").get<double>() * kBohr;
@@ -147,6 +148,11 @@ TEST_CASE("D3 functional parameters by name", "[d3]") {
   CHECK_THROWS(pet::d3_parameters("no-such-functional"));
   CHECK_THROWS(pet::d3_parameters("r2scan", pet::D3Damping::Zero));  // BJ only
   CHECK(pet::d3_functionals().size() > 100);
+  // The default precision follows the network's: float, double in the fp64 build.
+  CHECK(pet::D3Settings{}.precision ==
+        (std::is_same_v<pet::Net, double> ? pet::D3Precision::Double : pet::D3Precision::Float));
+  CHECK(pet::d3_precision("mixed") == pet::D3Precision::Mixed);
+  CHECK_THROWS(pet::d3_precision("half"));
 }
 
 // The default cutoffs taper smoothly: forces and virial are the energy's
@@ -157,6 +163,7 @@ TEST_CASE("D3 forces and virial are the energy's gradient", "[d3]") {
     for (auto damping : {pet::D3Damping::BJ, pet::D3Damping::Zero}) {
       DYNAMIC_SECTION((damping == pet::D3Damping::BJ ? "bj" : "zero") << (atm ? "+atm" : "")) {
         pet::D3Settings set = pet::D3Settings::functional("pbe", damping, atm);
+        set.precision = pet::D3Precision::Double;  // central differences to 1e-7: float's are below
         // Short cutoffs, so that many pairs sit inside the tapers.
         set.cutoffs.pair = 7.0, set.cutoffs.pair_taper = 2.5;
         set.cutoffs.cn = 5.0, set.cutoffs.cn_taper = 2.0;
@@ -209,28 +216,34 @@ TEST_CASE("D3 is bit-reproducible and batch-independent", "[d3][determinism]") {
   const pet::System a = water_box(3, 5), b = water_box(2, 9);
   pet::System mol;
   mol.n_atoms = 3, mol.atomic_numbers = {8, 1, 1}, mol.positions = {0, 0, 0, 0.757, 0.586, 0, -0.757, 0.586, 0};
-  pet::D3 d3(pet::D3Settings::functional("pbesol", pet::D3Damping::BJ, true));
-  const pet::Results ra = d3.compute(a), rb = d3.compute(b), rm = d3.compute(mol);
-  const pet::Results r2 = d3.compute(a);
-  REQUIRE(ra.energy[0] == r2.energy[0]);
-  for (std::size_t k = 0; k < ra.forces.size(); ++k) REQUIRE(ra.forces[k] == r2.forces[k]);
-  for (int k = 0; k < 6; ++k) REQUIRE(ra.virial[k] == r2.virial[k]);
-  // In a batch, each structure's answer is its own, to the bit.
-  const pet::Results all = d3.compute(std::vector<pet::System>{b, mol, a});
-  REQUIRE(all.energy.size() == 3);
-  CHECK(all.energy[0] == rb.energy[0]);
-  CHECK(all.energy[1] == rm.energy[0]);
-  CHECK(all.energy[2] == ra.energy[0]);
-  const std::size_t ob = 3 * b.n_atoms, om = 3 * mol.n_atoms;
-  for (std::size_t k = 0; k < rb.forces.size(); ++k) REQUIRE(all.forces[k] == rb.forces[k]);
-  for (std::size_t k = 0; k < rm.forces.size(); ++k) REQUIRE(all.forces[ob + k] == rm.forces[k]);
-  for (std::size_t k = 0; k < ra.forces.size(); ++k) REQUIRE(all.forces[ob + om + k] == ra.forces[k]);
-  for (int k = 0; k < 6; ++k) REQUIRE(all.virial[12 + k] == ra.virial[k]);
-  // A molecule has no virial to speak of but its sum is still W = sum r (x) F.
-  // Translation: the energy does not move.
-  pet::System t = a;
-  for (int i = 0; i < t.n_atoms; ++i) t.positions[3 * i] += 0.37;
-  CHECK(std::fabs(d3.compute(t).energy[0] - ra.energy[0]) < 1e-10 * std::fabs(ra.energy[0]));
+  for (auto prec : {pet::D3Precision::Double, pet::D3Precision::Mixed, pet::D3Precision::Float}) {
+    DYNAMIC_SECTION(pet::d3_precision_name(prec)) {
+      pet::D3Settings set = pet::D3Settings::functional("pbesol", pet::D3Damping::BJ, true);
+      set.precision = prec;
+      pet::D3 d3(set);
+      const pet::Results ra = d3.compute(a), rb = d3.compute(b), rm = d3.compute(mol);
+      const pet::Results r2 = d3.compute(a);
+      REQUIRE(ra.energy[0] == r2.energy[0]);
+      for (std::size_t k = 0; k < ra.forces.size(); ++k) REQUIRE(ra.forces[k] == r2.forces[k]);
+      for (int k = 0; k < 6; ++k) REQUIRE(ra.virial[k] == r2.virial[k]);
+      // In a batch, each structure's answer is its own, to the bit.
+      const pet::Results all = d3.compute(std::vector<pet::System>{b, mol, a});
+      REQUIRE(all.energy.size() == 3);
+      CHECK(all.energy[0] == rb.energy[0]);
+      CHECK(all.energy[1] == rm.energy[0]);
+      CHECK(all.energy[2] == ra.energy[0]);
+      const std::size_t ob = 3 * b.n_atoms, om = 3 * mol.n_atoms;
+      for (std::size_t k = 0; k < rb.forces.size(); ++k) REQUIRE(all.forces[k] == rb.forces[k]);
+      for (std::size_t k = 0; k < rm.forces.size(); ++k) REQUIRE(all.forces[ob + k] == rm.forces[k]);
+      for (std::size_t k = 0; k < ra.forces.size(); ++k) REQUIRE(all.forces[ob + om + k] == ra.forces[k]);
+      for (int k = 0; k < 6; ++k) REQUIRE(all.virial[12 + k] == ra.virial[k]);
+      // Translation moves the energy by rounding only.
+      pet::System t = a;
+      for (int i = 0; i < t.n_atoms; ++i) t.positions[3 * i] += 0.37;
+      const double tol = prec == pet::D3Precision::Double ? 1e-10 : 1e-5;
+      CHECK(std::fabs(d3.compute(t).energy[0] - ra.energy[0]) < tol * std::fabs(ra.energy[0]));
+    }
+  }
 }
 
 // An engine's view: owned atoms and ghosts, without periodicity. The owned
@@ -242,6 +255,7 @@ TEST_CASE("D3 with ghosts matches the periodic structure", "[d3]") {
   set.cutoffs.pair = 6.0, set.cutoffs.pair_taper = 1.5, set.cutoffs.cn = 4.0, set.cutoffs.cn_taper = 1.0;
   set.cutoffs.atm = 4.0, set.cutoffs.atm_taper = 1.0;
   set.cutoffs.tail = false;  // an engine's ghosts have no cell, so no tail
+  set.precision = pet::D3Precision::Double;  // the same sums in another order: to 1e-10
   const pet::D3 d3(set);
   const pet::Results ref = d3.compute(s);
   // Ghosts: every image within ghost_cutoff (no exchange) of the cell.
@@ -293,6 +307,7 @@ TEST_CASE("D3 ATM past the neighbour list's capacity", "[d3]") {
   const pet::System s = water_box(2, 21);
   pet::D3Settings set = pet::D3Settings::functional("pbe", pet::D3Damping::BJ, true);
   set.cutoffs.atm = 5.0, set.cutoffs.atm_taper = 1.0;
+  set.precision = pet::D3Precision::Double;  // the same sums in another order: to 1e-12
   const pet::D3 a(set);
   const pet::Results ra = a.compute(s);
   setenv("PET_D3_ATM_CAP", "8", 1);
@@ -304,29 +319,64 @@ TEST_CASE("D3 ATM past the neighbour list's capacity", "[d3]") {
   for (int k = 0; k < 6; ++k) CHECK(std::fabs(ra.virial[k] - rb.virial[k]) < 1e-11);
 }
 
-// Mixed precision: float arithmetic per pair and triangle, double sums. Within
-// ~1e-6 relative of the double path, and as reproducible.
-TEST_CASE("D3 in mixed precision", "[d3]") {
-  const pet::System s = water_box(3, 13);
-  for (int atm = 0; atm < 2; ++atm)
-    for (auto damping : {pet::D3Damping::BJ, pet::D3Damping::Zero}) {
-      DYNAMIC_SECTION((damping == pet::D3Damping::BJ ? "bj" : "zero") << (atm ? "+atm" : "")) {
-        pet::D3Settings set = pet::D3Settings::functional("pbe", damping, atm);
-        set.cutoffs.atm = 5.0;
-        const pet::D3 dbl(set);
-        set.mixed_precision = true;
-        const pet::D3 mix(set);
-        const pet::Results a = dbl.compute(s), b = mix.compute(s), b2 = mix.compute(s);
-        INFO("E " << a.energy[0] << " mixed " << b.energy[0]);
-        CHECK(std::fabs(a.energy[0] - b.energy[0]) < 1e-6 * std::fabs(a.energy[0]));
-        double err = 0, scale = 0;
-        for (std::size_t k = 0; k < a.forces.size(); ++k)
-          err = worst(err, std::fabs(a.forces[k] - b.forces[k])), scale = std::max(scale, std::fabs(a.forces[k]));
-        INFO("force error " << err << " of " << scale);
-        CHECK(err < 1e-5 * scale);
-        for (int k = 0; k < 6; ++k) CHECK(std::fabs(a.virial[k] - b.virial[k]) < 1e-6 * std::fabs(a.energy[0]));
-        CHECK(b.energy[0] == b2.energy[0]);
-        for (std::size_t k = 0; k < b.forces.size(); ++k) REQUIRE(b.forces[k] == b2.forces[k]);
+// Every precision against double: the same answer to float's rounding, as
+// reproducible, and each structure's own in a batch.
+TEST_CASE("D3 in mixed and float precision", "[d3]") {
+  const pet::System s = water_box(3, 13), small = water_box(2, 7);
+  for (auto prec : {pet::D3Precision::Mixed, pet::D3Precision::Float})
+    for (int atm = 0; atm < 2; ++atm)
+      for (auto damping : {pet::D3Damping::BJ, pet::D3Damping::Zero}) {
+        DYNAMIC_SECTION(pet::d3_precision_name(prec) << " " << (damping == pet::D3Damping::BJ ? "bj" : "zero")
+                                                     << (atm ? "+atm" : "")) {
+          pet::D3Settings set = pet::D3Settings::functional("pbe", damping, atm);
+          set.cutoffs.atm = 5.0;
+          set.precision = pet::D3Precision::Double;
+          const pet::D3 dbl(set);
+          set.precision = prec;
+          const pet::D3 low(set);
+          const pet::Results a = dbl.compute(s), b = low.compute(s), b2 = low.compute(s);
+          // Float's tolerances: its sums over ~10^3 pair terms per atom.
+          const double tol = prec == pet::D3Precision::Float ? 2e-5 : 2e-6;
+          INFO("E " << a.energy[0] << " " << pet::d3_precision_name(prec) << " " << b.energy[0]);
+          CHECK(std::fabs(a.energy[0] - b.energy[0]) < tol * std::fabs(a.energy[0]));
+          double err = 0, scale = 0;
+          for (std::size_t k = 0; k < a.forces.size(); ++k)
+            err = worst(err, std::fabs(a.forces[k] - b.forces[k])), scale = std::max(scale, std::fabs(a.forces[k]));
+          INFO("force error " << err << " of " << scale);
+          CHECK(err < 10 * tol * scale);
+          for (int k = 0; k < 6; ++k) CHECK(std::fabs(a.virial[k] - b.virial[k]) < tol * std::fabs(a.energy[0]));
+          // To the bit, run to run and in a batch.
+          REQUIRE(b.energy[0] == b2.energy[0]);
+          for (std::size_t k = 0; k < b.forces.size(); ++k) REQUIRE(b.forces[k] == b2.forces[k]);
+          const pet::Results one = low.compute(small), both = low.compute(std::vector<pet::System>{small, s});
+          REQUIRE(both.energy[0] == one.energy[0]);
+          REQUIRE(both.energy[1] == b.energy[0]);
+          for (std::size_t k = 0; k < b.forces.size(); ++k) REQUIRE(both.forces[one.forces.size() + k] == b.forces[k]);
+          for (int k = 0; k < 6; ++k) REQUIRE(both.virial[6 + k] == b.virial[k]);
+        }
       }
+}
+
+// Float's forces are still its energy's gradient, to float's resolution:
+// central differences with a step float can resolve.
+TEST_CASE("D3 float forces are the energy's gradient", "[d3]") {
+  const pet::System s = water_box(2, 11);
+  pet::D3Settings set = pet::D3Settings::functional("pbe", pet::D3Damping::BJ, true);
+  set.cutoffs.pair = 7.0, set.cutoffs.pair_taper = 2.5, set.cutoffs.cn = 5.0, set.cutoffs.cn_taper = 2.0;
+  set.cutoffs.atm = 4.5, set.cutoffs.atm_taper = 1.5;
+  set.precision = pet::D3Precision::Float;
+  const pet::D3 d3(set);
+  const pet::Results r = d3.compute(s);
+  const double h = 1e-2;  // float energies resolve ~5e-8 eV: the step keeps that noise to ~3e-6 eV/A
+  double err = 0, scale = 0;
+  for (int i = 0; i < s.n_atoms; i += 3)
+    for (int d = 0; d < 3; ++d) {
+      pet::System p = s, m = s;
+      p.positions[3 * i + d] += h, m.positions[3 * i + d] -= h;
+      const double fd = -(d3.compute(p, false).energy[0] - d3.compute(m, false).energy[0]) / (2 * h);
+      err = worst(err, std::fabs(fd - r.forces[3 * i + d]));
+      scale = std::max(scale, std::fabs(fd));
     }
+  INFO("force FD error " << err << " of " << scale);
+  CHECK(err < 1e-3 * scale + 4e-6);
 }

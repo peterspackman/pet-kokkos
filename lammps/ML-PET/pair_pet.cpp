@@ -17,8 +17,7 @@
 // parameters: d3_damping bj|zero, d3_atm yes|no, d3_cutoff R, d3_cn_cutoff R,
 // d3_atm_cutoff R, d3_taper W (Angstrom; defaults 12, 8, 8 and 2), d3_tail
 // yes|no (the pair sum beyond the cutoff for a periodic box: mode images only),
-// d3_mixed yes|no (float arithmetic per pair, double sums: faster on GPUs with
-// slow fp64).
+// d3_precision double|mixed|float (pet::D3Precision).
 // D3 searches the atoms itself: mode images sees the owned atoms in the box;
 // mode exchange needs ghosts to its pair cutoff (the ghost cutoff is raised to
 // it), whose CNs and dE/dCN cross by the same comm as PET's atom values; mode
@@ -644,7 +643,8 @@ void PairPET::settings(int narg, char **arg)
                       "[gpu_aware auto|yes|no]");
   mode = comm->nprocs == 1 ? Mode::Images : Mode::Exchange;
   std::string d3_functional, d3_damping = "bj";
-  bool d3_atm = false, d3_tail = true, d3_mixed = false;
+  bool d3_atm = false, d3_tail = true;
+  std::string d3_precision;
   double d3_cut = -1, d3_cn = -1, d3_atm_cut = -1, d3_taper = -1;
   auto yes = [&](const std::string &key, const std::string &val) {
     if (val == "yes") return true;
@@ -658,7 +658,7 @@ void PairPET::settings(int narg, char **arg)
     else if (key == "d3_damping") d3_damping = val;
     else if (key == "d3_atm") d3_atm = yes(key, val);
     else if (key == "d3_tail") d3_tail = yes(key, val);
-    else if (key == "d3_mixed") d3_mixed = yes(key, val);
+    else if (key == "d3_precision") d3_precision = val;
     else if (key == "d3_cutoff") d3_cut = utils::numeric(FLERR, val, false, lmp);
     else if (key == "d3_cn_cutoff") d3_cn = utils::numeric(FLERR, val, false, lmp);
     else if (key == "d3_atm_cutoff") d3_atm_cut = utils::numeric(FLERR, val, false, lmp);
@@ -714,12 +714,13 @@ void PairPET::settings(int narg, char **arg)
       if (d3_atm_cut > 0) s.cutoffs.atm = d3_atm_cut;
       if (d3_taper >= 0) s.cutoffs.pair_taper = s.cutoffs.cn_taper = s.cutoffs.atm_taper = d3_taper;
       s.cutoffs.tail = d3_tail;
-      s.mixed_precision = d3_mixed;
+      if (!d3_precision.empty()) s.precision = pet::d3_precision(d3_precision);
       opts.d3 = s;
       if (comm->me == 0)
-        utils::logmesg(lmp, "pair_style pet: D3({}) {} damping{}, cutoffs {} / CN {} / ATM {} A, taper {} A{}\n",
+        utils::logmesg(lmp, "pair_style pet: D3({}) {} damping{}, cutoffs {} / CN {} / ATM {} A, taper {} A{}, {}\n",
                        d3_functional, d3_damping, d3_atm ? " + ATM" : "", s.cutoffs.pair, s.cutoffs.cn,
-                       s.cutoffs.atm, s.cutoffs.pair_taper, s.cutoffs.tail ? ", tail (mode images)" : "");
+                       s.cutoffs.atm, s.cutoffs.pair_taper, s.cutoffs.tail ? ", tail (mode images)" : "",
+                       pet::d3_precision_name(s.precision));
     }
     calc = std::make_unique<pet::Calculator>(arg[0], opts);
   } catch (std::exception &e) {
