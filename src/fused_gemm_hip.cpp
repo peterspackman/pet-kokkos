@@ -125,10 +125,11 @@ mg::Rows rows(const View2D& v) { return {v.data(), int(v.extent(1))}; }
 struct SwigluAdj {
   const float *h_adj, *pre;
   int F;
+  bool fast;
   __device__ float4 operator()(int r, int k) const {
     const float2 ha = *reinterpret_cast<const float2*>(h_adj + size_t(r) * F + k / 2);
     const float4 p = *reinterpret_cast<const float4*>(pre + size_t(r) * 2 * F + k);
-    const float s0 = sigmoid(p.y), s1 = sigmoid(p.w);
+    const float s0 = sigmoid(p.y, fast), s1 = sigmoid(p.w, fast);
     return float4{ha.x * s0, ha.x * p.x * s0 * (1.0f - s0), ha.y * s1, ha.y * p.z * s1 * (1.0f - s1)};
   }
 };
@@ -163,6 +164,7 @@ struct SwigluFwd {
   float *pre, *h;
   const float* b;
   int N;
+  bool fast;
   using Col = Bias;
   using Row = NoRow;
   __device__ void col(int c, Col& x) const { load<4>(b + c, x.b); }
@@ -174,7 +176,7 @@ struct SwigluFwd {
     store<4>(pre + std::size_t(r) * N + c, p);
     if (!h) return;
 #pragma unroll
-    for (int j = 0; j < 2; ++j) q[j] = p[2 * j] * sigmoid(p[2 * j + 1]);
+    for (int j = 0; j < 2; ++j) q[j] = p[2 * j] * sigmoid(p[2 * j + 1], fast);
     store<2>(h + std::size_t(r) * (N / 2) + c / 2, q);
   }
 };
@@ -184,6 +186,7 @@ struct SwigluBwd {
   const float* pre;
   float* pre_adj;
   int F;
+  bool fast;
   using Col = NoRow;
   struct Row {
     float p[8];
@@ -199,7 +202,7 @@ struct SwigluBwd {
     float q[8];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      const float v = p[2 * j], sg = sigmoid(p[2 * j + 1]);
+      const float v = p[2 * j], sg = sigmoid(p[2 * j + 1], fast);
       q[2 * j] = ha[j] * sg;
       q[2 * j + 1] = ha[j] * v * sg * (1.0f - sg);
     }
@@ -212,6 +215,7 @@ struct SiluFwd {
   float *out, *pre;
   const float* b;
   int N;
+  bool fast;
   using Col = Bias;
   using Row = NoRow;
   __device__ void col(int c, Col& x) const {
@@ -229,7 +233,7 @@ struct SiluFwd {
     const std::size_t at = std::size_t(r) * N + c;
     if (pre) store<4>(pre + at, p);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) o[j] = p[j] * sigmoid(p[j]);
+    for (int j = 0; j < 4; ++j) o[j] = p[j] * sigmoid(p[j], fast);
     store<4>(out + at, o);
   }
 };
@@ -239,6 +243,7 @@ struct SiluBwd {
   const float* pre;
   float* grad;
   int N;
+  bool fast;
   using Col = NoRow;
   struct Row {
     float x[4];
@@ -251,7 +256,7 @@ struct SiluBwd {
     float g[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      const float sg = sigmoid(x[j]);
+      const float sg = sigmoid(x[j], fast);
       g[j] = a[j] * sg * (1.0f + x[j] * (1.0f - sg));
     }
     store<4>(grad + at, g);
@@ -365,28 +370,28 @@ bool linear_fused(View2D out, View2D in, const View2D& w, bool w_transposed, Vie
 bool silu_in_fused(View2D out, View2D pre, View2D in, const View2D& w, View1D b) {
   if (!usable(in, w) || !vec_ok(out) || (pre.data() && !vec_ok(pre)) || (b.data() && !vec_ok(b))) return false;
   launch<CM>("fused linear_silu", out.extent(0), out.extent(1), in.extent(1), rows(in), w.data(),
-             SiluFwd{out.data(), pre.data(), b.data(), int(out.extent(1))});
+             SiluFwd{out.data(), pre.data(), b.data(), int(out.extent(1)), fast_sigmoid()});
   return true;
 }
 
 bool silu_bwd_fused(View2D grad, View2D out_adj, const View2D& w, View2D pre) {
   if (!usable(out_adj, w) || !vec_ok(grad) || !vec_ok(pre)) return false;
   launch<RM>("fused silu_bwd", grad.extent(0), grad.extent(1), out_adj.extent(1), rows(out_adj), w.data(),
-             SiluBwd{pre.data(), grad.data(), int(grad.extent(1))});
+             SiluBwd{pre.data(), grad.data(), int(grad.extent(1)), fast_sigmoid()});
   return true;
 }
 
 bool swiglu_in_fused(View2D pre, View2D h, View2D in, const View2D& w, View1D b) {
   if (!usable(in, w) || !vec_ok(pre) || (h.data() && !vec_ok(h)) || !vec_ok(b)) return false;
   launch<CM>("fused swiglu_in", pre.extent(0), pre.extent(1), in.extent(1), rows(in), w.data(),
-             SwigluFwd{pre.data(), h.data(), b.data(), int(pre.extent(1))});
+             SwigluFwd{pre.data(), h.data(), b.data(), int(pre.extent(1)), fast_sigmoid()});
   return true;
 }
 
 bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2D pre) {
   if (!usable(out_adj, w_out) || !vec_ok(pre) || !vec_ok(pre_adj) || w_out.extent(1) % 4) return false;
   launch<RM>("fused swiglu_bwd", out_adj.extent(0), w_out.extent(1), out_adj.extent(1), rows(out_adj), w_out.data(),
-             SwigluBwd{pre.data(), pre_adj.data(), int(w_out.extent(1))});
+             SwigluBwd{pre.data(), pre_adj.data(), int(w_out.extent(1)), fast_sigmoid()});
   return true;
 }
 
@@ -406,7 +411,7 @@ bool swiglu_bwd_deferred(Workspace& ws, View2D in_adj, View2D out_adj, View2D pr
   const int N = in_adj.extent(1);
   launch<RM>("swiglu_bwd h_adj", R, F, out_adj.extent(1), rows(out_adj), w_out.v.data(),
              Plain{h_adj.data(), nullptr, 0.0f, F});
-  launch<RM>("swiglu_bwd in_adj", R, N, 2 * F, SwigluAdj{h_adj.data(), pre.data(), F}, w_in.v.data(),
+  launch<RM>("swiglu_bwd in_adj", R, N, 2 * F, SwigluAdj{h_adj.data(), pre.data(), F, fast_sigmoid()}, w_in.v.data(),
              Plain{in_adj.data(), nullptr, float(beta), N});
   return true;
 }

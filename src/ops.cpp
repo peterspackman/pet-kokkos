@@ -60,22 +60,24 @@ void linear_silu(View2D out, View2D pre, View2D in, const WeightRef& W, View1D b
   const View2D z = save ? pre : out;
   linear(z, in, W, b);
   const int n = out.extent(0) * out.extent(1);
+  const bool fast = fast_sigmoid();
   if (quads(out) && quads(z)) {
     Net *o = out.data(), *p = z.data();
     Kokkos::parallel_for(
         "silu", RangePolicy(0, n / 4), KOKKOS_LAMBDA(int q) {
           Quad v = quad(p, q);
-          for (int j = 0; j < 4; ++j) v.v[j] = silu(v.v[j]);
+          for (int j = 0; j < 4; ++j) v.v[j] *= sigmoid(v.v[j], fast);
           quad(o, q) = v;
         });
     return;
   }
   View1D o(out.data(), n), p(z.data(), n);
-  Kokkos::parallel_for("silu", RangePolicy(0, n), KOKKOS_LAMBDA(int i) { o(i) = silu(p(i)); });
+  Kokkos::parallel_for("silu", RangePolicy(0, n), KOKKOS_LAMBDA(int i) { o(i) = p(i) * sigmoid(p(i), fast); });
 }
 
 void silu_bwd(View2D grad, View2D pre) {
   const int n = grad.extent(0) * grad.extent(1);
+  const bool fast = fast_sigmoid();
   if (quads(grad) && quads(pre)) {
     Net *g = grad.data(), *p = pre.data();
     Kokkos::parallel_for(
@@ -83,7 +85,7 @@ void silu_bwd(View2D grad, View2D pre) {
           const Quad x = quad(p, q);
           Quad y = quad(g, q);
           for (int j = 0; j < 4; ++j) {
-            const Net sg = sigmoid(x.v[j]);
+            const Net sg = sigmoid(x.v[j], fast);
             y.v[j] *= sg * (Net(1) + x.v[j] * (Net(1) - sg));
           }
           quad(g, q) = y;
@@ -93,7 +95,7 @@ void silu_bwd(View2D grad, View2D pre) {
   View1D g(grad.data(), n), p(pre.data(), n);
   Kokkos::parallel_for(
       "silu_bwd", RangePolicy(0, n), KOKKOS_LAMBDA(int i) {
-        const Net x = p(i), sg = sigmoid(x);
+        const Net x = p(i), sg = sigmoid(x, fast);
         g(i) *= sg * (Net(1) + x * (Net(1) - sg));
       });
 }
@@ -249,21 +251,22 @@ void swiglu_in(View2D pre, View2D h, View2D in, const WeightRef& w_in, View1D b_
   linear(pre, in, w_in, b_in);
   if (!h.data()) return;
   const int F = h.extent(1);
+  const bool fast = fast_sigmoid();
   if (quads(h) && quads(pre) && pre.size() == 2 * h.size()) {
     // Flat: h's value j is pre's 2j and 2j + 1 (pre rows are twice as wide).
     Net *hp = h.data(), *pp = pre.data();
     Kokkos::parallel_for(
         "swiglu", RangePolicy(0, int(h.size() / 4)), KOKKOS_LAMBDA(int q) {
           const Quad a = quad(pp, 2 * q), b = quad(pp, 2 * q + 1);
-          quad(hp, q) = {{a.v[0] * sigmoid(a.v[1]), a.v[2] * sigmoid(a.v[3]), b.v[0] * sigmoid(b.v[1]),
-                          b.v[2] * sigmoid(b.v[3])}};
+          quad(hp, q) = {{a.v[0] * sigmoid(a.v[1], fast), a.v[2] * sigmoid(a.v[3], fast), b.v[0] * sigmoid(b.v[1], fast),
+                          b.v[2] * sigmoid(b.v[3], fast)}};
         });
     return;
   }
   Kokkos::parallel_for(
       "swiglu", RangePolicy(0, h.extent(0) * F), KOKKOS_LAMBDA(int i) {
         const int r = i / F, c = i % F;
-        h(r, c) = pre(r, 2 * c) * sigmoid(pre(r, 2 * c + 1));
+        h(r, c) = pre(r, 2 * c) * sigmoid(pre(r, 2 * c + 1), fast);
       });
 }
 
@@ -283,6 +286,7 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
   View2D pre_adj = ws.tmp(R, 2 * F);
   if (w_out.split || !swiglu_bwd_fused(pre_adj, out_adj, w_out.v, pre)) {
     View2D h_adj = ws.tmp(R, F);
+    const bool fast = fast_sigmoid();
     linear_bwd(h_adj, out_adj, w_out, 0);
     if (quads(h_adj) && quads(pre) && quads(pre_adj)) {
       Net *ha = h_adj.data(), *pp = pre.data(), *pa = pre_adj.data();
@@ -293,7 +297,7 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
               const Quad x = quad(pp, 2 * q + half);
               Quad y;
               for (int j = 0; j < 2; ++j) {
-                const Net v = x.v[2 * j], sg = sigmoid(x.v[2 * j + 1]), gj = g.v[2 * half + j];
+                const Net v = x.v[2 * j], sg = sigmoid(x.v[2 * j + 1], fast), gj = g.v[2 * half + j];
                 y.v[2 * j] = gj * sg;
                 y.v[2 * j + 1] = gj * v * sg * (Net(1) - sg);
               }
@@ -304,7 +308,7 @@ void swiglu_bwd(Workspace& ws, View2D in_adj, View2D out_adj, View2D pre, const 
       Kokkos::parallel_for(
           "swiglu_bwd", RangePolicy(0, R * F), KOKKOS_LAMBDA(int i) {
             const int r = i / F, c = i % F;
-            const Net v = pre(r, 2 * c), sg = sigmoid(pre(r, 2 * c + 1));
+            const Net v = pre(r, 2 * c), sg = sigmoid(pre(r, 2 * c + 1), fast);
             pre_adj(r, 2 * c) = h_adj(r, c) * sg;
             pre_adj(r, 2 * c + 1) = h_adj(r, c) * v * sg * (Net(1) - sg);
           });
@@ -372,6 +376,7 @@ void compress_bwd(View2D g, View2D et_adj, const WeightRef& w2, View2D pre, cons
   const bool fused = !w2.split && silu_bwd_fused(g, et_adj, w2.v, pre);
   if (!fused) linear_bwd(g, et_adj, w2, 0);
   auto wx = f.wx;
+  const bool fast = fast_sigmoid();
   Kokkos::parallel_for(
       "compress_bwd", norm_policy(E), KOKKOS_LAMBDA(const Team& t) {
         const int r = t.league_rank() * kNormRows + t.team_rank();
@@ -382,7 +387,7 @@ void compress_bwd(View2D g, View2D et_adj, const WeightRef& w2, View2D pre, cons
             [&](int d, Net& s0, Net& s1, Net& s2, Net& s3) {
               Net gd = g(r, d);
               if (!fused) {
-                const Net x = pre(r, d), sg = sigmoid(x);
+                const Net x = pre(r, d), sg = sigmoid(x, fast);
                 g(r, d) = gd = gd * sg * (Net(1) + x * (Net(1) - sg));
               }
               s0 += gd * wx(d, 0), s1 += gd * wx(d, 1), s2 += gd * wx(d, 2), s3 += gd * wx(d, 3);

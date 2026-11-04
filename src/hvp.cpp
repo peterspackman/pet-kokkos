@@ -27,6 +27,7 @@
 // or key for the attention; tests/test_hvp.cpp holds the whole product to
 // finite differences.
 #include "ops.hpp"
+#include "pet/gemm.hpp"
 
 #include "pet/cutoff.hpp"
 
@@ -37,12 +38,12 @@ namespace pet {
 
 namespace {
 
-KOKKOS_INLINE_FUNCTION Net dsilu(Net z) {
-  const Net s = sigmoid(z);
+KOKKOS_INLINE_FUNCTION Net dsilu(Net z, bool fast) {
+  const Net s = sigmoid(z, fast);
   return s * (Net(1) + z * (Net(1) - s));
 }
-KOKKOS_INLINE_FUNCTION Net d2silu(Net z) {
-  const Net s = sigmoid(z);
+KOKKOS_INLINE_FUNCTION Net d2silu(Net z, bool fast) {
+  const Net s = sigmoid(z, fast);
   return s * (Net(1) - s) * (Net(2) + z * (Net(1) - Net(2) * s));
 }
 
@@ -74,10 +75,11 @@ KOKKOS_INLINE_FUNCTION void cut_derivs(double d, double rc, double w, int kind, 
 // out_t = silu'(z) z_t; z [R, C], z_t and out_t [K R, C].
 void act_tan(View2D out_t, View2D z, View2D z_t) {
   const int R = z.extent(0), C = z.extent(1);
+  const bool fast = fast_sigmoid();
   Kokkos::parallel_for(
       "hv_act", RangePolicy(0, z_t.extent(0) * C), KOKKOS_LAMBDA(int i) {
         const int r = (i / C) % R, c = i % C;
-        out_t(i / C, c) = dsilu(z(r, c)) * z_t(i / C, c);
+        out_t(i / C, c) = dsilu(z(r, c), fast) * z_t(i / C, c);
       });
 }
 
@@ -87,26 +89,28 @@ void act_tan(View2D out_t, View2D z, View2D z_t) {
 void act_bwd2(View2D g, View2D g_t, View2D a, View2D a_t, View2D z, View2D z_t) {
   const int R = z.extent(0), C = z.extent(1);
   const bool has_at = a_t.extent(0) > 0;
+  const bool fast = fast_sigmoid();
   if (g.extent(0) > 0)
     Kokkos::parallel_for(
         "hv_act_bwd", RangePolicy(0, R * C), KOKKOS_LAMBDA(int i) {
-          g(i / C, i % C) = a(i / C, i % C) * dsilu(z(i / C, i % C));
+          g(i / C, i % C) = a(i / C, i % C) * dsilu(z(i / C, i % C), fast);
         });
   Kokkos::parallel_for(
       "hv_act_bwd_t", RangePolicy(0, z_t.extent(0) * C), KOKKOS_LAMBDA(int i) {
         const int q = i / C, r = q % R, c = i % C;
         const Net x = z(r, c);
-        g_t(q, c) = (has_at ? a_t(q, c) * dsilu(x) : Net(0)) + a(r, c) * d2silu(x) * z_t(q, c);
+        g_t(q, c) = (has_at ? a_t(q, c) * dsilu(x, fast) : Net(0)) + a(r, c) * d2silu(x, fast) * z_t(q, c);
       });
 }
 
 // SwiGLU's h = v sigmoid(g), v and g interleaved in pre (2j, 2j+1): its tangent.
 void swiglu_tan(View2D h_t, View2D pre, View2D pre_t) {
   const int R = pre.extent(0), F = h_t.extent(1);
+  const bool fast = fast_sigmoid();
   Kokkos::parallel_for(
       "hv_swiglu", RangePolicy(0, h_t.extent(0) * F), KOKKOS_LAMBDA(int i) {
         const int q = i / F, r = q % R, c = i % F;
-        const Net v = pre(r, 2 * c), s = sigmoid(pre(r, 2 * c + 1));
+        const Net v = pre(r, 2 * c), s = sigmoid(pre(r, 2 * c + 1), fast);
         h_t(q, c) = pre_t(q, 2 * c) * s + v * s * (Net(1) - s) * pre_t(q, 2 * c + 1);
       });
 }
@@ -114,17 +118,18 @@ void swiglu_tan(View2D h_t, View2D pre, View2D pre_t) {
 // Its backward from ha, h's adjoint, into pa (pre's), and both tangents.
 void swiglu_bwd2(View2D pa, View2D pa_t, View2D ha, View2D ha_t, View2D pre, View2D pre_t) {
   const int R = pre.extent(0), F = ha.extent(1);
+  const bool fast = fast_sigmoid();
   Kokkos::parallel_for(
       "hv_swiglu_bwd", RangePolicy(0, R * F), KOKKOS_LAMBDA(int i) {
         const int r = i / F, c = i % F;
-        const Net v = pre(r, 2 * c), s = sigmoid(pre(r, 2 * c + 1));
+        const Net v = pre(r, 2 * c), s = sigmoid(pre(r, 2 * c + 1), fast);
         pa(r, 2 * c) = ha(r, c) * s;
         pa(r, 2 * c + 1) = ha(r, c) * v * s * (Net(1) - s);
       });
   Kokkos::parallel_for(
       "hv_swiglu_bwd_t", RangePolicy(0, pa_t.extent(0) * F), KOKKOS_LAMBDA(int i) {
         const int q = i / F, r = q % R, c = i % F;
-        const Net v = pre(r, 2 * c), s = sigmoid(pre(r, 2 * c + 1));
+        const Net v = pre(r, 2 * c), s = sigmoid(pre(r, 2 * c + 1), fast);
         const Net s1 = s * (Net(1) - s), s2 = s1 * (Net(1) - Net(2) * s);
         const Net vt = pre_t(q, 2 * c), gt = pre_t(q, 2 * c + 1), a = ha(r, c), at = ha_t(q, c);
         pa_t(q, 2 * c) = at * s + a * s1 * gt;

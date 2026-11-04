@@ -16,6 +16,7 @@
 #include <map>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 
 #if defined(KOKKOS_ENABLE_CUDA)
 #include <cublasLt.h>
@@ -120,9 +121,30 @@ inline AttentionMode& attention_mode() {
   return m;
 }
 
+// The SiLU and SwiGLU sigmoid: fast (the hardware exp and reciprocal, see
+// sigmoid(x, fast) in pet/kokkos.hpp) by default on AMD GPUs in fp32, where it
+// makes the fused SiLU and SwiGLU GEMMs 5-15% faster at a few ulp of the activation;
+// PET_FAST_SIGMOID=0 restores the accurate one (and its bits). Process-global;
+// no effect on other backends or in fp64.
+inline bool default_fast_sigmoid() {
+#if defined(KOKKOS_ENABLE_HIP)
+  return std::is_same_v<Net, float>;
+#else
+  return false;
+#endif
+}
+inline bool& fast_sigmoid() {
+  static bool f = [] {
+    const char* e = std::getenv("PET_FAST_SIGMOID");
+    if (!e || !*e) return default_fast_sigmoid();
+    return e[0] != '0' && default_fast_sigmoid();
+  }();
+  return f;
+}
+
 // The numeric modes, for keys that must tell a recorded graph from another.
 inline std::uintptr_t numerics_key() {
-  return std::uintptr_t(gemm_mode()) | std::uintptr_t(attention_mode()) << 8;
+  return std::uintptr_t(gemm_mode()) | std::uintptr_t(attention_mode()) << 8 | std::uintptr_t(fast_sigmoid()) << 16;
 }
 
 #if defined(KOKKOS_ENABLE_CUDA)

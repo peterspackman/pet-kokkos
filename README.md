@@ -421,7 +421,9 @@ The virial is `W = V·σ`, a symmetric tensor in Voigt order
 ### Faster modes
 
 Everything runs fp32-accurate unless you ask otherwise: the answers are the
-reference's, to fp32 rounding, on every device. Two independent switches trade
+reference's, to fp32 rounding, on every device. The one exception is on by
+default on AMD GPUs and changes the answer by less than fp32's own error (the
+fast sigmoid, below). Two independent switches trade
 a little accuracy for speed on tensor cores. Each is process-wide and can be
 set by environment variable, by `pet::Options`, or as a metatomic option:
 
@@ -429,6 +431,32 @@ set by environment variable, by `pet::Options`, or as a metatomic option:
 |---|---|---|---|
 | GEMM mode | the dense layers' matrix products | see below | `PET_GEMM` / `gemm` / `gemm` |
 | attention mode | attention's own products (scores, weights times values, their adjoints) | NVIDIA, compute capability 8.0+ | `PET_ATTN` / `attention` / `attention` |
+
+**The fast sigmoid (AMD GPUs, on by default).** On an AMD GPU in an fp32
+build, the sigmoid in SiLU and SwiGLU, forward and backward, is the hardware's
+exp and reciprocal (1 ulp each) instead of the library exp and the IEEE
+division. That saves about 20 instructions a value, which matters because the
+activations are computed in the matrix-core GEMMs' epilogues: the SiLU GEMMs
+run 5-15% faster. `PET_FAST_SIGMOID=0` turns it off and gives back the accurate
+sigmoid's answer to the bit. The forward and backward use the same sigmoid, so
+forces stay the gradient of the energy computed, and results still repeat to
+the bit and do not depend on the batch. Elsewhere (NVIDIA, CPUs, fp64 builds)
+the switch does nothing. Measured on an MI250X against the fp64 build, on
+pet-mad-s, pet-mad-xs and pet-omat-s, 648- and 5184-atom water and 1728-atom
+diamond:
+
+| | energy | largest force error | RMS force error |
+|---|---|---|---|
+| accurate sigmoid against fp64 | 1e-6-2.1e-4 meV/atom | 6.0-7.2e-3 meV/Å | 1.4-2.0e-3 meV/Å |
+| fast sigmoid against fp64 | 1.3e-5-2.0e-4 meV/atom | 5.6-7.6e-3 meV/Å | 1.4-2.0e-3 meV/Å |
+| fast against accurate | 1.3-3.0e-5 meV/atom | 2.1-3.5e-3 meV/Å | 0.5-1.0e-3 meV/Å |
+
+That is, the change is below fp32's own error. Over 1000 NVE steps (648-atom
+water, 0.5 fs) the energy drifts 0.093 meV/atom with it against 0.090 without
+(pet-mad-s), 0.112 against 0.105 (pet-mad-xs). On one MI250X GCD it takes
+pet-mad-s at 5184-atom water from 117.8 to 116.7 ms, pet-omat-s from 85.7 to
+85.0, pet-mad-xs from 28.2 to 27.6, and diamond 1728 with pet-mad-xs from
+12.9 to 12.7.
 
 **fp32 on tensor cores (3xTF32, A100, H100/H200 and B200).**
 On these GPUs the TF32 tensor cores run 7-8x the rate of the fp32 CUDA cores,
@@ -574,6 +602,9 @@ stress uncertainties upet derives from ensembles are not implemented.
   forces in a stepping loop, and they never made an MI250X evaluation faster.
 - `PET_MFMA_GEMM=0`: on AMD CDNA GPUs, use rocBLAS/hipBLASLt instead of the
   built-in fp32 matrix-core GEMMs and their fused epilogues.
+- `PET_FAST_SIGMOID=0`: on AMD GPUs, use the accurate sigmoid in SiLU and
+  SwiGLU instead of the hardware exp and reciprocal (the default there; no
+  effect elsewhere); see [Faster modes](#faster-modes).
 - `PET_RECOMPUTE`: `never`, `wide` or `layers` forces how much of the forward
   the backward recomputes; by default the cheapest tier whose estimate fits the
   device (less a reserve of 10% or 1.5 GiB) is taken, and a pass that runs out

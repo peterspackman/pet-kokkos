@@ -566,3 +566,58 @@ TEST_CASE("TF32 attention repeats itself, keeps batch invariance, and stays near
     }
   }
 }
+
+TEST_CASE("PET_FAST_SIGMOID=0 gives the accurate sigmoid's bits back; the fast one stays close",
+          "[model][determinism]") {
+  // The switch is read at each launch, so turning it off mid-process restores
+  // the accurate sigmoid's answer to the bit (the answer of a build without the
+  // fast one). Off HIP, or in fp64, the two are one function.
+  if (quick()) SKIP("PET_TEST_QUICK is set");
+  struct Restore {
+    bool saved = pet::fast_sigmoid();
+    ~Restore() { pet::fast_sigmoid() = saved; }
+  } restore;
+  for (const auto& model : golden_models()) {
+    const auto found = find_model(model);
+    if (!found) continue;
+    pet::Options opts;
+    opts.graphs = false;
+    const pet::Calculator calc(found->first, found->second, opts);
+    const std::vector<pet::System> batch = rattled_batch(model);
+    if (batch.empty()) continue;
+    DYNAMIC_SECTION(model) {
+      pet::fast_sigmoid() = false;
+      const Device accurate = device_eval(calc, batch);
+      pet::fast_sigmoid() = true;
+      const Device fast = device_eval(calc, batch);
+      pet::fast_sigmoid() = false;
+      const Device again = device_eval(calc, batch);
+      pet::fast_sigmoid() = true;
+      const Device fast_again = device_eval(calc, batch);
+      const bool differs = pet::default_fast_sigmoid();
+      for (std::size_t b = 0; b < batch.size(); ++b) {
+        INFO("structure " << b);
+        REQUIRE(again.energy[b] == accurate.energy[b]);
+        REQUIRE(again.forces[b] == accurate.forces[b]);
+        REQUIRE(fast_again.energy[b] == fast.energy[b]);
+        REQUIRE(fast_again.forces[b] == fast.forces[b]);
+        if (!differs) {
+          REQUIRE(fast.energy[b] == accurate.energy[b]);
+          REQUIRE(fast.forces[b] == accurate.forces[b]);
+          continue;
+        }
+        // Measured on MI250X, pet-mad-s/-xs and pet-omat-s at water 648-5184
+        // and diamond 1728 (README, Faster modes): |dE| <= 3e-5 meV/atom and
+        // max|dF| <= 3.5e-3 meV/A against the accurate sigmoid, below fp32's
+        // own error against fp64; the bounds here are 30x those.
+        const double n = batch[b].n_atoms, de = std::abs(fast.energy[b] - accurate.energy[b]) / n;
+        double df = 0.0;
+        for (std::size_t i = 0; i < fast.forces[b].size(); ++i)
+          df = worst(df, std::abs(fast.forces[b][i] - accurate.forces[b][i]));
+        INFO("|dE| " << de << " eV/atom, max|dF| " << df << " eV/A");
+        CHECK(de <= 1e-6);
+        CHECK(df <= 1e-4);
+      }
+    }
+  }
+}
