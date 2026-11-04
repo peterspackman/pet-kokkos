@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.18)
 
 project(pet_kokkos
-    VERSION 0.2.0
+    VERSION 0.2.1
     DESCRIPTION "Kokkos evaluation of PET machine-learning interatomic potentials"
     LANGUAGES CXX)
 
