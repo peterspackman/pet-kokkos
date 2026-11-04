@@ -11,16 +11,6 @@ namespace pet {
 
 namespace {
 
-// Floor division and the matching non-negative remainder. A bin index outside
-// [0, n) folds into the box and the quotient is the lattice shift that took it
-// there; C's / and % truncate toward zero instead, which gets both wrong for
-// negative indices.
-KOKKOS_INLINE_FUNCTION int floor_div(int a, int n) {
-  const int q = a / n;
-  return (a % n != 0 && ((a < 0) != (n < 0))) ? q - 1 : q;
-}
-KOKKOS_INLINE_FUNCTION int floor_mod(int a, int n) { return a - floor_div(a, n) * n; }
-
 // The cell-list search for one atom, shared by the count and fill passes so the
 // two cannot disagree about which candidates are edges.
 struct CellSearch {
@@ -71,6 +61,48 @@ DeviceSearch& device_search() {
     return DeviceSearch::Auto;
   }();
   return s;
+}
+
+void sort_into_bins(Workspace& ws, const std::string& prefix, const IView1D& abin, int N, int nbins,
+                    IView1D& bstart, IView1D& batom) {
+  // Counting sort of atoms by bin (the counters zeroed here, not by the pool).
+  IView1D bcnt = ws.i1(prefix + "_bcnt", nbins);
+  Kokkos::deep_copy(ExecSpace(), bcnt, 0);
+  bstart = ws.i1(prefix + "_bstart", nbins + 1);
+  auto start = bstart;
+  Kokkos::parallel_for(
+      "cl_count", RangePolicy(0, N),
+      KOKKOS_LAMBDA(int gi) { Kokkos::atomic_inc(&bcnt(abin(gi))); });
+  Kokkos::parallel_scan(
+      "cl_scan", RangePolicy(0, nbins), KOKKOS_LAMBDA(int c, int& upd, bool final) {
+        if (final) start(c) = upd;
+        upd += bcnt(c);
+        if (final && c == nbins - 1) start(nbins) = upd;
+      });
+  IView1D fill = ws.i1(prefix + "_fill", nbins);
+  Kokkos::deep_copy(ExecSpace(), fill, 0);  // atomic accumulator
+  IView1D bunsorted = ws.i1(prefix + "_batom_fill", N);
+  batom = ws.i1(prefix + "_batom", N);
+  auto sorted = batom;
+  Kokkos::parallel_for(
+      "cl_fill", RangePolicy(0, N), KOKKOS_LAMBDA(int gi) {
+        const int c = abin(gi);
+        bunsorted(start(c) + Kokkos::atomic_fetch_add(&fill(c), 1)) = gi;
+      });
+  // The atomic fill leaves each bin in thread-arrival order; put it in atom
+  // order. One warp per bin, each lane placing its atoms at their rank: a big
+  // cell at a long cutoff has a few bins of hundreds of atoms.
+  Kokkos::parallel_for(
+      "cl_sortbins", TeamPolicy(nbins, 1, kLanes),
+      KOKKOS_LAMBDA(const TeamPolicy::member_type& t) {
+        const int lo = start(t.league_rank()), n = start(t.league_rank() + 1) - lo;
+        Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, n), [&](int q) {
+          const int a = bunsorted(lo + q);
+          int rank = 0;
+          for (int p = 0; p < n; ++p) rank += bunsorted(lo + p) < a;
+          sorted(lo + rank) = a;
+        });
+      });
 }
 
 RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D& posw,
@@ -167,41 +199,8 @@ RawEdges build_raw_edges_cells(Workspace& ws, const DeviceGeom& g, const RView2D
         abin(gi) = goff(b) + (ijk[0] * gnc(b, 1) + ijk[1]) * gnc(b, 2) + ijk[2];
       });
 
-  // Counting sort of atoms by bin (the counters zeroed here, not by the pool).
-  IView1D bcnt = ws.i1("cl_bcnt", nbins);
-  Kokkos::deep_copy(ExecSpace(), bcnt, 0);
-  IView1D bstart = ws.i1("cl_bstart", nbins + 1);
-  Kokkos::parallel_for(
-      "cl_count", RangePolicy(0, Ntot),
-      KOKKOS_LAMBDA(int gi) { Kokkos::atomic_inc(&bcnt(abin(gi))); });
-  Kokkos::parallel_scan(
-      "cl_scan", RangePolicy(0, nbins), KOKKOS_LAMBDA(int c, int& upd, bool final) {
-        if (final) bstart(c) = upd;
-        upd += bcnt(c);
-        if (final && c == nbins - 1) bstart(nbins) = upd;
-      });
-  IView1D fill = ws.i1("cl_fill", nbins);
-  Kokkos::deep_copy(ExecSpace(), fill, 0);  // atomic accumulator
-  IView1D bunsorted = ws.i1("cl_batom_fill", Ntot), batom = ws.i1("cl_batom", Ntot);
-  Kokkos::parallel_for(
-      "cl_fill", RangePolicy(0, Ntot), KOKKOS_LAMBDA(int gi) {
-        const int c = abin(gi);
-        bunsorted(bstart(c) + Kokkos::atomic_fetch_add(&fill(c), 1)) = gi;
-      });
-  // The atomic fill leaves each bin in thread-arrival order; put it in atom
-  // order. One warp per bin, each lane placing its atoms at their rank: a big
-  // cell at a long cutoff has a few bins of hundreds of atoms.
-  Kokkos::parallel_for(
-      "cl_sortbins", TeamPolicy(nbins, 1, kLanes),
-      KOKKOS_LAMBDA(const TeamPolicy::member_type& t) {
-        const int lo = bstart(t.league_rank()), n = bstart(t.league_rank() + 1) - lo;
-        Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, n), [&](int q) {
-          const int a = bunsorted(lo + q);
-          int rank = 0;
-          for (int p = 0; p < n; ++p) rank += bunsorted(lo + p) < a;
-          batom(lo + rank) = a;
-        });
-      });
+  IView1D bstart, batom;
+  sort_into_bins(ws, "cl", abin, Ntot, nbins, bstart, batom);
 
   // ---- count, scan, fill ---------------------------------------------------
   // One warp per atom, its lanes on the members of each candidate bin. The fill
