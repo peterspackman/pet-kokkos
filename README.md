@@ -121,7 +121,10 @@ of the fork instead.
 
 Apple GPUs have no fp64, so `metal` builds default to `PET_PRECISION=fp32`.
 With forces, pet-mad-xs takes ~8 ms on 64-atom diamond, 31 ms on 648-atom
-water and 134 ms on 1728-atom diamond on an M3 Pro.
+water and 134 ms on 1728-atom diamond on an M3 Pro. D3 runs in `float` by
+default (8 ms on 1728-atom diamond); its `double` and `mixed` are the fork's
+software doubles, ten times slower, and with float's transcendentals they
+match s-dftd3 to ~1e-7 rather than 1e-10.
 
 ## Python
 
