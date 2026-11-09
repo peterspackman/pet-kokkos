@@ -613,7 +613,7 @@ bool swiglu_bwd_fused(View2D pre_adj, View2D out_adj, const View2D& w_out, View2
 #elif !defined(PET_FUSED_HIP)  // else fused_gemm_hip.cpp
 
 bool batch_invariant_gemms() {
-#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(PET_HAVE_CBLAS)
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_METAL) || defined(PET_HAVE_CBLAS)
   return false;
 #else
   // The naive loop, one dot product per element (TF32x3 runs it too here).
