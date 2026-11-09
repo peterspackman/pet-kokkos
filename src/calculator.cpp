@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -593,9 +594,30 @@ Results Calculator::compute(const std::vector<System>& systems, bool compute_for
   const auto runs = impl_->memory_runs(systems);
   if (runs.size() == 1) return compute_batch(systems, compute_forces);
   Results out;
+  // A run the estimate let through that still does not fit is halved and tried
+  // again, rather than failing a call whose structures each fit on their own.
+  std::function<Results(std::size_t, std::size_t)> run = [&](std::size_t b, std::size_t e) -> Results {
+    if (e - b == 1) return compute(systems[b], compute_forces);
+    try {
+      return compute_batch({systems.begin() + b, systems.begin() + e}, compute_forces);
+    } catch (const std::runtime_error& err) {
+      if (!std::strstr(err.what(), "out of device memory")) throw;
+      impl_->model.release_workspace();
+      const std::size_t m = b + (e - b) / 2;
+      Results lo = run(b, m);
+      const Results hi = run(m, e);
+      auto join = [](auto& to, const auto& from) { to.insert(to.end(), from.begin(), from.end()); };
+      join(lo.energy, hi.energy), join(lo.per_atom_energy, hi.per_atom_energy), join(lo.forces, hi.forces);
+      join(lo.virial, hi.virial), join(lo.n_atoms, hi.n_atoms), join(lo.energy_uncertainty, hi.energy_uncertainty);
+      join(lo.per_atom_energy_uncertainty, hi.per_atom_energy_uncertainty);
+      join(lo.energy_ensemble, hi.energy_ensemble);
+      for (const int id : hi.struct_id) lo.struct_id.push_back(id + int(m - b));
+      lo.n_ensemble = std::max(lo.n_ensemble, hi.n_ensemble);
+      return lo;
+    }
+  };
   for (const auto& [b, e] : runs) {
-    const Results r = e - b == 1 ? compute(systems[b], compute_forces)
-                                 : compute_batch({systems.begin() + b, systems.begin() + e}, compute_forces);
+    const Results r = run(b, e);
     auto append = [](auto& to, const auto& from) { to.insert(to.end(), from.begin(), from.end()); };
     append(out.energy, r.energy);
     append(out.per_atom_energy, r.per_atom_energy);

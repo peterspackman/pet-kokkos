@@ -949,6 +949,7 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
   // The shapes now; the tier and estimate stay those of the pass that recorded a
   // replayed graph, or are 0 for a featurizer that never recomputes.
   plan_.atoms = N, plan_.max_neighbors = d.max_neighbors, plan_.edges = d.n_edges, plan_.budget = mem_budget_;
+  bool released = false;
   for (;;) {
     try {
       out = graphs_ && !ozaki_active() && !d.exchange ? graph_.run(graph_key(d, grad), pass) : pass();
@@ -957,6 +958,17 @@ EnergyResult PetModel::compute(const DeviceEdgeData& dev, std::vector<double>* h
       // Kokkos 5 throws a bad_alloc, Kokkos 4 a runtime_error that says so.
       const bool oom = dynamic_cast<const std::bad_alloc*>(&e) || std::strstr(e.what(), "failed to allocate");
       if (!oom) throw;
+      // The pool is grow-only and keeps each buffer at the largest size any
+      // earlier shape asked for, so after batches of different shapes it can hold
+      // most of the card in buffers the wrong size for this one, and growing one
+      // of them finds nothing free (a batch estimated at 52 GiB failed beside a
+      // 61 GiB pool on a 64 GiB MI250X). Give it back and run again, once, at the
+      // same tier, before deciding the estimate itself was wrong.
+      if (!released && ws_.capacity_bytes() > 0) {
+        released = true;
+        ws_.release();
+        continue;
+      }
       // The estimate was wrong for this device: under Auto, give the pool back
       // and run again a tier further down, from now on.
       if (recompute_ == Recompute::Auto && h_.featurizer_type != FeaturizerType::Residual &&
