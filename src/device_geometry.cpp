@@ -726,7 +726,11 @@ const DeviceEdgeData& EdgeSession::step(const double* positions, bool on_device,
           for (int c = 0; c < 3; ++c) pos(to, c) = x(i, c);
         });
   } else if (N) {
-    Kokkos::deep_copy(pos, Kokkos::View<const double**, Kokkos::LayoutRight, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(positions, N, 3));
+    // Into Real on the host first: a copy between spaces cannot convert.
+    auto hpos = Kokkos::create_mirror_view(Kokkos::WithoutInitializing, pos);
+    for (int i = 0; i < N; ++i)
+      for (int c = 0; c < 3; ++c) hpos(i, c) = Real(positions[3 * i + c]);
+    Kokkos::deep_copy(pos, hpos);
   }
   set_cell(cell);
   Kokkos::deep_copy(ExecSpace(), d_cell, h_cell);

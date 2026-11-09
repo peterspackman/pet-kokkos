@@ -1471,23 +1471,28 @@ BatchResult D3::compute_device(const DeviceGeom& g, bool compute_forces) const {
   const Out o = impl_->evaluate(a, compute_forces, false);
   BatchResult br;
   br.n_struct = g.B, br.n_atoms = g.Ntot, br.struct_id = g.sid;
-  auto conv1 = [&](const char* key, const Kokkos::View<double*, LR, MemSpace>& v) {
-    RView1D r = impl_->ws.r1(key, v.extent(0));
-    Kokkos::deep_copy(ExecSpace(), r, v);
-    return r;
+  // The views themselves where Real is double, else copies in Real. Generic
+  // lambdas, so that only the branch for this build's Real is compiled.
+  auto conv1 = [&](const char* key, const auto& v) -> RView1D {
+    if constexpr (std::is_same_v<Real, double>) {
+      return v;
+    } else {
+      RView1D r = impl_->ws.r1(key, v.extent(0));
+      Kokkos::deep_copy(ExecSpace(), r, v);
+      return r;
+    }
   };
-  auto conv2 = [&](const char* key, const Kokkos::View<double**, LR, MemSpace>& v) {
-    RView2D r = impl_->ws.r2(key, v.extent(0), v.extent(1));
-    Kokkos::deep_copy(ExecSpace(), r, v);
-    return r;
+  auto conv2 = [&](const char* key, const auto& v) -> RView2D {
+    if constexpr (std::is_same_v<Real, double>) {
+      return v;
+    } else {
+      RView2D r = impl_->ws.r2(key, v.extent(0), v.extent(1));
+      Kokkos::deep_copy(ExecSpace(), r, v);
+      return r;
+    }
   };
-  if constexpr (std::is_same_v<Real, double>) {
-    br.energy = o.energy, br.per_atom = o.per_atom;
-    if (compute_forces) br.forces = o.forces, br.virial = o.virial;
-  } else {
-    br.energy = conv1("d3:r_energy", o.energy), br.per_atom = conv1("d3:r_eat", o.per_atom);
-    if (compute_forces) br.forces = conv2("d3:r_fat", o.forces), br.virial = conv2("d3:r_virial", o.virial);
-  }
+  br.energy = conv1("d3:r_energy", o.energy), br.per_atom = conv1("d3:r_eat", o.per_atom);
+  if (compute_forces) br.forces = conv2("d3:r_fat", o.forces), br.virial = conv2("d3:r_virial", o.virial);
   return br;
 }
 
