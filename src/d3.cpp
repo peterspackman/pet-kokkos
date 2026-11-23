@@ -419,13 +419,32 @@ struct Kernels {
   template <int K>
   static std::size_t walk_scratch() {
     return Scratch2<A>::shmem_size(2 * kLanes, 4) + ScratchI1::shmem_size(2 * kLanes) +
-           Scratch2<A>::shmem_size(kLanes, K);
+           Scratch2<A>::shmem_size(kLanes, K) + stage_scratch();
+  }
+  // Each lane's candidate, tested once and kept for the compaction's scan: the
+  // scan runs its closure twice per index (to count, then to place), on
+  // different lanes, and a pair at the cutoff can test differently in the two
+  // -- the count and the slots filled then disagree.
+  static std::size_t stage_scratch() { return Scratch2<A>::shmem_size(kLanes, 4) + ScratchI1::shmem_size(kLanes); }
+  template <class M>
+  KOKKOS_INLINE_FUNCTION void stage(const M& t, const Scratch2<A>& staged, const ScratchI1& hits, int base, int k1,
+                                    const Origin& g, A R2, float Rf2) const {
+    Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, kLanes), [&](int l) {
+      const int k = base + l;
+      A v[3] = {A(0), A(0), A(0)}, d2 = A(0);
+      hits(l) = k < k1 && candidate(k, g.o, g.of, R2, Rf2, v, d2);
+      for (int c = 0; c < 3; ++c) staged(l, c) = v[c];
+      staged(l, 3) = d2;
+    });
+    t.team_barrier();
   }
   template <int K, class M, class F>
   KOKKOS_INLINE_FUNCTION void team_walk(const M& t, int ks, A R, F&& f, A* out) const {
     Scratch2<A> bv(t.team_scratch(0), 2 * kLanes, 4);
     ScratchI1 bk(t.team_scratch(0), 2 * kLanes);
     Scratch2<A> acc(t.team_scratch(0), kLanes, K);
+    Scratch2<A> staged(t.team_scratch(0), kLanes, 4);
+    ScratchI1 hits(t.team_scratch(0), kLanes);
     Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, kLanes), [&](int l) {
       for (int c = 0; c < K; ++c) acc(l, c) = A(0);
     });
@@ -446,22 +465,21 @@ struct Kernels {
     runs(ks, R, [&](int k0, int k1, const A* sh, int) {
       const Origin g = origin(ks, sh);
       for (int base = k0; base < k1; base += kLanes) {
+        stage(t, staged, hits, base, k1, g, R2, Rf2);
         int added = 0;
         Kokkos::parallel_scan(
             Kokkos::ThreadVectorRange(t, kLanes),
             [&](int l, int& pos, bool final) {
-              const int k = base + l;
-              A v[3] = {A(0), A(0), A(0)}, d2 = A(0);
-              const bool hit = k < k1 && candidate(k, g.o, g.of, R2, Rf2, v, d2);
+              const int hit = hits(l);
               if (final && hit) {
                 const int w = count + pos;
-                bk(w) = k;
-                for (int c = 0; c < 3; ++c) bv(w, c) = v[c];
-                bv(w, 3) = d2;
+                bk(w) = base + l;
+                for (int c = 0; c < 4; ++c) bv(w, c) = staged(l, c);
               }
               pos += hit;
             },
             added);
+        t.team_barrier();
         count += added;
         if (count >= kLanes) {
           evaluate(kLanes);
@@ -716,6 +734,8 @@ struct Kernels {
     for (int a = 0; a < kR; ++a) wi[a] = gwp(ks, a), dwi[a] = dgwp(ks, a);
     Scratch2<P> L(t.team_scratch(1), atm_cap, kNb);
     ScratchI1 Lk(t.team_scratch(1), atm_cap);
+    Scratch2<A> staged(t.team_scratch(0), kLanes, 4);
+    ScratchI1 hits(t.team_scratch(0), kLanes);
     const A R = raa, R2 = R * R;
     const float Rf2 = float(R2) * 1.0001f + 1e-3f;
     // The list: ordered compaction, as team_walk's.
@@ -723,22 +743,21 @@ struct Kernels {
     runs(ks, R, [&](int k0, int k1, const A* sh, int) {
       const Origin g = origin(ks, sh);
       for (int base = k0; base < k1; base += kLanes) {
+        stage(t, staged, hits, base, k1, g, R2, Rf2);
         int added = 0;
         Kokkos::parallel_scan(
             Kokkos::ThreadVectorRange(t, kLanes),
             [&](int l, int& pos, bool final) {
-              const int k = base + l;
-              A v[3] = {A(0), A(0), A(0)}, d2 = A(0);
-              const bool hit = k < k1 && candidate(k, g.o, g.of, R2, Rf2, v, d2);
+              const int hit = hits(l);
               if (final && hit && n + pos < atm_cap) {
                 const int w = n + pos;
-                Lk(w) = k;
-                for (int c = 0; c < 3; ++c) L(w, c) = P(v[c]);
-                L(w, 3) = P(d2);
+                Lk(w) = base + l;
+                for (int c = 0; c < 4; ++c) L(w, c) = P(staged(l, c));
               }
               pos += hit;
             },
             added);
+        t.team_barrier();
         n += added;
       }
     });
@@ -1201,7 +1220,9 @@ struct Core {
     }
     k.atm_cap = atm_cap;
     Kokkos::parallel_for(F ? "d3_atm" : "d3_atm_energy",
-                         Teams<TagATM<F>>(N, 1, kLanes).set_scratch_size(1, Kokkos::PerTeam(Kn::atm_scratch(atm_cap))),
+                         Teams<TagATM<F>>(N, 1, kLanes)
+                             .set_scratch_size(0, Kokkos::PerTeam(Kn::stage_scratch()))
+                             .set_scratch_size(1, Kokkos::PerTeam(Kn::atm_scratch(atm_cap))),
                          k);
   }
 
