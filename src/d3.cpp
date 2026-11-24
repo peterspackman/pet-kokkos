@@ -421,30 +421,93 @@ struct Kernels {
     return Scratch2<A>::shmem_size(2 * kLanes, 4) + ScratchI1::shmem_size(2 * kLanes) +
            Scratch2<A>::shmem_size(kLanes, K) + stage_scratch();
   }
-  // Each lane's candidate, tested once and kept for the compaction's scan: the
-  // scan runs its closure twice per index (to count, then to place), on
-  // different lanes, and a pair at the cutoff can test differently in the two
-  // -- the count and the slots filled then disagree.
+  // The ordered compaction of candidates base .. base + kLanes - 1 (those below
+  // k1): place(w, k, v, d2) for each hit, w its rank among them in walk order;
+  // returns the number of hits, the same on every lane. Each candidate is
+  // tested once, by one lane: a pair at the cutoff can test differently in two
+  // inlined copies of candidate() (in float, from different contraction), and
+  // a count that disagrees with the slots placed leaves a stale slot to read.
+  //
+  // On a GPU the team is one warp (wavefront), lane l its hardware lane l, and
+  // a ballot ranks the hits in registers. Elsewhere a parallel_scan does, which
+  // calls its closure twice per index (to count, then to place), so the lanes
+  // stage their results in scratch for it first.
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+  struct Stage {};
+  static std::size_t stage_scratch() { return 0; }
+  template <class M>
+  KOKKOS_INLINE_FUNCTION Stage stage_views(const M&) const {
+    return {};
+  }
+#else
+  struct Stage {
+    Scratch2<A> v;
+    ScratchI1 hit;
+  };
   static std::size_t stage_scratch() { return Scratch2<A>::shmem_size(kLanes, 4) + ScratchI1::shmem_size(kLanes); }
   template <class M>
-  KOKKOS_INLINE_FUNCTION void stage(const M& t, const Scratch2<A>& staged, const ScratchI1& hits, int base, int k1,
-                                    const Origin& g, A R2, float Rf2) const {
+  KOKKOS_INLINE_FUNCTION Stage stage_views(const M& t) const {
+    return {Scratch2<A>(t.team_scratch(0), kLanes, 4), ScratchI1(t.team_scratch(0), kLanes)};
+  }
+#endif
+  template <class M, class Place>
+  KOKKOS_INLINE_FUNCTION int compact(const M& t, const Stage& s, int base, int k1, const Origin& g, A R2, float Rf2,
+                                     Place&& place) const {
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+    (void)s;
+    int added = 0;
     Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, kLanes), [&](int l) {
       const int k = base + l;
       A v[3] = {A(0), A(0), A(0)}, d2 = A(0);
-      hits(l) = k < k1 && candidate(k, g.o, g.of, R2, Rf2, v, d2);
-      for (int c = 0; c < 3; ++c) staged(l, c) = v[c];
-      staged(l, 3) = d2;
+      const bool hit = k < k1 && candidate(k, g.o, g.of, R2, Rf2, v, d2);
+#if defined(__CUDA_ARCH__)
+      const unsigned m = __ballot_sync(0xffffffffu, hit);
+      const int w = __popc(m & ((1u << l) - 1u));
+      added = __popc(m);
+#elif defined(__HIP_DEVICE_COMPILE__)
+      const unsigned long long m = __ballot(hit);
+      const int w = __popcll(m & ((1ull << l) - 1ull));
+      added = __popcll(m);
+#else
+      // The host pass of a device build: kernels only run on the device.
+      const int w = 0;
+      Kokkos::abort("D3 compaction: the ballot runs on the device only");
+#endif
+      if (hit) place(w, k, v, d2);
+    });
+    return added;
+#else
+    Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, kLanes), [&](int l) {
+      const int k = base + l;
+      A v[3] = {A(0), A(0), A(0)}, d2 = A(0);
+      s.hit(l) = k < k1 && candidate(k, g.o, g.of, R2, Rf2, v, d2);
+      for (int c = 0; c < 3; ++c) s.v(l, c) = v[c];
+      s.v(l, 3) = d2;
     });
     t.team_barrier();
+    int added = 0;
+    Kokkos::parallel_scan(
+        Kokkos::ThreadVectorRange(t, kLanes),
+        [&](int l, int& pos, bool final) {
+          const int hit = s.hit(l);
+          if (final && hit) {
+            const A v[3] = {s.v(l, 0), s.v(l, 1), s.v(l, 2)};
+            place(pos, base + l, v, s.v(l, 3));
+          }
+          pos += hit;
+        },
+        added);
+    // Before the next call's staging overwrites what a lane has yet to read.
+    t.team_barrier();
+    return added;
+#endif
   }
   template <int K, class M, class F>
   KOKKOS_INLINE_FUNCTION void team_walk(const M& t, int ks, A R, F&& f, A* out) const {
     Scratch2<A> bv(t.team_scratch(0), 2 * kLanes, 4);
     ScratchI1 bk(t.team_scratch(0), 2 * kLanes);
     Scratch2<A> acc(t.team_scratch(0), kLanes, K);
-    Scratch2<A> staged(t.team_scratch(0), kLanes, 4);
-    ScratchI1 hits(t.team_scratch(0), kLanes);
+    const Stage stage = stage_views(t);
     Kokkos::parallel_for(Kokkos::ThreadVectorRange(t, kLanes), [&](int l) {
       for (int c = 0; c < K; ++c) acc(l, c) = A(0);
     });
@@ -465,21 +528,11 @@ struct Kernels {
     runs(ks, R, [&](int k0, int k1, const A* sh, int) {
       const Origin g = origin(ks, sh);
       for (int base = k0; base < k1; base += kLanes) {
-        stage(t, staged, hits, base, k1, g, R2, Rf2);
-        int added = 0;
-        Kokkos::parallel_scan(
-            Kokkos::ThreadVectorRange(t, kLanes),
-            [&](int l, int& pos, bool final) {
-              const int hit = hits(l);
-              if (final && hit) {
-                const int w = count + pos;
-                bk(w) = base + l;
-                for (int c = 0; c < 4; ++c) bv(w, c) = staged(l, c);
-              }
-              pos += hit;
-            },
-            added);
-        t.team_barrier();
+        const int added = compact(t, stage, base, k1, g, R2, Rf2, [&](int w, int k, const A* v, A d2) {
+          bk(count + w) = k;
+          for (int c = 0; c < 3; ++c) bv(count + w, c) = v[c];
+          bv(count + w, 3) = d2;
+        });
         count += added;
         if (count >= kLanes) {
           evaluate(kLanes);
@@ -734,8 +787,7 @@ struct Kernels {
     for (int a = 0; a < kR; ++a) wi[a] = gwp(ks, a), dwi[a] = dgwp(ks, a);
     Scratch2<P> L(t.team_scratch(1), atm_cap, kNb);
     ScratchI1 Lk(t.team_scratch(1), atm_cap);
-    Scratch2<A> staged(t.team_scratch(0), kLanes, 4);
-    ScratchI1 hits(t.team_scratch(0), kLanes);
+    const Stage stage = stage_views(t);
     const A R = raa, R2 = R * R;
     const float Rf2 = float(R2) * 1.0001f + 1e-3f;
     // The list: ordered compaction, as team_walk's.
@@ -743,21 +795,12 @@ struct Kernels {
     runs(ks, R, [&](int k0, int k1, const A* sh, int) {
       const Origin g = origin(ks, sh);
       for (int base = k0; base < k1; base += kLanes) {
-        stage(t, staged, hits, base, k1, g, R2, Rf2);
-        int added = 0;
-        Kokkos::parallel_scan(
-            Kokkos::ThreadVectorRange(t, kLanes),
-            [&](int l, int& pos, bool final) {
-              const int hit = hits(l);
-              if (final && hit && n + pos < atm_cap) {
-                const int w = n + pos;
-                Lk(w) = base + l;
-                for (int c = 0; c < 4; ++c) L(w, c) = P(staged(l, c));
-              }
-              pos += hit;
-            },
-            added);
-        t.team_barrier();
+        const int added = compact(t, stage, base, k1, g, R2, Rf2, [&](int w, int k, const A* v, A d2) {
+          if (n + w >= atm_cap) return;
+          Lk(n + w) = k;
+          for (int c = 0; c < 3; ++c) L(n + w, c) = P(v[c]);
+          L(n + w, 3) = P(d2);
+        });
         n += added;
       }
     });
