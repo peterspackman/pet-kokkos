@@ -927,9 +927,14 @@ void run(const char* name, F&& f) {
 namespace tc {
 
 __device__ inline float tf32(float x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   std::uint32_t r;
   asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
   return __uint_as_float(r);
+#else
+  // cvt.rna.tf32 needs sm_80; the same rounding on the integer pipe compiles anywhere
+  return __uint_as_float((__float_as_uint(x) + 0x1000u) & 0xffffe000u);
+#endif
 }
 // c += A B, the operands already TF32.
 __device__ inline void mma(float (&c)[4], float a0, float a1, float a2, float a3, float b0, float b1) {
